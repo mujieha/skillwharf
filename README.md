@@ -13,7 +13,7 @@ skillwharf add github:anthropics/skills/skills/mcp-builder
 ```
 
 ```
-✔ mcp-builder  github:anthropics/skills/skills/mcp-builder@34040c9c5685
+✔ mcp-builder  github:anthropics/skills/skills/mcp-builder@34040c9c568585f6929bedeaad110ad08f079624
    claude       symlink  .claude/skills/mcp-builder
    agents       symlink  .agents/skills/mcp-builder
 ```
@@ -41,6 +41,21 @@ folder gets a link to it. Commit the two files, and a teammate who clones the pr
 verify. `skillwharf doctor` reports broken links, drift from the lockfile, folders
 skillwharf did not create, and skills nobody has used lately. `skillwharf usage` reads
 Claude Code's local session logs to show which skills actually fire.
+
+## Who it's for
+
+- **One developer.** `skillwharf -g` keeps your personal skills in `~/.skillwharf` and links
+  them into the agents' global folders, so every project on your machine sees the same
+  versions.
+- **A small team.** Commit `skillwharf.json` and `skillwharf.lock.json` next to your code.
+  Everyone who clones the repository runs `skillwharf sync` and gets the same skills at the
+  same commits, and `skillwharf doctor` tells each person when their copy has drifted.
+- **A company with several teams.** Keep shared skills in repositories of your own. Private
+  ones work too, as long as each person's `git` can already clone them (for example after
+  `gh auth setup-git`). Each team's projects pin the skills they use, so one team can move
+  to a new version with `skillwharf update` while another stays where it is. To make skills
+  easy to find, keep an `index.json` registry (`skillwharf publish` adds entries to it) and
+  point projects at it with `skillwharf init --registry <url>`.
 
 ## Install
 
@@ -144,7 +159,7 @@ A registry is any git repo (or URL) serving an `index.json`:
 ]}
 ```
 
-Point a project at one with `skillwharf init --registry <url>` or `"registry"` in the manifest. The default registry (used when no `--registry` is given and the manifest sets none) may not exist yet — `search` reports that plainly rather than failing silently. Publish with `skillwharf publish ./my-skill --registry ../registry-checkout --source github:me/skills/my-skill`, then commit and push the checkout.
+Point a project at one with `skillwharf init --registry <url>` or `"registry"` in the manifest. The default registry (used when no `--registry` is given and the manifest sets none) is [mujieha/skillwharf-registry](https://github.com/mujieha/skillwharf-registry); if it cannot be reached, `search` says so plainly rather than failing silently. Publish with `skillwharf publish ./my-skill --registry ../registry-checkout --source github:me/skills/my-skill`, then commit and push the checkout.
 
 ## Sources
 
@@ -172,6 +187,8 @@ MIT
 - Usage tracking reads Claude Code's local logs only; Codex and Cursor do not expose comparable ones.
 - Windows without Developer Mode falls back to copying instead of symlinking; `doctor` flags the copies.
 - The default registry is a starter list; it is schema-checked, not reviewed.
+- A registry URL is fetched without credentials, so a company registry must be reachable over https without a login, or used from a local checkout (`--registry <path>`).
+- There is no central approval or audit step; changes to skills are reviewed through the pull requests that change `skillwharf.json` and the lockfile.
 - skillwharf does not review a skill's content — read a `SKILL.md` before installing it, as you would a shell script.
 
 ## Security
