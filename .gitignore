@@ -1,0 +1,21 @@
+node_modules/
+dist/
+coverage/
+*.log
+*.tgz
+.DS_Store
+
+# Editors, agent tooling and the maintainer's local notes
+.idea/
+.vscode/
+.claude/
+CLAUDE.md
+AGENTS.md
+.remember/
+notes/
+
+# Anything that could be a credential
+.env
+.env.*
+*.pem
+*.key

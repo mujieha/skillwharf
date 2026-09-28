@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only token. This workflow has no secrets and uploads nothing, so a pull
+# request from a fork gains nothing by running it.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Linux is where most CI and container users run the CLI; macOS is where
+    # most of the people who asked for it work. Symlink handling differs between
+    # the two, which is the one behaviour worth running on both.
+    strategy:
+      fail-fast: false
+      matrix:
+        # Hosted runners consume paid minutes on a private repository, so
+        # while this one is private every leg runs on the maintainer's own
+        # macOS runner and the Linux leg is skipped. A public repository gets
+        # hosted runners free, and a self-hosted runner must never take pull
+        # requests from forks, so the switch back is automatic.
+        os: ${{ github.event.repository.private && fromJSON('["self-hosted"]') || fromJSON('["ubuntu-latest","macos-latest"]') }}
+        node: [22, 24]
+    runs-on: ${{ matrix.os == 'self-hosted' && fromJSON('["self-hosted","macOS","ARM64"]') || matrix.os }}
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: ${{ matrix.node }}
+          # Hosted runners cache npm through Actions. The self-hosted runner's
+          # npm cache is the maintainer's own ~/.npm, already warm, and
+          # round-tripping it through the Actions cache stalls the job.
+          cache: ${{ matrix.os != 'self-hosted' && 'npm' || '' }}
+          package-manager-cache: ${{ matrix.os != 'self-hosted' }}
+
+      - name: Install
+        run: npm ci
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # The built CLI must start and refuse a manifest that would escape the
+      # store; both are cheap to check on every platform.
+      - name: Smoke test the built CLI
+        run: bash scripts/smoke.sh

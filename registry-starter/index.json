@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "skills": [
+    {
+      "name": "docx",
+      "description": "Create, read and edit Word documents",
+      "source": "github:anthropics/skills/skills/docx",
+      "tags": ["documents", "office"]
+    },
+    {
+      "name": "mcp-builder",
+      "description": "Guide for creating high-quality MCP (Model Context Protocol) servers",
+      "source": "github:anthropics/skills/skills/mcp-builder",
+      "tags": ["mcp", "server"]
+    },
+    {
+      "name": "pdf",
+      "description": "Read, merge, split and fill PDF files",
+      "source": "github:anthropics/skills/skills/pdf",
+      "tags": ["documents", "pdf"]
+    },
+    {
+      "name": "pptx",
+      "description": "Create and edit PowerPoint presentations",
+      "source": "github:anthropics/skills/skills/pptx",
+      "tags": ["documents", "office"]
+    },
+    {
+      "name": "skill-creator",
+      "description": "Create, improve and evaluate skills",
+      "source": "github:anthropics/skills/skills/skill-creator",
+      "tags": ["meta", "skills"]
+    },
+    {
+      "name": "webapp-testing",
+      "description": "Test web applications end to end with a browser",
+      "source": "github:anthropics/skills/skills/webapp-testing",
+      "tags": ["testing", "browser"]
+    },
+    {
+      "name": "xlsx",
+      "description": "Create, read and edit Excel spreadsheets",
+      "source": "github:anthropics/skills/skills/xlsx",
+      "tags": ["documents", "spreadsheets"]
+    }
+  ]
+}

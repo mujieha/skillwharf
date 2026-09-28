@@ -1,0 +1,53 @@
+{
+  "name": "skillwharf",
+  "version": "0.1.0",
+  "description": "Install, version, sync and track agent skills (SKILL.md) across Claude Code, Codex, Cursor and more.",
+  "type": "module",
+  "bin": {
+    "skillwharf": "./dist/cli.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mujieha/skillwharf.git"
+  },
+  "homepage": "https://mujieha.com/apps/skillwharf",
+  "bugs": {
+    "url": "https://github.com/mujieha/skillwharf/issues"
+  },
+  "author": "Artem Rufornyi",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && chmod +x dist/cli.js",
+    "dev": "tsx src/cli.ts",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "agent-skills",
+    "claude-code",
+    "codex",
+    "cursor",
+    "skills",
+    "cli"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "commander": "^15.0.0",
+    "picocolors": "^1.1.1",
+    "yaml": "^2.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "tsx": "^4.19.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.1"
+  }
+}
