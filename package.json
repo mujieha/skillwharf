@@ -1,6 +1,6 @@
 {
   "name": "skillwharf",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Install, version, sync and track agent skills (SKILL.md) across Claude Code, Codex, Cursor and more.",
   "type": "module",
   "bin": {
@@ -10,7 +10,7 @@
     "type": "git",
     "url": "git+https://github.com/mujieha/skillwharf.git"
   },
-  "homepage": "https://mujieha.com/apps/skillwharf",
+  "homepage": "https://skillwharf.mujieha.com/",
   "bugs": {
     "url": "https://github.com/mujieha/skillwharf/issues"
   },

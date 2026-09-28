@@ -25,7 +25,7 @@ import type { AgentId, Context } from "./types.js";
 import { daysAgo, scanClaudeUsage } from "./usage.js";
 import { sanitizeForTerminal } from "./validate.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 
 const program = new Command()
   .name("skillwharf")
