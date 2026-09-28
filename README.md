@@ -18,6 +18,30 @@ skillwharf add github:anthropics/skills/skills/mcp-builder
    agents       symlink  .agents/skills/mcp-builder
 ```
 
+## Why
+
+Agent skills are folders with a `SKILL.md` that teach a coding agent a task: filling in
+PDFs, building an MCP server, your team's release checklist. They are easy to write and
+easy to lose track of.
+
+- **The same skill ends up copied everywhere.** Claude Code reads `.claude/skills`, Codex
+  and Cursor read `.agents/skills`, and every teammate has their own copies. Copies drift,
+  and nobody can say which one is current.
+- **Nothing pins them.** A skill taken from someone's repository last month may have
+  changed since, so a fresh clone of your project can get a different skill from the one
+  you tested with, or none at all.
+- **Nobody knows which ones are used.** Skills pile up; some fire every day and others
+  never do.
+
+skillwharf treats skills the way a package manager treats dependencies. `skillwharf.json`
+says which skills a project wants, and `skillwharf.lock.json` pins each one to a full
+commit sha and a content hash. One copy lives in `.skillwharf/skills`, and each agent's
+folder gets a link to it. Commit the two files, and a teammate who clones the project runs
+`skillwharf sync` to get exactly the same skills; `sync` refuses a lockfile it cannot
+verify. `skillwharf doctor` reports broken links, drift from the lockfile, folders
+skillwharf did not create, and skills nobody has used lately. `skillwharf usage` reads
+Claude Code's local session logs to show which skills actually fire.
+
 ## Install
 
 ```
