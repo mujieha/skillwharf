@@ -6,6 +6,10 @@ installs; `usage` shows which skills Claude Code actually fires. skillwharf inst
 `.claude/skills` and the cross-tool `.agents/skills` (read natively by Codex and Cursor) by
 default.
 
+<p align="center">
+  <a href="https://github.com/mujieha/skillwharf/blob/main/docs/media/skillwharf-intro.mp4"><img src="https://raw.githubusercontent.com/mujieha/skillwharf/main/docs/media/skillwharf-intro.gif" width="720" alt="skillwharf in 28 seconds: why copied skills drift, then init, add pinned to a full commit sha, sync, doctor and usage in a terminal, and who it is for: one developer, a small team, a company"></a>
+</p>
+
 ```
 npm i -g skillwharf
 skillwharf init
