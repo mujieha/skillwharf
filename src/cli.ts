@@ -135,6 +135,7 @@ program
         all: opts.all,
         force: opts.force,
         limits: parseLimits(opts),
+        onSkipped: (s) => console.log(pc.yellow("!"), `skipped ${clean(s.dir)}: ${clean(s.reason)}`),
       });
       for (const a of added) {
         console.log(pc.green("✔"), pc.bold(a.name), a.meta.version ? pc.dim(`v${clean(a.meta.version)}`) : "", pc.dim(clean(a.lock.resolved)));

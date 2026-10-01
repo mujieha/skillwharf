@@ -18,6 +18,12 @@ const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 let base: string, home: string, proj: string, outside: string, ctx: Context;
 const savedEnv = { ...process.env };
 
+// Built from code points so the source never holds an invisible or look-alike character.
+const RLO = String.fromCodePoint(0x202e); // right-to-left override
+const LONG_S = String.fromCodePoint(0x17f); // U+017F
+const KELVIN = String.fromCodePoint(0x212a); // U+212A KELVIN SIGN
+const FULLWIDTH_G = String.fromCodePoint(0xff47); // U+FF47
+
 function writeSkill(dir: string, name: string, body = "body", description = "d") {
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: ${description}\n---\n${body}\n`);
@@ -162,6 +168,14 @@ describe("R4-2: a folder with .git, links or empty directories is never taken fo
     expect(linkStatus(ctx, loadManifest(ctx)!, "claude", "s", store)).toBe("stale-copy");
   });
 
+  it("remove still deletes a genuine skillwharf copy, as the Windows fallback leaves one", () => {
+    plant(() => {});
+    const r = removeSkill(ctx, "s");
+    expect(r.removedLinks).toEqual(["claude"]);
+    expect(fs.existsSync(target)).toBe(false);
+    expect(fs.existsSync(store)).toBe(false);
+  });
+
   describe.each(variants)("with a %s in the agent folder", (_label, extra) => {
     beforeEach(() => plant(extra));
     const intact = () => {
@@ -197,7 +211,7 @@ describe("R4-3: agentPaths targets are validated and printed sanitised", () => {
   const m = (p: { projectPath?: string; globalPath?: string }): Manifest =>
     ({ version: 1, agents: ["claude"], skills: {}, agentPaths: { claude: p } }) as Manifest;
 
-  it.each(["\u001b]52;c;x\u0007", "ok/\u009b31m", "a/‮b", "a\nb"])("refuses projectPath %j", (p) => {
+  it.each(["\u001b]52;c;x\u0007", "ok/\u009b31m", `a/${RLO}b`, "a\nb"])("refuses projectPath %j", (p) => {
     expect(() => validateManifest(m({ projectPath: p }), "skillwharf.json")).toThrow(/control/);
   });
 
@@ -206,7 +220,7 @@ describe("R4-3: agentPaths targets are validated and printed sanitised", () => {
   });
 
   it("`where` prints no bidi override even when the project folder name has one", () => {
-    const odd = path.join(base, "p‮x");
+    const odd = path.join(base, `p${RLO}x`);
     fs.mkdirSync(odd);
     const oddCtx = makeContext({ cwd: odd, home });
     writeSkill(path.join(odd, "src", "s"), "s");
@@ -215,13 +229,13 @@ describe("R4-3: agentPaths targets are validated and printed sanitised", () => {
     const r = cli(["where", "s"], odd);
     expect(r.status).toBe(0);
     expect(r.stdout).toContain(".claude");
-    expect(r.stdout).not.toMatch(/‮/);
+    expect(r.stdout).not.toContain(RLO);
   });
 });
 
 // ------------------------------------------------------------------ R4-4
 describe("R4-4: --json output is sanitised and registry entries keep only known fields", () => {
-  const unsafe = /[\u0080-\u009f‪-‮⁦-⁩]/;
+  const unsafe = new RegExp("[\\u0080-\\u009f\\u202a-\\u202e\\u2066-\\u2069]");
 
   it("list --json drops C1 and bidi characters from a SKILL.md description", () => {
     writeManifest({ version: 1, agents: ["claude"], skills: {} });
@@ -241,8 +255,8 @@ describe("R4-4: --json output is sanitised and registry entries keep only known 
     fs.mkdirSync(logs, { recursive: true });
     const line = {
       timestamp: new Date().toISOString(),
-      cwd: `${fs.realpathSync(proj)}/x‮y`, // the CLI sees the resolved path (/var -> /private/var on macOS)
-      message: { content: [{ type: "tool_use", name: "Skill", input: { skill: "ev‮il\u009b" } }] },
+      cwd: `${fs.realpathSync(proj)}/x${RLO}y`, // the CLI sees the resolved path (/var -> /private/var on macOS)
+      message: { content: [{ type: "tool_use", name: "Skill", input: { skill: `ev${RLO}il\u009b` } }] },
     };
     fs.writeFileSync(path.join(logs, "s.jsonl"), JSON.stringify(line) + "\n");
     const r = cli(["usage", "--json"]);
@@ -258,7 +272,7 @@ describe("R4-4: --json output is sanitised and registry entries keep only known 
       path.join(reg, "index.json"),
       JSON.stringify({
         version: 1,
-        skills: [{ name: "pdf", description: "pdf tools", source: "github:o/r/pdf", extra: "x‮y", nested: { a: 1 } }],
+        skills: [{ name: "pdf", description: "pdf tools", source: "github:o/r/pdf", extra: `x${RLO}y`, nested: { a: 1 } }],
       }),
     );
     const idx = await loadRegistry(reg);
@@ -279,17 +293,12 @@ describe("R4-5: add --all validates every skill before it writes the first one",
     writeSkill(path.join(proj, "multi", "a"), "a");
     writeSkill(path.join(proj, "multi", "b"), '"!!!"');
     expect(() => addSkill(ctx, path.join(proj, "multi"), { all: true })).toThrow(/valid skill name/);
-    const m = loadManifest(ctx)!;
-    const recorded = Object.keys(m.skills);
-    const linked = fs.existsSync(path.join(proj, ".claude", "skills", "a"));
-    // Either nothing happened at all, or `a` is fully recorded in both files; never linked but unrecorded.
-    if (linked) {
-      expect(recorded).toContain("a");
-      expect(Object.keys(loadLock(ctx).skills)).toContain("a");
-    } else {
-      expect(recorded).toEqual([]);
-      expect(fs.existsSync(storePath(ctx, "a"))).toBe(false);
-    }
+    // Nothing is written before the whole plan passes.
+    expect(Object.keys(loadManifest(ctx)!.skills)).toEqual([]);
+    expect(Object.keys(loadLock(ctx).skills)).toEqual([]);
+    expect(fs.existsSync(storePath(ctx, "a"))).toBe(false);
+    expect(fs.existsSync(path.join(proj, ".skillwharf"))).toBe(false);
+    expect(fs.existsSync(path.join(proj, ".claude"))).toBe(false);
   });
 
   it("a foreign folder at the second skill's target stops the whole run before the first write", () => {
@@ -488,7 +497,248 @@ describe("R4-10: a skill folder over the size cap is refused before anything lan
 describe("R4-12: reserved directory names are compared after Unicode folding", () => {
   const m = (p: string): Manifest => ({ version: 1, agents: ["claude"], skills: {}, agentPaths: { claude: { projectPath: p } } }) as Manifest;
 
-  it.each([".ſkillwharf/skills", ".sKillwharf/skills", ".ｇit/hooks"])("rejects %j", (p) => {
+  // U+017F long s, U+212A Kelvin sign, U+FF47 fullwidth g. Lower-casing alone
+  // already maps the Kelvin sign to "k", so that one is a control; the other two
+  // need the NFKC fold.
+  it.each([`.${LONG_S}killwharf/skills`, `.s${KELVIN}illwharf/skills`, `.${FULLWIDTH_G}it/hooks`])("rejects %j", (p) => {
     expect(() => validateManifest(m(p), "skillwharf.json")).toThrow(/agentPaths/);
+  });
+
+  it("the Kelvin case really holds U+212A and not an ASCII k", () => {
+    const p = `.s${KELVIN}illwharf/skills`;
+    expect(p.codePointAt(2)).toBe(0x212a);
+    expect(p).not.toBe(".skillwharf/skills");
+  });
+});
+
+// ================================================================== Round 5
+// ------------------------------------------------------------------ C1
+describe("R5-C1: sync is all-or-nothing: every skill is fetched and checked before any is installed", () => {
+  let lockText: string;
+
+  function expectNothingWritten() {
+    expect(fs.existsSync(storePath(ctx, "a"))).toBe(false);
+    expect(fs.existsSync(storePath(ctx, "b"))).toBe(false);
+    expect(fs.existsSync(path.join(proj, ".claude"))).toBe(false);
+    expect(read(path.join(proj, "skillwharf.lock.json"))).toBe(lockText);
+  }
+
+  function entryFor(name: string, integrity: string) {
+    return {
+      source: `path:./src/${name}`,
+      resolved: `path:${path.join(proj, "src", name)}`,
+      integrity,
+      installedAt: "x",
+    };
+  }
+
+  /** Run `fn` with the temp directory pointed at an empty folder, and return what was left in it. */
+  function leftoverTemp(fn: () => void): string[] {
+    const tmp = path.join(base, "tmp");
+    fs.mkdirSync(tmp);
+    const old = process.env.TMPDIR;
+    process.env.TMPDIR = tmp;
+    try {
+      fn();
+    } finally {
+      if (old === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = old;
+    }
+    return fs.readdirSync(tmp);
+  }
+
+  describe("a hash mismatch on the second skill", () => {
+    beforeEach(() => {
+      writeSkill(path.join(proj, "src", "a"), "a");
+      writeSkill(path.join(proj, "src", "b"), "b");
+      writeManifest({
+        version: 1,
+        agents: ["claude"],
+        skills: { a: { source: "path:./src/a" }, b: { source: "path:./src/b" } },
+      });
+      writeLock({
+        version: 1,
+        skills: {
+          a: entryFor("a", hashDir(path.join(proj, "src", "a"))),
+          b: entryFor("b", "sha256-not-the-real-hash"),
+        },
+      });
+      lockText = read(path.join(proj, "skillwharf.lock.json"));
+    });
+
+    it("installs neither skill, links neither, and leaves the lockfile byte for byte", () => {
+      expect(() => syncSkills(ctx)).toThrow(/integrity mismatch for "b"/);
+      expectNothingWritten();
+    });
+
+    it("leaves no temp folder behind", () => {
+      const left = leftoverTemp(() => expect(() => syncSkills(ctx)).toThrow(/integrity mismatch/));
+      expect(left).toEqual([]);
+    });
+
+    it("installs both when the hashes are right (control)", () => {
+      writeLock({
+        version: 1,
+        skills: {
+          a: entryFor("a", hashDir(path.join(proj, "src", "a"))),
+          b: entryFor("b", hashDir(path.join(proj, "src", "b"))),
+        },
+      });
+      const left = leftoverTemp(() => {
+        expect(syncSkills(ctx).fetched).toEqual(["a", "b"]);
+      });
+      expect(left).toEqual([]);
+      expect(fs.existsSync(path.join(proj, ".claude", "skills", "a"))).toBe(true);
+      expect(fs.existsSync(path.join(proj, ".claude", "skills", "b"))).toBe(true);
+    });
+  });
+
+  describe("an unfetchable pin on the second skill", () => {
+    beforeEach(() => {
+      localGithub((work) => writeSkill(path.join(work, "b"), "b"));
+      writeSkill(path.join(proj, "src", "a"), "a");
+      writeManifest({
+        version: 1,
+        agents: ["claude"],
+        skills: { a: { source: "path:./src/a" }, b: { source: "github:acme/skills/b" } },
+      });
+      writeLock({
+        version: 1,
+        skills: {
+          a: entryFor("a", hashDir(path.join(proj, "src", "a"))),
+          b: {
+            source: "github:acme/skills/b",
+            resolved: "github:acme/skills/b@0123456789abcdef0123456789abcdef01234567",
+            integrity: "sha256-x",
+            installedAt: "x",
+          },
+        },
+      });
+      lockText = read(path.join(proj, "skillwharf.lock.json"));
+    });
+
+    it("installs neither skill and leaves the lockfile byte for byte", () => {
+      const left = leftoverTemp(() => expect(() => syncSkills(ctx)).toThrow(/Cannot install the pinned commit for "b"/));
+      expectNothingWritten();
+      expect(left).toEqual([]);
+    });
+  });
+});
+
+// ------------------------------------------------------------------ B1
+describe("R5-B1: add --all never records a folder whose source would not parse again", () => {
+  beforeEach(() => {
+    localGithub((work) => {
+      writeSkill(path.join(work, "skills", "ok"), "ok");
+      writeSkill(path.join(work, "skills", "bad name"), "bad-name");
+      writeSkill(path.join(work, "skills", "x@y"), "x-y");
+    });
+    writeManifest({ version: 1, agents: ["claude"], skills: {} });
+  });
+
+  it("installs the good folder, reports the others as skipped with a reason, and the manifest re-parses", () => {
+    const skipped: { dir: string; reason: string }[] = [];
+    const added = addSkill(ctx, "github:acme/skills/skills", { all: true, onSkipped: (s) => skipped.push(s) });
+    expect(added.map((a) => a.name)).toEqual(["ok"]);
+    expect(skipped.map((s) => s.dir).sort()).toEqual(["skills/bad name", "skills/x@y"]);
+    for (const s of skipped) expect(s.reason).toMatch(/sub-path/i);
+
+    const m = loadManifest(ctx)!;
+    expect(Object.keys(m.skills)).toEqual(["ok"]);
+    expect(parseSource(m.skills.ok.source)).toMatchObject({ subpath: "skills/ok", ref: undefined });
+    expect(Object.keys(loadLock(ctx).skills)).toEqual(["ok"]);
+
+    // and a later sync can read it
+    fs.rmSync(path.join(proj, ".skillwharf"), { recursive: true });
+    fs.rmSync(path.join(proj, ".claude"), { recursive: true });
+    expect(syncSkills(ctx).fetched).toEqual(["ok"]);
+  });
+
+  it("refuses the run when every folder is skipped", () => {
+    // rebuild the local "GitHub" without the good folder
+    fs.rmSync(path.join(base, "gh"), { recursive: true });
+    fs.rmSync(path.join(base, "work"), { recursive: true });
+    localGithub((work) => {
+      writeSkill(path.join(work, "skills", "bad name"), "bad-name");
+      writeSkill(path.join(work, "skills", "x@y"), "x-y");
+    });
+    expect(() => addSkill(ctx, "github:acme/skills/skills", { all: true })).toThrow(/no installable skill|skipped/i);
+    expect(Object.keys(loadManifest(ctx)!.skills)).toEqual([]);
+    expect(fs.existsSync(path.join(proj, ".skillwharf"))).toBe(false);
+  });
+});
+
+// ------------------------------------------------------------------ doctor wording
+describe("R5-doctor: the missing-integrity warning says where sync refuses it", () => {
+  it("says the folder is installed but unpinned here and that a fresh clone is refused", () => {
+    writeSkill(path.join(proj, "src", "s"), "s");
+    writeManifest({ version: 1, agents: ["claude"], skills: { s: { source: "path:./src/s" } } });
+    writeLock({
+      version: 1,
+      skills: { s: { source: "path:./src/s", resolved: `path:${path.join(proj, "src", "s")}`, installedAt: "x" } as never },
+    });
+    syncSkills(ctx, { allowUnpinned: true });
+    const lock = loadLock(ctx);
+    delete (lock.skills.s as { integrity?: string }).integrity;
+    writeLock(lock);
+    const msg = doctor(ctx).find((i) => /no integrity/.test(i.message))?.message ?? "";
+    expect(msg).toMatch(/installed but unpinned/);
+    expect(msg).toMatch(/fresh clone/);
+    expect(msg).not.toMatch(/sync will refuse it\)$/);
+  });
+});
+
+// ------------------------------------------------------------------ path portability
+describe("R5-path: a path: source inside the project is recorded relative to it", () => {
+  it("add records path:./skills/x and a copy of the project elsewhere can sync it", () => {
+    writeManifest({ version: 1, agents: ["claude"], skills: {} });
+    writeSkill(path.join(proj, "skills", "x"), "x");
+    addSkill(ctx, path.join(proj, "skills", "x"));
+    expect(loadManifest(ctx)!.skills.x.source).toBe("path:./skills/x");
+    expect(loadLock(ctx).skills.x.source).toBe("path:./skills/x");
+    expect(loadLock(ctx).skills.x.resolved).toBe("path:./skills/x");
+
+    // a teammate's checkout: the committed files only, at another location
+    const other = path.join(base, "elsewhere", "clone");
+    fs.mkdirSync(other, { recursive: true });
+    for (const f of ["skillwharf.json", "skillwharf.lock.json"]) fs.copyFileSync(path.join(proj, f), path.join(other, f));
+    fs.cpSync(path.join(proj, "skills"), path.join(other, "skills"), { recursive: true });
+    const otherCtx = makeContext({ cwd: other, home });
+    expect(syncSkills(otherCtx).fetched).toEqual(["x"]);
+    expect(fs.existsSync(path.join(other, ".claude", "skills", "x", "SKILL.md"))).toBe(true);
+  });
+
+  it("a relative path typed from a sub-folder is recorded relative to the project root too", () => {
+    writeManifest({ version: 1, agents: ["claude"], skills: {} });
+    writeSkill(path.join(proj, "skills", "x"), "x");
+    const prev = process.cwd();
+    process.chdir(path.join(proj, "skills"));
+    try {
+      addSkill(ctx, "./x");
+    } finally {
+      process.chdir(prev);
+    }
+    expect(loadManifest(ctx)!.skills.x.source).toBe("path:./skills/x");
+  });
+
+  it("add --all from a folder inside the project records each skill relative", () => {
+    writeManifest({ version: 1, agents: ["claude"], skills: {} });
+    writeSkill(path.join(proj, "multi", "a"), "a");
+    writeSkill(path.join(proj, "multi", "b"), "b");
+    addSkill(ctx, path.join(proj, "multi"), { all: true });
+    const m = loadManifest(ctx)!;
+    expect(m.skills.a.source).toBe("path:./multi/a");
+    expect(m.skills.b.source).toBe("path:./multi/b");
+    expect(loadLock(ctx).skills.a.resolved).toBe("path:./multi/a");
+  });
+
+  it("a folder outside the project stays absolute, and sync elsewhere refuses it without the flag", () => {
+    writeManifest({ version: 1, agents: ["claude"], skills: {} });
+    writeSkill(path.join(outside, "shared"), "shared");
+    addSkill(ctx, path.join(outside, "shared"));
+    expect(loadManifest(ctx)!.skills.shared.source).toBe(path.join(outside, "shared"));
+    fs.rmSync(path.join(proj, ".skillwharf"), { recursive: true });
+    fs.rmSync(path.join(proj, ".claude"), { recursive: true });
+    expect(() => syncSkills(ctx)).toThrow(/outside the project/);
   });
 });
