@@ -11,8 +11,8 @@ concurrency:
   cancel-in-progress: true
 
 # Read-only token, and no secrets: the workflow uploads nothing. Every job runs
-# on a GitHub-hosted runner, so a pull request from a fork runs in a fresh
-# virtual machine and never on a machine of ours.
+# on GitHub-hosted runners only, so a pull request from a fork runs in a fresh
+# virtual machine that GitHub provides.
 permissions:
   contents: read
 

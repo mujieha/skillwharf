@@ -18,17 +18,29 @@ export async function loadRegistry(location: string): Promise<RegistryIndex> {
     return normalize(JSON.parse(await readCapped(res, MAX_REGISTRY_BYTES)) as RegistryIndex);
   }
   const p = fs.existsSync(location) && fs.statSync(location).isDirectory() ? path.join(location, "index.json") : location;
-  const idx = readJson<RegistryIndex>(p);
-  if (!idx) throw new Error(`Registry index not found at ${p}`);
-  return normalize(idx);
+  // lstat before reading: a device file (/dev/zero) or a named pipe would
+  // otherwise be read until memory runs out or forever.
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(p);
+  } catch {
+    throw new Error(`Registry index not found at ${p}`);
+  }
+  if (!st.isFile()) throw new Error(`Registry index ${p} is not a regular file; refusing to read it.`);
+  if (st.size > MAX_REGISTRY_BYTES) throw tooBigError(MAX_REGISTRY_BYTES);
+  return normalize(JSON.parse(fs.readFileSync(p, "utf8")) as RegistryIndex);
 }
 
 /** Largest registry index that is read; a remote server could otherwise stream without end. */
 const MAX_REGISTRY_BYTES = 5 * 1024 * 1024;
 
 /** The response body as text, refusing to read more than `max` bytes. */
+function tooBigError(max: number): Error {
+  return new Error(`Registry index is larger than ${max / (1024 * 1024)} MB; refusing to read it.`);
+}
+
 async function readCapped(res: Response, max: number): Promise<string> {
-  const tooBig = () => new Error(`Registry response is larger than ${max / (1024 * 1024)} MB; refusing to read it.`);
+  const tooBig = () => tooBigError(max);
   const declared = Number(res.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > max) throw tooBig();
   if (!res.body) return "";

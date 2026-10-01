@@ -803,14 +803,35 @@ describe("R6-D2: a path: source that is an agent target or the store is refused,
     intact();
   });
 
-  it("remove leaves the folder", () => {
-    removeSkill(ctx, "foo");
+  it("remove refuses too, and leaves the folder", () => {
+    expect(() => removeSkill(ctx, "foo")).toThrow(/overlap/);
     intact();
   });
 
   it("remove leaves an identical folder when the lock does not record a copy (a store an old version made)", () => {
     fs.cpSync(folder(), storePath(ctx, "foo"), { recursive: true });
-    removeSkill(ctx, "foo");
+    expect(() => removeSkill(ctx, "foo")).toThrow(/overlap/);
+    intact();
+    expect(fs.existsSync(path.join(storePath(ctx, "foo"), "SKILL.md"))).toBe(true);
+  });
+
+  it("a forged links record plus an identical folder that is the source cannot make remove or sync delete or replace it", () => {
+    fs.cpSync(folder(), storePath(ctx, "foo"), { recursive: true });
+    writeLock({
+      version: 1,
+      skills: {
+        foo: {
+          source: "path:./.claude/skills/foo",
+          resolved: `path:${folder()}`,
+          integrity: hashDir(storePath(ctx, "foo")),
+          installedAt: "x",
+          links: { claude: "copy" },
+        },
+      },
+    });
+    expect(() => removeSkill(ctx, "foo")).toThrow(/overlap/);
+    intact();
+    expect(() => syncSkills(ctx)).toThrow(/overlap/);
     intact();
   });
 
@@ -888,6 +909,92 @@ describe("R6-D2: a copy is ours only when the lock records that skillwharf made 
     fs.writeFileSync(path.join(target(), "mine.txt"), "mine");
     expect(() => syncSkills(ctx)).toThrow(/not managed/);
     expect(read(path.join(target(), "mine.txt"))).toBe("mine");
+  });
+});
+
+// ------------------------------------------------------------------ Round 7
+describe("R7-1: the links record is lockfile data; it does not let remove or sync replace a folder that differs", () => {
+  const target = () => path.join(proj, ".claude", "skills", "s");
+
+  /** A synced skill whose agent link is replaced by a real folder, with a forged `links` record in the lock. */
+  function forge(edit?: (dir: string) => void) {
+    writeSkill(path.join(proj, "src", "s"), "s", "v1");
+    writeManifest(claudeOnly({ s: { source: "path:./src/s" } }));
+    syncSkills(ctx);
+    fs.rmSync(target(), { recursive: true, force: true });
+    fs.cpSync(storePath(ctx, "s"), target(), { recursive: true });
+    edit?.(target());
+    const lock = loadLock(ctx);
+    lock.skills.s.links = { claude: "copy" };
+    writeLock(lock);
+  }
+
+  it("a folder with one edited byte is left alone by remove", () => {
+    forge((d) => fs.writeFileSync(path.join(d, "SKILL.md"), read(path.join(d, "SKILL.md")).replace("v1", "v2")));
+    removeSkill(ctx, "s");
+    expect(read(path.join(target(), "SKILL.md"))).toContain("v2");
+  });
+
+  it("a folder with one edited byte is refused by sync and left alone", () => {
+    forge((d) => fs.writeFileSync(path.join(d, "SKILL.md"), read(path.join(d, "SKILL.md")).replace("v1", "v2")));
+    expect(() => syncSkills(ctx)).toThrow(/not managed/);
+    expect(read(path.join(target(), "SKILL.md"))).toContain("v2");
+  });
+
+  it("the one accepted case: a forged record and a byte-identical folder that is not the source is replaceable (its content is in the store)", () => {
+    forge();
+    const r = removeSkill(ctx, "s");
+    expect(r.removedLinks).toEqual(["claude"]);
+    expect(fs.existsSync(target())).toBe(false);
+  });
+});
+
+describe("R7-2: a copy is recorded in the saved lockfile even when the run fails afterwards", () => {
+  it("sync: skill a's copy is recorded when skill b's foreign folder stops the run", () => {
+    writeSkill(path.join(proj, "src", "a"), "a");
+    writeSkill(path.join(proj, "src", "b"), "b");
+    writeManifest(claudeOnly({ a: { source: "path:./src/a" }, b: { source: "path:./src/b" } }));
+    const tb = path.join(proj, ".claude", "skills", "b");
+    fs.mkdirSync(tb, { recursive: true });
+    fs.writeFileSync(path.join(tb, "mine.txt"), "mine");
+    withoutSymlinks(() => expect(() => syncSkills(ctx)).toThrow(/not managed/));
+    expect(fs.lstatSync(path.join(proj, ".claude", "skills", "a")).isSymbolicLink()).toBe(false);
+    expect(loadLock(ctx).skills.a.links).toEqual({ claude: "copy" });
+    // so a later remove can still take the copy away
+    removeSkill(ctx, "a");
+    expect(fs.existsSync(path.join(proj, ".claude", "skills", "a"))).toBe(false);
+  });
+});
+
+describe("R7-3: a registry given as a local path is read with the same cap, and only if it is a regular file", () => {
+  it("refuses a file over 5 MB", async () => {
+    const f = path.join(base, "big.json");
+    fs.writeFileSync(f, Buffer.alloc(5 * 1024 * 1024 + 1, 0x20));
+    await expect(loadRegistry(f)).rejects.toThrow(/larger than 5 MB/);
+  });
+
+  it("refuses a directory whose index.json is too big", async () => {
+    const d = path.join(base, "regdir");
+    fs.mkdirSync(d);
+    fs.writeFileSync(path.join(d, "index.json"), Buffer.alloc(5 * 1024 * 1024 + 1, 0x20));
+    await expect(loadRegistry(d)).rejects.toThrow(/larger than 5 MB/);
+  });
+
+  it.skipIf(process.platform === "win32")("refuses a named pipe without opening it", async () => {
+    const f = path.join(base, "pipe.json");
+    execFileSync("mkfifo", [f]);
+    await expect(loadRegistry(f)).rejects.toThrow(/not a regular file/);
+  });
+
+  it.skipIf(process.platform === "win32")("refuses a device file", async () => {
+    await expect(loadRegistry("/dev/zero")).rejects.toThrow(/not a regular file/);
+  });
+
+  it("still reads an ordinary index and reports a missing one", async () => {
+    const f = path.join(base, "ok.json");
+    fs.writeFileSync(f, JSON.stringify({ version: 1, skills: [{ name: "pdf", description: "d", source: "github:o/r/pdf" }] }));
+    expect((await loadRegistry(f)).skills).toHaveLength(1);
+    await expect(loadRegistry(path.join(base, "missing.json"))).rejects.toThrow(/not found/);
   });
 });
 

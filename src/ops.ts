@@ -106,9 +106,10 @@ function copyRecorded(lock: Lockfile, name: string, g: TargetGroup): boolean {
 }
 
 /** Update the lock entry's record of which agents hold a copy, from the links just written. */
-function recordLinks(lock: Lockfile, name: string, results: LinkResult[]): void {
+function recordLinks(lock: Lockfile, name: string, results: LinkResult[]): boolean {
   const entry = lock.skills[name];
-  if (!entry) return;
+  if (!entry) return false; // a skill with no lock entry (a committed store) has nowhere to record it
+  const before = JSON.stringify(entry.links ?? null);
   const links = { ...(entry.links ?? {}) };
   for (const r of results) {
     for (const a of r.agents) {
@@ -118,6 +119,7 @@ function recordLinks(lock: Lockfile, name: string, results: LinkResult[]): void 
   }
   if (Object.keys(links).length > 0) entry.links = links;
   else delete entry.links;
+  return JSON.stringify(entry.links ?? null) !== before;
 }
 
 /** Two sources name the same place, however they were typed (relative or absolute path, URL or shorthand). */
@@ -208,7 +210,9 @@ function linkGroup(
   force?: boolean,
 ): LinkResult {
   const result = { ...linkSkill(ctx, m, g.agents[0], name, store, { force, copyRecorded: copyRecorded(lock, name, g) }), agents: g.agents };
-  recordLinks(lock, name, [result]);
+  // Saved at once: if a later link or skill fails, the copy just made must
+  // already be in the lockfile, or it would be foreign (and unremovable) from then on.
+  if (recordLinks(lock, name, [result])) saveLock(ctx, lock);
   return result;
 }
 
@@ -414,6 +418,13 @@ export function removeSkill(ctx: Context, name: string): RemoveResult {
   const existed = name in m.skills;
   const store = storePath(ctx, name);
   assertSafeInstall(ctx, m, name, store, agentsFor(m, name));
+  // The links record is lockfile data a teammate can edit. Whatever it says, a
+  // folder that is the skill's own source is never deleted: refuse before
+  // touching anything, as add, sync, update and doctor do.
+  const entry = lock.skills[name];
+  for (const raw of [m.skills[name]?.source, entry?.source, entry?.resolved]) {
+    if (typeof raw === "string") assertStoredSourceClear(ctx, m, name, raw);
+  }
   const removed: TargetGroup[] = [];
   for (const g of targetGroups(ctx, m, agentsFor(m, name), name)) {
     if (unlinkSkill(ctx, m, g.agents[0], name, store, { copyRecorded: copyRecorded(lock, name, g) })) removed.push(g);
