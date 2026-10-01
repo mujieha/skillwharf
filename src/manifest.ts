@@ -43,8 +43,8 @@ export function makeContext(opts: { global?: boolean; cwd?: string; home?: strin
 }
 
 /**
- * Walk up from `start` looking for skillwharf.json. The walk never uses the
- * home directory or anything above it as a project root, and does not climb
+ * Walk up from `start` looking for skillwharf.json. The walk stops at the
+ * home directory without reading a manifest there, and does not climb
  * into a folder the current user does not own (a manifest planted in a shared
  * /tmp would otherwise become the project of anyone working below it).
  */

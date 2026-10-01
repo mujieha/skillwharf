@@ -157,7 +157,7 @@ Override a path in the manifest:
 
 An override must sit inside one of the agent folders `.claude`, `.agents` or `.cursor` (at least one level below it, such as `.claude/custom`), and each folder name may use only letters, digits, `.`, `_` and `-`. Anything else, such as `node_modules` or `scripts`, is refused; there is no flag to relax this.
 
-On Windows without Developer Mode, symlinks fall back to copies. skillwharf records each copy it makes in the lockfile (`links`), and only a folder the lockfile records as a copy, and that still matches the store exactly, is treated as skillwharf's own; `skillwharf doctor` flags these copies. The `links` record is lockfile data that a teammate can edit: a forged record plus a folder that is byte-identical to the store (and is not the skill's own source) is the one case where a folder skillwharf did not create can be replaced or removed, and its content is recoverable from the store. A copy is recorded only when the skill has a lock entry.
+On Windows without Developer Mode, symlinks fall back to copies. skillwharf records each copy it makes in the lockfile (`links`), and only a folder the lockfile records as a copy, and that still matches the store exactly, is treated as skillwharf's own; `skillwharf doctor` flags these copies. The `links` record is lockfile data that a teammate can edit: a forged record plus a folder that is byte-identical to the store (and is not the skill's own source) is the one case where a folder skillwharf did not create can be replaced or removed, and its content survives in the skill's source or in git, not in the store, which `remove` deletes in the same run. A copy is recorded only when the skill has a lock entry.
 
 ## Usage tracking
 
