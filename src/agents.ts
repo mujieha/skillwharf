@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { exists, hashDir, isDir, isSymlink, linkOrCopy, removePath, resolveLink } from "./fs.js";
+import { exists, isDir, isPlainCopyOf, isSymlink, linkOrCopy, removePath, resolveLink } from "./fs.js";
 import { assertSafeTarget } from "./manifest.js";
 import type { AgentId, Context, Manifest } from "./types.js";
 
@@ -143,13 +143,21 @@ export interface LinkResult {
   mode: "symlink" | "copy" | "skipped";
 }
 
+/**
+ * `copyRecorded`: the lockfile says skillwharf made a copy (not a link) at this
+ * agent's location. Only then can a real folder there be skillwharf's own.
+ */
+export interface OwnershipOptions {
+  copyRecorded?: boolean;
+}
+
 export function linkSkill(
   ctx: Context,
   m: Manifest,
   agent: AgentId,
   name: string,
   storeDir: string,
-  opts: { force?: boolean } = {},
+  opts: { force?: boolean } & OwnershipOptions = {},
 ): LinkResult {
   const target = agentTarget(ctx, m, agent, name);
   if (!target) return { agents: [agent], target: "", mode: "skipped" };
@@ -157,7 +165,7 @@ export function linkSkill(
   assertSafeTarget(ctx, target, { leaf: false });
   if (isSymlink(storeDir)) throw new Error(`${storeDir} is a symlink; refusing to link it into ${agent}. Remove it and re-run.`);
   // Never silently replace something we did not create.
-  if (!opts.force && linkStatus(ctx, m, agent, name, storeDir) === "foreign") {
+  if (!opts.force && linkStatus(ctx, m, agent, name, storeDir, opts) === "foreign") {
     throw new Error(
       `${target} already exists and is not managed by skillwharf. Move it away, or re-run with --force to replace it.`,
     );
@@ -166,7 +174,14 @@ export function linkSkill(
   return { agents: [agent], target, mode };
 }
 
-export function unlinkSkill(ctx: Context, m: Manifest, agent: AgentId, name: string, storeDir: string): boolean {
+export function unlinkSkill(
+  ctx: Context,
+  m: Manifest,
+  agent: AgentId,
+  name: string,
+  storeDir: string,
+  opts: OwnershipOptions = {},
+): boolean {
   const target = agentTarget(ctx, m, agent, name);
   if (!target) return false;
   assertSafeTarget(ctx, target, { leaf: false });
@@ -180,9 +195,12 @@ export function unlinkSkill(ctx: Context, m: Manifest, agent: AgentId, name: str
       (!isSymlink(storeDir) && isDir(storeDir) && resolveLink(target) === realStoreDir(storeDir));
     if (!ours) return false;
   } else {
-    // A real directory: only remove it if it is byte-identical to our store
-    // copy (copy fallback). Anything else was put there by someone else.
-    if (!isDir(target) || !isDir(storeDir) || hashDir(target) !== hashDir(storeDir)) return false;
+    // A real directory: only remove it if the lockfile says skillwharf made a
+    // copy here (the symlink fallback) and it is still exactly what copying our
+    // store folder produces: same files, same folders, no .git, no links.
+    // Identical content alone proves nothing (a user's own copy or clone of the
+    // same skill is identical too); anything else was put there by someone else.
+    if (!opts.copyRecorded || !isDir(target) || !isDir(storeDir) || !isPlainCopyOf(target, storeDir)) return false;
   }
   removePath(target);
   return true;
@@ -191,7 +209,14 @@ export function unlinkSkill(ctx: Context, m: Manifest, agent: AgentId, name: str
 export type LinkStatus = "ok" | "missing" | "broken" | "foreign" | "stale-copy";
 
 /** Inspect the state of an agent's install of a skill. */
-export function linkStatus(ctx: Context, m: Manifest, agent: AgentId, name: string, storeDir: string): LinkStatus {
+export function linkStatus(
+  ctx: Context,
+  m: Manifest,
+  agent: AgentId,
+  name: string,
+  storeDir: string,
+  opts: OwnershipOptions = {},
+): LinkStatus {
   const target = agentTarget(ctx, m, agent, name);
   if (!target || !exists(target)) return "missing";
   // A store entry that is itself a symlink points somewhere skillwharf did not
@@ -202,7 +227,8 @@ export function linkStatus(ctx: Context, m: Manifest, agent: AgentId, name: stri
     if (!real) return "broken";
     return !storeIsLink && real === realStoreDir(storeDir) ? "ok" : "foreign";
   }
-  // A real directory is only "ours" (a copy fallback) if it matches the store byte for byte.
-  if (!storeIsLink && isDir(target) && isDir(storeDir) && hashDir(target) === hashDir(storeDir)) return "stale-copy";
+  // A real directory is only "ours" (a copy fallback) if the lockfile records a
+  // copy here and it is exactly a copy of the store folder.
+  if (opts.copyRecorded && !storeIsLink && isDir(target) && isDir(storeDir) && isPlainCopyOf(target, storeDir)) return "stale-copy";
   return "foreign";
 }

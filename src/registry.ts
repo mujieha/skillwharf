@@ -15,12 +15,49 @@ export async function loadRegistry(location: string): Promise<RegistryIndex> {
       throw new Error("the default registry is not available yet; pass --registry <url|path>");
     }
     if (!res.ok) throw new Error(`Registry fetch failed (${res.status}) for ${location}`);
-    return normalize((await res.json()) as RegistryIndex);
+    return normalize(JSON.parse(await readCapped(res, MAX_REGISTRY_BYTES)) as RegistryIndex);
   }
   const p = fs.existsSync(location) && fs.statSync(location).isDirectory() ? path.join(location, "index.json") : location;
-  const idx = readJson<RegistryIndex>(p);
-  if (!idx) throw new Error(`Registry index not found at ${p}`);
-  return normalize(idx);
+  // lstat before reading: a device file (/dev/zero) or a named pipe would
+  // otherwise be read until memory runs out or forever.
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(p);
+  } catch {
+    throw new Error(`Registry index not found at ${p}`);
+  }
+  if (!st.isFile()) throw new Error(`Registry index ${p} is not a regular file; refusing to read it.`);
+  if (st.size > MAX_REGISTRY_BYTES) throw tooBigError(MAX_REGISTRY_BYTES);
+  return normalize(JSON.parse(fs.readFileSync(p, "utf8")) as RegistryIndex);
+}
+
+/** Largest registry index that is read; a remote server could otherwise stream without end. */
+const MAX_REGISTRY_BYTES = 5 * 1024 * 1024;
+
+/** The response body as text, refusing to read more than `max` bytes. */
+function tooBigError(max: number): Error {
+  return new Error(`Registry index is larger than ${max / (1024 * 1024)} MB; refusing to read it.`);
+}
+
+async function readCapped(res: Response, max: number): Promise<string> {
+  const tooBig = () => tooBigError(max);
+  const declared = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > max) throw tooBig();
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel();
+      throw tooBig();
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 function normalize(idx: RegistryIndex): RegistryIndex {
@@ -30,17 +67,23 @@ function normalize(idx: RegistryIndex): RegistryIndex {
     (e) =>
       e && typeof e.name === "string" && SKILL_NAME_RE.test(e.name) &&
       typeof e.description === "string" && typeof e.source === "string" && e.source.length < 512 &&
+      e.source === e.source.trim() &&
       isGithubSource(e.source) &&
       (e.tags === undefined || (Array.isArray(e.tags) && e.tags.every((t) => typeof t === "string" && t.length < 40))),
   );
   return {
     version: 1,
-    skills: clean.map((e) => ({
-      ...e,
-      description: sanitizeForTerminal(e.description.slice(0, 300)),
-      tags: e.tags?.map(sanitizeForTerminal),
-      version: typeof e.version === "string" ? sanitizeForTerminal(e.version) : undefined,
-    })),
+    // Known fields only: whatever else an entry carries is not ours to pass on.
+    skills: clean.map((e) => {
+      const entry: RegistryEntry = {
+        name: e.name,
+        description: sanitizeForTerminal(e.description.slice(0, 300)),
+        source: e.source,
+      };
+      if (e.tags) entry.tags = e.tags.map(sanitizeForTerminal);
+      if (typeof e.version === "string") entry.version = sanitizeForTerminal(e.version);
+      return entry;
+    }),
   };
 }
 

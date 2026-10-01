@@ -1,6 +1,6 @@
 {
   "name": "skillwharf",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Install, version, sync and track agent skills (SKILL.md) across Claude Code, Codex, Cursor and more.",
   "type": "module",
   "bin": {

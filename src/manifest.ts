@@ -1,12 +1,16 @@
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { assertNoSymlinks, exists, readJson, writeJson } from "./fs.js";
-import type { AgentId, Context, Lockfile, Manifest } from "./types.js";
-import { assertSkillName } from "./validate.js";
+import { assertNoSymlinks, exists, readJson, resolveLink, writeJson } from "./fs.js";
+import type { AgentId, Context, LockEntry, Lockfile, Manifest } from "./types.js";
+import { assertSkillName, hasTerminalUnsafe } from "./validate.js";
 
 const KNOWN_AGENTS = new Set(["claude", "codex", "agents", "cursor"]);
-/** Top-level directories an agentPaths override may never resolve into (compared lowercase). */
+/** Directory names an agentPaths override may never use (compared lowercase, after Unicode folding). */
 const RESERVED_DIRS = new Set([".skillwharf", ".git"]);
+/** The agent folders an agentPaths override must stay inside (the folders ADAPTERS in agents.ts use). */
+const AGENT_DIRS = [".claude", ".agents", ".cursor"];
+const AGENT_PART_RE = /^[A-Za-z0-9._-]+$/;
 
 export const MANIFEST = "skillwharf.json";
 export const LOCKFILE = "skillwharf.lock.json";
@@ -35,16 +39,31 @@ export function makeContext(opts: { global?: boolean; cwd?: string; home?: strin
     return { root: path.join(home, ".skillwharf"), global: true, home };
   }
   const start = opts.cwd ?? process.cwd();
-  return { root: findProjectRoot(start) ?? start, global: false, home };
+  return { root: findProjectRoot(start, home) ?? start, global: false, home };
 }
 
-/** Walk up from `start` looking for skillwharf.json. */
-export function findProjectRoot(start: string): string | undefined {
+/**
+ * Walk up from `start` looking for skillwharf.json. The walk stops at the
+ * home directory without reading a manifest there, and does not climb
+ * into a folder the current user does not own (a manifest planted in a shared
+ * /tmp would otherwise become the project of anyone working below it).
+ */
+export function findProjectRoot(start: string, home: string = os.homedir()): string | undefined {
+  const homes = new Set([path.resolve(home), resolveLink(home)].filter((h): h is string => h !== undefined));
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
   let dir = path.resolve(start);
   for (;;) {
+    if (homes.has(dir) || homes.has(resolveLink(dir) ?? dir)) return undefined;
     if (exists(path.join(dir, MANIFEST))) return dir;
     const parent = path.dirname(dir);
     if (parent === dir) return undefined;
+    if (uid !== undefined && uid !== 0) {
+      try {
+        if (fs.statSync(parent).uid !== uid) return undefined;
+      } catch {
+        return undefined;
+      }
+    }
     dir = parent;
   }
 }
@@ -90,18 +109,49 @@ export function validateManifest(m: Manifest, file: string): Manifest {
   for (const [agent, o] of Object.entries(m.agentPaths ?? {})) {
     if (!KNOWN_AGENTS.has(agent)) throw bad(`agentPaths: unknown agent "${agent}"`);
     for (const p of [o?.projectPath, o?.globalPath]) {
-      if (p !== undefined && (typeof p !== "string" || path.isAbsolute(p) || p.split(/[\\/]/).includes(".."))) {
+      if (p === undefined) continue;
+      if (typeof p !== "string" || path.isAbsolute(p) || p.split(/[\\/]/).includes("..")) {
         throw bad(`agentPaths.${agent}: paths must be relative and may not contain ".."`);
       }
+      if (hasTerminalUnsafe(p)) {
+        throw bad(`agentPaths.${agent}: paths may not contain control or bidirectional-override characters`);
+      }
       // Linking into skillwharf's own store (or into .git) would replace the
-      // store with a link to itself, or plant files git executes.
-      const first = p?.split(/[\\/]/).find((s) => s !== "" && s !== ".")?.toLowerCase();
+      // store with a link to itself, or plant files git executes. Compared
+      // after Unicode folding: a case-insensitive volume folds U+017F to "s".
+      const first = p
+        .split(/[\\/]/)
+        .find((s) => s !== "" && s !== ".")
+        ?.normalize("NFKC")
+        .toLowerCase();
       if (first !== undefined && RESERVED_DIRS.has(first)) {
         throw bad(`agentPaths.${agent}: paths may not point inside ${first}`);
       }
+      const problem = agentPathProblem(p);
+      if (problem) throw bad(`agentPaths.${agent}: ${problem}`);
     }
   }
   return m;
+}
+
+/**
+ * An override may only move skills between the known agent folders' own
+ * subfolders. Anywhere else in the project is a place something else reads as
+ * code (`node_modules`, `scripts`, `.husky`) or a name some file system aliases
+ * (`GIT~1`, trailing dots, ignorable code points). The ASCII charset and the
+ * allowlist leave none of those expressible.
+ */
+function agentPathProblem(p: string): string | undefined {
+  const parts = p.split("/").filter((s) => s !== "" && s !== ".");
+  if (parts.length < 2 || !AGENT_DIRS.includes(parts[0])) {
+    return `paths must be inside one of ${AGENT_DIRS.map((d) => `${d}/`).join(", ")} (for example ".claude/custom")`;
+  }
+  for (const part of parts) {
+    if (!AGENT_PART_RE.test(part) || part.endsWith(".") || RESERVED_DIRS.has(part.normalize("NFKC").toLowerCase())) {
+      return `"${part}" is not allowed: use only letters, digits, ".", "_" and "-" in each folder name, no name may end in ".", and none may be .git or .skillwharf`;
+    }
+  }
+  return undefined;
 }
 
 export function requireManifest(ctx: Context): Manifest {
@@ -122,7 +172,19 @@ export function saveManifest(ctx: Context, m: Manifest): void {
 export function loadLock(ctx: Context): Lockfile {
   const l = readJson<Lockfile>(assertSafeTarget(ctx, lockPath(ctx))) ?? { version: 1, skills: {} };
   if (typeof l.skills !== "object" || l.skills === null) throw new Error(`${lockPath(ctx)}: "skills" must be an object`);
-  for (const name of Object.keys(l.skills)) assertSkillName(name);
+  for (const [name, entry] of Object.entries(l.skills)) {
+    assertSkillName(name);
+    // Only a recorded copy of a known agent means anything; drop the rest.
+    if (entry && typeof entry === "object" && "links" in entry) {
+      const raw = entry.links as unknown;
+      const kept =
+        raw && typeof raw === "object"
+          ? Object.entries(raw).filter(([a, v]) => KNOWN_AGENTS.has(a) && v === "copy")
+          : [];
+      if (kept.length > 0) entry.links = Object.fromEntries(kept) as LockEntry["links"];
+      else delete entry.links;
+    }
+  }
   return l;
 }
 

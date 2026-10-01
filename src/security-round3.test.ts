@@ -96,7 +96,9 @@ describe("R3-3: agentPaths may not point into .skillwharf or .git", () => {
   });
 
   it("still accepts an ordinary override", () => {
-    expect(() => validateManifest(m({ projectPath: ".mytool/skills" }), "skillwharf.json")).not.toThrow();
+    // Round 6 (D3): an override must sit inside a known agent folder, so the
+    // ordinary override here is one of those (it was ".mytool/skills").
+    expect(() => validateManifest(m({ projectPath: ".claude/custom" }), "skillwharf.json")).not.toThrow();
   });
 
   it("add refuses instead of replacing the store with a self-referencing link", () => {

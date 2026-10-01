@@ -48,13 +48,42 @@ export function sanitizeForTerminal(s: string): string {
   return String(s).replace(TERMINAL_UNSAFE_RE, "");
 }
 
-/** A repo sub-path: relative, no traversal, no leading slash. */
+/** True when `s` holds a character `sanitizeForTerminal` would strip. */
+export function hasTerminalUnsafe(s: string): boolean {
+  return sanitizeForTerminal(s) !== s;
+}
+
+/**
+ * A copy of `value` as JSON text with every string (and key) sanitised.
+ * JSON.stringify escapes only C0 controls, so C1 controls and bidi overrides
+ * would otherwise reach a terminal or a log viewer through `--json` output.
+ */
+export function toSafeJson(value: unknown): string {
+  const scrub = (v: unknown): unknown => {
+    if (typeof v === "string") return sanitizeForTerminal(v);
+    if (Array.isArray(v)) return v.map(scrub);
+    if (v !== null && typeof v === "object") {
+      return Object.fromEntries(Object.entries(v).map(([k, x]) => [sanitizeForTerminal(k), scrub(x)]));
+    }
+    return v;
+  };
+  // Round-trip first so Dates and anything else with toJSON become plain data.
+  return JSON.stringify(scrub(JSON.parse(JSON.stringify(value))), null, 2);
+}
+
+const SUBPATH_PART_RE = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * A repo sub-path: relative, no traversal, no leading slash, and every folder
+ * name limited to letters, digits, `.`, `_` and `-`. The sub-path is shown as a
+ * copy-paste `skillwharf add` command, so shell metacharacters and spaces have
+ * no business in it.
+ */
 export function assertSubpath(sub: string): string {
   if (sub === "") return sub;
-  const parts = sub.split("/");
-  for (const p of parts) {
-    if (p === "" || p === "." || p === ".." || p.includes("\\") || p.includes("\0")) {
-      throw new Error(`Invalid sub-path "${sub}"`);
+  for (const p of sub.split("/")) {
+    if (!SUBPATH_PART_RE.test(p) || p === "." || p === ".." || p.toLowerCase() === ".git") {
+      throw new Error(`Invalid sub-path "${sub}": folder names may use only letters, digits, ".", "_" and "-"`);
     }
   }
   return sub;

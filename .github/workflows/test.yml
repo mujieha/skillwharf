@@ -10,8 +10,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# Read-only token. This workflow has no secrets and uploads nothing, so a pull
-# request from a fork gains nothing by running it.
+# Read-only token, and no secrets: the workflow uploads nothing. Every job runs
+# on GitHub-hosted runners only, so a pull request from a fork runs in a fresh
+# virtual machine that GitHub provides.
 permissions:
   contents: read
 
@@ -23,15 +24,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Hosted runners consume paid minutes on a private repository, so
-        # while this one is private every leg runs on the maintainer's own
-        # macOS runner and the Linux leg is skipped. A public repository gets
-        # hosted runners free, and a self-hosted runner must never take pull
-        # requests from forks, so the switch back is automatic.
-        os: ${{ github.event.repository.private && fromJSON('["self-hosted"]') || fromJSON('["ubuntu-latest","macos-latest"]') }}
+        os: [ubuntu-latest, macos-latest]
         node: [22, 24]
-    runs-on: ${{ matrix.os == 'self-hosted' && fromJSON('["self-hosted","macOS","ARM64"]') || matrix.os }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -39,11 +37,7 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: ${{ matrix.node }}
-          # Hosted runners cache npm through Actions. The self-hosted runner's
-          # npm cache is the maintainer's own ~/.npm, already warm, and
-          # round-tripping it through the Actions cache stalls the job.
-          cache: ${{ matrix.os != 'self-hosted' && 'npm' || '' }}
-          package-manager-cache: ${{ matrix.os != 'self-hosted' }}
+          cache: npm
 
       - name: Install
         run: npm ci

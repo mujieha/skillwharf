@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import pc from "picocolors";
 import { ADAPTERS, ALL_AGENTS, DEFAULT_AGENTS, groupLabel, isAgentId, targetGroups } from "./agents.js";
-import { isDir } from "./fs.js";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_FILES, isDir, type SizeLimits } from "./fs.js";
 import {
   DEFAULT_REGISTRY,
   MANIFEST,
@@ -23,9 +23,9 @@ import { readSkill } from "./skill.js";
 import { parseSource } from "./source.js";
 import type { AgentId, Context } from "./types.js";
 import { daysAgo, scanClaudeUsage } from "./usage.js";
-import { sanitizeForTerminal } from "./validate.js";
+import { sanitizeForTerminal, toSafeJson } from "./validate.js";
 
-const VERSION = "0.1.1";
+const VERSION = "0.1.2";
 
 const program = new Command()
   .name("skillwharf")
@@ -44,6 +44,22 @@ function parseAgents(s: string | undefined): AgentId[] | undefined {
   const ids = s.split(",").map((x) => x.trim()).filter(Boolean);
   for (const id of ids) if (!isAgentId(id)) fail(`Unknown agent "${id}". Known: ${ALL_AGENTS.join(", ")}`);
   return ids as AgentId[];
+}
+
+/** `--max-skill-size <mb>` and `--max-skill-files <n>` as the size cap ops expects. */
+function parseLimits(o: { maxSkillSize?: string; maxSkillFiles?: string }): SizeLimits | undefined {
+  const limits: SizeLimits = {};
+  if (o.maxSkillSize !== undefined) {
+    const mb = Number(o.maxSkillSize);
+    if (!Number.isFinite(mb) || mb <= 0) fail(`--max-skill-size takes a positive number of megabytes, got "${o.maxSkillSize}"`);
+    limits.maxBytes = Math.floor(mb * 1024 * 1024);
+  }
+  if (o.maxSkillFiles !== undefined) {
+    const n = Number(o.maxSkillFiles);
+    if (!Number.isInteger(n) || n <= 0) fail(`--max-skill-files takes a positive whole number, got "${o.maxSkillFiles}"`);
+    limits.maxFiles = n;
+  }
+  return Object.keys(limits).length > 0 ? limits : undefined;
 }
 
 function fail(msg: string): never {
@@ -92,6 +108,15 @@ program
   });
 
 // ---------------------------------------------------------------- add
+interface AddCliOptions {
+  name?: string;
+  agents?: string;
+  all?: boolean;
+  force?: boolean;
+  maxSkillSize?: string;
+  maxSkillFiles?: string;
+}
+
 program
   .command("add <source>")
   .description("install a skill from github:owner/repo[/path][@ref], a GitHub URL, or a local path")
@@ -99,10 +124,19 @@ program
   .option("-a, --agents <list>", "only link into these agents")
   .option("--all", "install every skill found in the source")
   .option("--force", "replace agent files that skillwharf did not create")
-  .action((source: string, opts: { name?: string; agents?: string; all?: boolean; force?: boolean }, cmd: Command) => {
+  .option("--max-skill-size <mb>", `refuse a skill folder over this many megabytes (default ${DEFAULT_MAX_BYTES / 1024 / 1024})`)
+  .option("--max-skill-files <n>", `refuse a skill folder with more than this many files and folders (default ${DEFAULT_MAX_FILES})`)
+  .action((source: string, opts: AddCliOptions, cmd: Command) => {
     const ctx = ctxFrom(cmd);
     try {
-      const added = addSkill(ctx, source, { name: opts.name, agents: parseAgents(opts.agents), all: opts.all, force: opts.force });
+      const added = addSkill(ctx, source, {
+        name: opts.name,
+        agents: parseAgents(opts.agents),
+        all: opts.all,
+        force: opts.force,
+        limits: parseLimits(opts),
+        onSkipped: (s) => console.log(pc.yellow("!"), `skipped ${clean(s.dir)}: ${clean(s.reason)}`),
+      });
       for (const a of added) {
         console.log(pc.green("✔"), pc.bold(a.name), a.meta.version ? pc.dim(`v${clean(a.meta.version)}`) : "", pc.dim(clean(a.lock.resolved)));
         for (const l of a.links) {
@@ -140,12 +174,22 @@ program
   .command("sync")
   .description("make the store and every agent directory match the manifest")
   .option("--force", "replace agent files that skillwharf did not create")
-  .option("--allow-unpinned", "if a pinned commit cannot be fetched, install the manifest source as it is now")
+  .option(
+    "--allow-unpinned",
+    "install what the lockfile cannot verify: the manifest source if a pinned commit cannot be fetched, or the pinned commit unchecked if its entry has no integrity hash",
+  )
   .option("--allow-outside-paths", "accept path: sources that resolve outside the project")
-  .action((opts: { force?: boolean; allowUnpinned?: boolean; allowOutsidePaths?: boolean }, cmd: Command) => {
+  .option("--max-skill-size <mb>", `refuse a skill folder over this many megabytes (default ${DEFAULT_MAX_BYTES / 1024 / 1024})`)
+  .option("--max-skill-files <n>", `refuse a skill folder with more than this many files and folders (default ${DEFAULT_MAX_FILES})`)
+  .action((opts: { force?: boolean; allowUnpinned?: boolean; allowOutsidePaths?: boolean; maxSkillSize?: string; maxSkillFiles?: string }, cmd: Command) => {
     const ctx = ctxFrom(cmd);
     try {
-      const r = syncSkills(ctx, { force: opts.force, allowUnpinned: opts.allowUnpinned, allowOutsidePaths: opts.allowOutsidePaths });
+      const r = syncSkills(ctx, {
+        force: opts.force,
+        allowUnpinned: opts.allowUnpinned,
+        allowOutsidePaths: opts.allowOutsidePaths,
+        limits: parseLimits(opts),
+      });
       for (const n of r.fetched) console.log(pc.green("✔"), "fetched", pc.bold(n));
       for (const l of r.linked) console.log(pc.green("✔"), "linked ", pc.bold(l.name), pc.dim(`→ ${groupLabel(l.link.agents)} (${l.link.mode})`));
       if (r.fetched.length + r.linked.length === 0) console.log(pc.green("✔"), `everything in sync (${r.unchanged.length} skills)`);
@@ -159,10 +203,12 @@ program
   .command("update [names...]")
   .description("re-fetch skills from their sources and refresh the lockfile")
   .option("--allow-outside-paths", "accept path: sources that resolve outside the project")
-  .action((names: string[], opts: { allowOutsidePaths?: boolean }, cmd: Command) => {
+  .option("--max-skill-size <mb>", `refuse a skill folder over this many megabytes (default ${DEFAULT_MAX_BYTES / 1024 / 1024})`)
+  .option("--max-skill-files <n>", `refuse a skill folder with more than this many files and folders (default ${DEFAULT_MAX_FILES})`)
+  .action((names: string[], opts: { allowOutsidePaths?: boolean; maxSkillSize?: string; maxSkillFiles?: string }, cmd: Command) => {
     const ctx = ctxFrom(cmd);
     try {
-      const res = updateSkills(ctx, names, { allowOutsidePaths: opts.allowOutsidePaths });
+      const res = updateSkills(ctx, names, { allowOutsidePaths: opts.allowOutsidePaths, limits: parseLimits(opts) });
       for (const r of res) {
         console.log(r.changed ? pc.green("↑") : pc.dim("="), pc.bold(r.name), r.changed ? "updated" : pc.dim("unchanged"));
       }
@@ -215,7 +261,7 @@ program
     });
 
     if (gopts.json) {
-      console.log(JSON.stringify(rows, null, 2));
+      console.log(toSafeJson(rows));
       return;
     }
     if (rows.length === 0) {
@@ -263,15 +309,11 @@ program
 
     if (gopts.json) {
       console.log(
-        JSON.stringify(
-          {
-            days: Number(opts.days),
-            used: rows.map((r) => ({ skill: r.skill, count: r.count, lastUsed: r.lastUsed, projects: [...r.projects] })),
-            neverUsed: never,
-          },
-          null,
-          2,
-        ),
+        toSafeJson({
+          days: Number(opts.days),
+          used: rows.map((r) => ({ skill: r.skill, count: r.count, lastUsed: r.lastUsed, projects: [...r.projects] })),
+          neverUsed: never,
+        }),
       );
       return;
     }
@@ -343,7 +385,7 @@ program
     try {
       const idx = await loadRegistry(reg);
       const hits = searchRegistry(idx, query.join(" "));
-      if (gopts.json) return console.log(JSON.stringify(hits, null, 2));
+      if (gopts.json) return console.log(toSafeJson(hits));
       if (hits.length === 0) return console.log(pc.dim(`no matches in ${clean(reg)}`));
       console.log(
         table(
@@ -391,8 +433,9 @@ program
     const m = requireManifest(ctx);
     const groups = targetGroups(ctx, m, agentsFor(m, name), name);
     const width = Math.max(5, ...groups.map((g) => groupLabel(g.agents).length));
-    console.log("store".padEnd(width), storePath(ctx, name));
-    for (const g of groups) console.log(groupLabel(g.agents).padEnd(width), g.target);
+    // Paths come from the manifest (agentPaths) and from folder names: print them sanitised.
+    console.log("store".padEnd(width), clean(storePath(ctx, name)));
+    for (const g of groups) console.log(groupLabel(g.agents).padEnd(width), clean(g.target));
   });
 
 program.parseAsync(process.argv).catch((e: Error) => fail(e.message));
