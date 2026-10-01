@@ -2,7 +2,7 @@ import os from "node:os";
 import path from "node:path";
 import { assertNoSymlinks, exists, readJson, writeJson } from "./fs.js";
 import type { AgentId, Context, Lockfile, Manifest } from "./types.js";
-import { assertSkillName } from "./validate.js";
+import { assertSkillName, hasTerminalUnsafe } from "./validate.js";
 
 const KNOWN_AGENTS = new Set(["claude", "codex", "agents", "cursor"]);
 /** Top-level directories an agentPaths override may never resolve into (compared lowercase). */
@@ -93,9 +93,17 @@ export function validateManifest(m: Manifest, file: string): Manifest {
       if (p !== undefined && (typeof p !== "string" || path.isAbsolute(p) || p.split(/[\\/]/).includes(".."))) {
         throw bad(`agentPaths.${agent}: paths must be relative and may not contain ".."`);
       }
+      if (p !== undefined && hasTerminalUnsafe(p)) {
+        throw bad(`agentPaths.${agent}: paths may not contain control or bidirectional-override characters`);
+      }
       // Linking into skillwharf's own store (or into .git) would replace the
-      // store with a link to itself, or plant files git executes.
-      const first = p?.split(/[\\/]/).find((s) => s !== "" && s !== ".")?.toLowerCase();
+      // store with a link to itself, or plant files git executes. Compared
+      // after Unicode folding: a case-insensitive volume folds U+017F to "s".
+      const first = p
+        ?.split(/[\\/]/)
+        .find((s) => s !== "" && s !== ".")
+        ?.normalize("NFKC")
+        .toLowerCase();
       if (first !== undefined && RESERVED_DIRS.has(first)) {
         throw bad(`agentPaths.${agent}: paths may not point inside ${first}`);
       }

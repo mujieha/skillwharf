@@ -41,8 +41,11 @@ skillwharf treats skills the way a package manager treats dependencies. `skillwh
 says which skills a project wants, and `skillwharf.lock.json` pins each one to a full
 commit sha and a content hash. One copy lives in `.skillwharf/skills`, and each agent's
 folder gets a link to it. Commit the two files, and a teammate who clones the project runs
-`skillwharf sync` to get exactly the same skills; `sync` refuses a lockfile it cannot
-verify. `skillwharf doctor` reports broken links, drift from the lockfile, folders
+`skillwharf sync` to get the same skills: it fetches each one at its pinned commit and
+refuses it if the content's hash differs from the lockfile (a lockfile entry with no hash
+is refused too, unless you pass `--allow-unpinned`). A skill with no lockfile entry yet is
+installed from its manifest source as it is now, then pinned.
+`skillwharf doctor` reports broken links, drift from the lockfile, folders
 skillwharf did not create, and skills nobody has used lately. `skillwharf usage` reads
 Claude Code's local session logs to show which skills actually fire.
 
@@ -82,10 +85,10 @@ skillwharf sync                                             # after a fresh git 
 | Command | Does |
 | --- | --- |
 | `skillwharf init [-a claude,agents,codex,cursor]` | Write `skillwharf.json`; the default agents are `claude,agents` |
-| `skillwharf add <source> [--name n] [--agents a,b] [--all] [--force]` | Install from `github:owner/repo[/path][@ref]`, a GitHub URL or a local path |
+| `skillwharf add <source> [--name n] [--agents a,b] [--all] [--force] [--max-skill-size mb] [--max-skill-files n]` | Install from `github:owner/repo[/path][@ref]`, a GitHub URL or a local path |
 | `skillwharf remove <name>` | Unlink from agents and delete from the store |
-| `skillwharf sync [--force]` | Make the store and agent folders match the manifest — run after `git clone` |
-| `skillwharf update [names...]` | Re-fetch from source, refresh the lockfile, report what changed |
+| `skillwharf sync [--force] [--allow-unpinned] [--allow-outside-paths]` | Make the store and agent folders match the manifest — run after `git clone` |
+| `skillwharf update [names...] [--allow-outside-paths]` | Re-fetch from source, refresh the lockfile, report what changed |
 | `skillwharf list` | Skills, versions, agents, uses in the last 90 days |
 | `skillwharf usage [--days 30] [--all-projects]` | Which skills actually fire, from Claude Code session logs |
 | `skillwharf doctor [--stale-days 60]` | Broken links, local drift, skills nobody used |
@@ -105,7 +108,7 @@ Add `-g` to any command to manage `~/.skillwharf` and the agents' global folders
   "agents": ["claude", "agents"],
   "skills": {
     "mcp-builder": { "source": "github:anthropics/skills/skills/mcp-builder" },
-    "release-notes": { "source": "path:../shared-skills/release-notes", "agents": ["claude"] }
+    "release-notes": { "source": "path:./skills/release-notes", "agents": ["claude"] }
   }
 }
 ```
@@ -126,7 +129,9 @@ Add `-g` to any command to manage `~/.skillwharf` and the agents' global folders
 }
 ```
 
-Add `.skillwharf/` and the agent folders (`.claude/skills`, `.agents/skills`, and `.cursor/skills` if you enabled `cursor`) to `.gitignore` if you prefer teammates to run `skillwharf sync`, which installs exactly the pinned commit and refuses content whose hash differs from the lockfile. If you commit them instead, `skillwharf doctor` reports any store folder that differs from the lockfile; `sync` does not re-check a folder that is already there. Commit real folders: skillwharf refuses to write through a store or agent folder that is a symlink.
+A `path:` source in the manifest is relative to the project root and must stay inside the project; `sync` and `update` refuse one outside it unless you pass `--allow-outside-paths`.
+
+Add `.skillwharf/` and the agent folders (`.claude/skills`, `.agents/skills`, and `.cursor/skills` if you enabled `cursor`) to `.gitignore` if you prefer teammates to run `skillwharf sync`, which installs the pinned commit and refuses content whose hash differs from the lockfile. If you commit them instead, `skillwharf doctor` reports any store folder that differs from the lockfile; `sync` does not re-check a folder that is already there. Commit real folders: skillwharf refuses to write through a store or agent folder that is a symlink.
 
 ## Supported agents
 
@@ -173,7 +178,7 @@ Point a project at one with `skillwharf init --registry <url>` or `"registry"` i
 | GitHub URL | `https://github.com/owner/repo/tree/main/sub/dir` |
 | Local path | `./skills/foo`, `../shared/foo`, `path:/abs/foo` |
 
-GitHub sources are fetched with `git clone --depth 1`, so private repos work if `git` can already reach them.
+GitHub sources are fetched with `git clone --depth 1`, so private repos work if `git` can already reach them. Each folder name in a sub-path may use only letters, digits, `.`, `_` and `-`, and a symlink anywhere on the sub-path is refused. A skill folder with more than 2,000 files and folders or more than 50 MB is refused; `--max-skill-files` and `--max-skill-size` (megabytes) raise the cap on `add`, `sync` and `update`.
 
 ## Development
 
@@ -192,6 +197,7 @@ MIT
 - Windows without Developer Mode falls back to copying instead of symlinking; `doctor` flags the copies.
 - The default registry is a starter list; it is schema-checked, not reviewed.
 - A registry URL is fetched without credentials, so a company registry must be reachable over https without a login, or used from a local checkout (`--registry <path>`).
+- The size cap applies to the skill folder that is installed, not to the `git clone` that fetches it.
 - There is no central approval or audit step; changes to skills are reviewed through the pull requests that change `skillwharf.json` and the lockfile.
 - skillwharf does not review a skill's content — read a `SKILL.md` before installing it, as you would a shell script.
 

@@ -1,5 +1,5 @@
 import path from "node:path";
-import { exists, findSymlinks, hashDir, isDir, isInside, removePath, resolveLink } from "./fs.js";
+import { assertWithinLimits, exists, findSymlinks, hashDir, isDir, isInside, removePath, resolveLink, type SizeLimits } from "./fs.js";
 import {
   groupLabel,
   linkSkill,
@@ -22,6 +22,8 @@ export interface SourceOptions {
    * be able to copy arbitrary local folders into the agent's instructions.
    */
   allowOutsidePaths?: boolean;
+  /** Override the default size cap for one skill folder. */
+  limits?: SizeLimits;
 }
 
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
@@ -44,6 +46,11 @@ export function parseStoredSource(ctx: Context, raw: string, opts: SourceOptions
     }
   }
   return p;
+}
+
+/** True when a lock entry carries a content hash to verify against. */
+function hasIntegrity(entry: LockEntry): boolean {
+  return typeof entry.integrity === "string" && entry.integrity !== "";
 }
 
 /** A lock pin that is well-formed but cannot be fetched as-is (e.g. an abbreviated sha). */
@@ -117,6 +124,8 @@ export interface AddOptions {
   all?: boolean;
   /** Replace agent-side files that skillwharf did not create */
   force?: boolean;
+  /** Override the default size cap for one skill folder */
+  limits?: SizeLimits;
 }
 
 export interface AddedSkill {
@@ -148,22 +157,34 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
     }
     if (dirs.length > 1 && opts.name) throw new Error(`--name cannot be used with --all`);
 
-    const results: AddedSkill[] = [];
-    for (const dir of dirs) {
+    // Plan every skill first: names, store paths, agent targets, size. A skill
+    // that cannot be installed stops the whole run before anything is written,
+    // so `--all` never leaves earlier skills linked but unrecorded.
+    const seen = new Set<string>();
+    const plan = dirs.map((dir) => {
       const meta = readSkill(dir);
       const name = normalizeName(opts.name ?? meta.name);
+      if (seen.has(name)) throw new Error(`Two skills in ${sourceRaw} resolve to the name "${name}". Install them one at a time with --name.`);
+      seen.add(name);
       const store = storePath(ctx, name);
-      const skippedSymlinks = findSymlinks(dir);
-      // Check every agent target before touching the filesystem so a refusal
-      // leaves nothing half-installed.
-      const targets = opts.agents ?? m.skills[name]?.agents ?? m.agents;
+      // The agent set is fixed here and used for the check and for the links.
+      // `--agents` replaces a skill's own list; without it the list it has
+      // (or the manifest's default) is kept as it was.
+      const agentList = opts.agents ?? m.skills[name]?.agents;
+      const targets = agentList ?? m.agents;
       assertSafeInstall(ctx, m, name, store, targets);
       for (const g of targetGroups(ctx, m, targets, name)) {
         if (!opts.force && linkStatus(ctx, m, g.agents[0], name, store) === "foreign") {
           throw new Error(`${g.target} already exists and is not managed by skillwharf. Move it away, or re-run with --force.`);
         }
       }
-      installToStore(dir, store);
+      assertWithinLimits(dir, opts.limits);
+      return { dir, meta, name, store, agentList, targets, skippedSymlinks: findSymlinks(dir) };
+    });
+
+    const results: AddedSkill[] = [];
+    for (const { dir, meta, name, store, agentList, targets, skippedSymlinks } of plan) {
+      installToStore(dir, store, opts.limits);
 
       // When installing from a multi-skill source, record the exact sub-path
       // so `update` refetches just that skill.
@@ -184,7 +205,7 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
         resolved = sourceForManifest;
       }
 
-      m.skills[name] = { source: sourceForManifest, ...(opts.agents ? { agents: opts.agents } : {}) };
+      m.skills[name] = { source: sourceForManifest, ...(agentList ? { agents: agentList } : {}) };
       const entry: LockEntry = {
         source: sourceForManifest,
         resolved,
@@ -193,11 +214,13 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
         installedAt: new Date().toISOString(),
       };
       lock.skills[name] = entry;
-      const links = targetGroups(ctx, m, agentsFor(m, name), name).map((g) => linkGroup(ctx, m, g, name, store, opts.force));
+      // Record each skill as soon as its store folder is in place, before the
+      // links, so the lockfile always describes what the store holds.
+      saveManifest(ctx, m);
+      saveLock(ctx, lock);
+      const links = targetGroups(ctx, m, targets, name).map((g) => linkGroup(ctx, m, g, name, store, opts.force));
       results.push({ name, meta, lock: entry, links, skippedSymlinks });
     }
-    saveManifest(ctx, m);
-    saveLock(ctx, lock);
     return results;
   } finally {
     fetched.cleanup();
@@ -263,6 +286,22 @@ export function syncSkills(ctx: Context, opts: SyncOptions = {}): SyncReport {
     }
   }
 
+  // A lock entry with no integrity hash pins a commit but cannot verify what
+  // that commit contains. Refuse before installing anything unless the user
+  // opted in, and say which entries.
+  if (!opts.allowUnpinned) {
+    const unverifiable = Object.keys(m.skills).filter((name) => {
+      const entry = lock.skills[name];
+      return entry && !isDir(storePath(ctx, name)) && !hasIntegrity(entry);
+    });
+    if (unverifiable.length > 0) {
+      throw new Error(
+        `${LOCKFILE}: no integrity hash for ${unverifiable.map((n) => `"${n}"`).join(", ")}, so the content cannot be verified. ` +
+          `Nothing was installed and the lockfile was not changed. Run \`skillwharf update ${unverifiable.join(" ")}\` to pin it, or re-run sync with --allow-unpinned to install it unchecked.`,
+      );
+    }
+  }
+
   for (const [name, spec] of Object.entries(m.skills)) {
     const store = storePath(ctx, name);
     assertSafeInstall(ctx, m, name, store, agentsFor(m, name));
@@ -276,7 +315,7 @@ export function syncSkills(ctx: Context, opts: SyncOptions = {}): SyncReport {
       if (entry) {
         try {
           fetched = fetchSource(lockedSource(ctx, name, spec, entry, opts));
-          pinnedIntegrity = entry.integrity;
+          pinnedIntegrity = hasIntegrity(entry) ? entry.integrity : undefined;
         } catch (e) {
           const pinProblem = e instanceof UnusablePin || /^git fetch failed/.test((e as Error).message);
           if (!pinProblem) throw e;
@@ -294,7 +333,7 @@ export function syncSkills(ctx: Context, opts: SyncOptions = {}): SyncReport {
       try {
         const dirs = discoverSkills(fetched.dir);
         if (dirs.length !== 1) throw new Error(`Expected exactly one skill at ${spec.source}, found ${dirs.length}`);
-        installToStore(dirs[0], store);
+        installToStore(dirs[0], store, opts.limits);
         const integrity = hashDir(store);
         if (pinnedIntegrity !== undefined && integrity !== pinnedIntegrity) {
           removePath(store);
@@ -353,7 +392,7 @@ export function updateSkills(ctx: Context, only?: string[], opts: SourceOptions 
       const dirs = discoverSkills(fetched.dir);
       if (dirs.length !== 1) throw new Error(`Expected exactly one skill at ${spec.source}, found ${dirs.length}`);
       const before = lock.skills[name]?.integrity;
-      installToStore(dirs[0], store);
+      installToStore(dirs[0], store, opts.limits);
       const after = hashDir(store);
       const meta = readSkill(store);
       lock.skills[name] = {
@@ -419,6 +458,13 @@ export function doctor(ctx: Context): DoctorIssue[] {
     }
     if (!entry) {
       issues.push({ level: "warn", skill: name, message: "missing from lockfile", fix: "skillwharf update " + name });
+    } else if (!hasIntegrity(entry)) {
+      issues.push({
+        level: "warn",
+        skill: name,
+        message: "lockfile entry has no integrity hash (sync will refuse it)",
+        fix: "skillwharf update " + name,
+      });
     } else if (hashDir(store) !== entry.integrity) {
       issues.push({
         level: "warn",

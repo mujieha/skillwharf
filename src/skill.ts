@@ -30,16 +30,30 @@ function firstParagraph(body: string): string {
   return para ?? "";
 }
 
-export function readSkill(dir: string): SkillMeta {
+/**
+ * The SKILL.md in `dir`, only if it is a regular file. A symlinked one is
+ * treated as absent: in a fetched repo it could point at any local file, whose
+ * contents would then be read and printed as skill metadata.
+ */
+function skillFile(dir: string): string | undefined {
   const file = path.join(dir, "SKILL.md");
-  if (!fs.existsSync(file)) {
+  try {
+    return fs.lstatSync(file).isFile() ? file : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function readSkill(dir: string): SkillMeta {
+  const file = skillFile(dir);
+  if (!file) {
     throw new Error(`No SKILL.md found in ${dir}`);
   }
   return parseSkillMd(fs.readFileSync(file, "utf8"), path.basename(dir));
 }
 
 export function isSkillDir(dir: string): boolean {
-  return fs.existsSync(path.join(dir, "SKILL.md"));
+  return skillFile(dir) !== undefined;
 }
 
 /** Valid skill folder / registry names: lowercase, digits, dashes. */

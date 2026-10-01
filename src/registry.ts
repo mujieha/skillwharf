@@ -30,17 +30,23 @@ function normalize(idx: RegistryIndex): RegistryIndex {
     (e) =>
       e && typeof e.name === "string" && SKILL_NAME_RE.test(e.name) &&
       typeof e.description === "string" && typeof e.source === "string" && e.source.length < 512 &&
+      e.source === e.source.trim() &&
       isGithubSource(e.source) &&
       (e.tags === undefined || (Array.isArray(e.tags) && e.tags.every((t) => typeof t === "string" && t.length < 40))),
   );
   return {
     version: 1,
-    skills: clean.map((e) => ({
-      ...e,
-      description: sanitizeForTerminal(e.description.slice(0, 300)),
-      tags: e.tags?.map(sanitizeForTerminal),
-      version: typeof e.version === "string" ? sanitizeForTerminal(e.version) : undefined,
-    })),
+    // Known fields only: whatever else an entry carries is not ours to pass on.
+    skills: clean.map((e) => {
+      const entry: RegistryEntry = {
+        name: e.name,
+        description: sanitizeForTerminal(e.description.slice(0, 300)),
+        source: e.source,
+      };
+      if (e.tags) entry.tags = e.tags.map(sanitizeForTerminal);
+      if (typeof e.version === "string") entry.version = sanitizeForTerminal(e.version);
+      return entry;
+    }),
   };
 }
 

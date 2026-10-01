@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { copyDir, isDir } from "./fs.js";
+import { assertWithinLimits, copyDir, isDir, isInside, type SizeLimits } from "./fs.js";
 import { isSkillDir } from "./skill.js";
 import { assertGitRef, assertGithubOwner, assertGithubRepo, assertSubpath } from "./validate.js";
 
@@ -111,17 +111,48 @@ export function fetchSource(src: ParsedSource): Fetched {
   }
   // Always the full sha: hosts (GitHub included) refuse to serve an
   // abbreviated one, so a short pin could never be fetched again.
-  const sha = execFileSync("git", ["-C", tmp, "rev-parse", "HEAD"]).toString().trim();
-  const dir = path.join(tmp, src.subpath);
-  if (!isDir(dir)) {
+  let dir: string;
+  let sha: string;
+  try {
+    sha = execFileSync("git", ["-C", tmp, "rev-parse", "HEAD"]).toString().trim();
+    dir = resolveSubpath(tmp, src.subpath, `${src.owner}/${src.repo}`);
+  } catch (e) {
     fs.rmSync(tmp, { recursive: true, force: true });
-    throw new Error(`Sub-path "${src.subpath}" not found in ${src.owner}/${src.repo}`);
+    throw e;
   }
   return {
     dir,
     resolved: formatSource(src, sha),
     cleanup: () => fs.rmSync(tmp, { recursive: true, force: true }),
   };
+}
+
+/**
+ * `sub` below the clone at `root`, walked one component at a time with lstat.
+ * A repository can commit a link anywhere in its tree (`l -> /`), and a plain
+ * path.join + stat would follow it out of the clone and copy a local folder
+ * into the store. Any link on the way is refused, not followed; the resolved
+ * result is also checked to lie inside the clone.
+ */
+function resolveSubpath(root: string, sub: string, repoLabel: string): string {
+  let cur = root;
+  for (const part of sub.split("/").filter(Boolean)) {
+    cur = path.join(cur, part);
+    let st: fs.Stats | undefined;
+    try {
+      st = fs.lstatSync(cur);
+    } catch {
+      st = undefined;
+    }
+    if (st?.isSymbolicLink()) {
+      throw new Error(`Sub-path "${sub}" in ${repoLabel} passes through a symlink ("${part}"); symlinks in fetched repositories are never followed.`);
+    }
+    if (!st?.isDirectory()) throw new Error(`Sub-path "${sub}" not found in ${repoLabel}`);
+  }
+  if (!isInside(fs.realpathSync(root), fs.realpathSync(cur))) {
+    throw new Error(`Sub-path "${sub}" in ${repoLabel} resolves outside the fetched repository; refusing it.`);
+  }
+  return cur;
 }
 
 /**
@@ -144,6 +175,8 @@ export function discoverSkills(dir: string, maxDepth = 2): string[] {
   return found.sort();
 }
 
-export function installToStore(fromDir: string, storeDir: string): void {
+/** Copy a skill folder into the store, after checking it is within the size cap. */
+export function installToStore(fromDir: string, storeDir: string, limits?: SizeLimits): void {
+  assertWithinLimits(fromDir, limits);
   copyDir(fromDir, storeDir);
 }

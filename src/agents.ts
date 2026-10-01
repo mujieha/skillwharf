@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { exists, hashDir, isDir, isSymlink, linkOrCopy, removePath, resolveLink } from "./fs.js";
+import { exists, isDir, isPlainCopyOf, isSymlink, linkOrCopy, removePath, resolveLink } from "./fs.js";
 import { assertSafeTarget } from "./manifest.js";
 import type { AgentId, Context, Manifest } from "./types.js";
 
@@ -180,9 +180,10 @@ export function unlinkSkill(ctx: Context, m: Manifest, agent: AgentId, name: str
       (!isSymlink(storeDir) && isDir(storeDir) && resolveLink(target) === realStoreDir(storeDir));
     if (!ours) return false;
   } else {
-    // A real directory: only remove it if it is byte-identical to our store
-    // copy (copy fallback). Anything else was put there by someone else.
-    if (!isDir(target) || !isDir(storeDir) || hashDir(target) !== hashDir(storeDir)) return false;
+    // A real directory: only remove it if it is exactly what copying our store
+    // folder would have produced (copy fallback): same files, same folders, no
+    // .git, no links. Anything else was put there by someone else.
+    if (!isDir(target) || !isDir(storeDir) || !isPlainCopyOf(target, storeDir)) return false;
   }
   removePath(target);
   return true;
@@ -202,7 +203,7 @@ export function linkStatus(ctx: Context, m: Manifest, agent: AgentId, name: stri
     if (!real) return "broken";
     return !storeIsLink && real === realStoreDir(storeDir) ? "ok" : "foreign";
   }
-  // A real directory is only "ours" (a copy fallback) if it matches the store byte for byte.
-  if (!storeIsLink && isDir(target) && isDir(storeDir) && hashDir(target) === hashDir(storeDir)) return "stale-copy";
+  // A real directory is only "ours" (a copy fallback) if it is exactly a copy of the store folder.
+  if (!storeIsLink && isDir(target) && isDir(storeDir) && isPlainCopyOf(target, storeDir)) return "stale-copy";
   return "foreign";
 }

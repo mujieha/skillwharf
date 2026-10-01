@@ -54,6 +54,97 @@ export function listFiles(dir: string): string[] {
 }
 
 /**
+ * Directories and "odd" entries below `dir`, by lstat (links are never followed).
+ * Odd means anything `copyDir` never writes: a `.git` entry wherever it is, a
+ * symlink, or a file that is neither regular nor a directory.
+ */
+function scanTree(dir: string): { dirs: string[]; odd: string[] } {
+  const dirs: string[] = [];
+  const odd: string[] = [];
+  const walk = (rel: string) => {
+    for (const e of fs.readdirSync(path.join(dir, rel), { withFileTypes: true })) {
+      const relChild = rel ? `${rel}/${e.name}` : e.name;
+      if (e.name === ".git" || e.isSymbolicLink()) odd.push(relChild);
+      else if (e.isDirectory()) {
+        dirs.push(relChild);
+        walk(relChild);
+      } else if (!e.isFile()) odd.push(relChild);
+    }
+  };
+  walk("");
+  return { dirs: dirs.sort(), odd };
+}
+
+/**
+ * True only when `copy` is what `copyDir(original, copy)` would have produced:
+ * the same regular files byte for byte, the same folders, and nothing `copyDir`
+ * strips (`.git`, symlinks, sockets). `hashDir` alone ignores all of those, so a
+ * user's own `git clone` of the same commit would pass for a copy and be deleted.
+ */
+export function isPlainCopyOf(copy: string, original: string): boolean {
+  try {
+    const a = scanTree(copy);
+    const b = scanTree(original);
+    if (a.odd.length > 0 || b.odd.length > 0) return false;
+    if (a.dirs.join("\0") !== b.dirs.join("\0")) return false;
+    return hashDir(copy) === hashDir(original);
+  } catch {
+    return false;
+  }
+}
+
+/** Largest skill folder skillwharf installs unless told otherwise. */
+export const DEFAULT_MAX_FILES = 2000;
+export const DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
+
+export interface SizeLimits {
+  /** Files and folders, counted together. */
+  maxFiles?: number;
+  maxBytes?: number;
+}
+
+function formatBytes(n: number): string {
+  return n >= 1024 * 1024 ? `${Math.round((n / (1024 * 1024)) * 100) / 100} MB` : `${Math.round((n / 1024) * 100) / 100} KB`;
+}
+
+/**
+ * Throws when the folder `copyDir` would copy holds more entries or bytes than
+ * the cap. Walks without following links and skips what `copyDir` skips, and
+ * stops at the first excess, so a hostile tree is refused before one byte of it
+ * is written anywhere.
+ */
+export function assertWithinLimits(dir: string, limits: SizeLimits = {}): void {
+  const maxFiles = limits.maxFiles ?? DEFAULT_MAX_FILES;
+  const maxBytes = limits.maxBytes ?? DEFAULT_MAX_BYTES;
+  let entries = 0;
+  let bytes = 0;
+  const stack = [dir];
+  while (stack.length > 0) {
+    const cur = stack.pop() as string;
+    for (const e of fs.readdirSync(cur, { withFileTypes: true })) {
+      if (e.name === ".git" || e.isSymbolicLink()) continue;
+      const p = path.join(cur, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else if (!e.isFile()) continue;
+      entries += 1;
+      if (entries > maxFiles) {
+        throw new Error(
+          `${path.basename(dir)}: more than ${maxFiles} files and folders; refusing to install it. Raise the cap with --max-skill-files <n> if you trust it.`,
+        );
+      }
+      if (e.isFile()) {
+        bytes += fs.lstatSync(p).size;
+        if (bytes > maxBytes) {
+          throw new Error(
+            `${path.basename(dir)}: more than ${formatBytes(maxBytes)} of files; refusing to install it. Raise the cap with --max-skill-size <mb> if you trust it.`,
+          );
+        }
+      }
+    }
+  }
+}
+
+/**
  * sha256 over sorted relative paths, the owner-exec bit, the length and the
  * bytes of every file. Stable across machines. The length prefix keeps one
  * file's bytes from being read as the next file's header.
