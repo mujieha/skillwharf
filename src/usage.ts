@@ -14,7 +14,7 @@ export interface UsageOptions {
   home: string;
   /** Only count events newer than this */
   since?: Date;
-  /** Restrict to sessions whose cwd starts with this path */
+  /** Restrict to sessions whose cwd is this folder or inside it (a session with no cwd is left out) */
   project?: string;
 }
 
@@ -59,10 +59,17 @@ async function scanFile(fp: string, opts: UsageOptions, out: Map<string, UsageRe
     const ts = typeof obj.timestamp === "string" ? new Date(obj.timestamp) : undefined;
     if (opts.since && ts && ts < opts.since) continue;
     const cwd = typeof obj.cwd === "string" ? obj.cwd : "";
-    if (opts.project && cwd && !cwd.startsWith(opts.project)) continue;
+    // Scoped to a project: the session must have a cwd, and it must be the
+    // project or inside it (`/a/proj2` is not inside `/a/proj`).
+    if (opts.project && !(cwd && isInsideDir(opts.project, cwd))) continue;
 
     for (const name of extractSkillNames(obj)) record(out, name, ts, cwd);
   }
+}
+
+function isInsideDir(dir: string, p: string): boolean {
+  const base = dir.endsWith(path.sep) ? dir : dir + path.sep;
+  return p === dir || p.startsWith(base);
 }
 
 function extractSkillNames(obj: Record<string, unknown>): string[] {

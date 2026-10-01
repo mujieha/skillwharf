@@ -24,6 +24,12 @@ export interface LockEntry {
   integrity: string;
   version?: string;
   installedAt: string;
+  /**
+   * Agents whose folder holds a copy skillwharf made (the fallback when a
+   * symlink is not permitted), keyed by agent. A real folder in an agent
+   * directory counts as skillwharf's own only when the lock says so here.
+   */
+  links?: Partial<Record<AgentId, "copy">>;
 }
 
 export interface Lockfile {

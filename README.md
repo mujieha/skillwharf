@@ -130,7 +130,9 @@ Add `-g` to any command to manage `~/.skillwharf` and the agents' global folders
 }
 ```
 
-A `path:` source in a project manifest is relative to the project root and must stay inside the project; `sync` and `update` refuse one outside it unless you pass `--allow-outside-paths`. When you `add` a folder that is inside the project, skillwharf records it relative (`path:./skills/x`), so a teammate's checkout at another location resolves the same folder; a folder outside the project is recorded as an absolute path, which only works on your machine. The global manifest (`-g`, in `~/.skillwharf`) is yours, and its `path:` sources are not confined.
+A `path:` source in a project manifest is relative to the project root and must stay inside the project; `sync` and `update` refuse one outside it unless you pass `--allow-outside-paths`. When you `add` a folder that is inside the project, skillwharf records it relative (`path:./skills/x`), so a teammate's checkout at another location resolves the same folder; a folder outside the project is recorded as an absolute path, and `sync` and `update` refuse it on any machine, yours included, unless you pass `--allow-outside-paths`. A `path:` source may not be, contain or lie inside the skill store or the skill's own agent folders (so `path:./.claude/skills/foo` is refused: move that folder to, say, `skills/foo` first). The global manifest (`-g`, in `~/.skillwharf`) is yours, and its `path:` sources are not confined to a project.
+
+`add` refuses to replace a skill that is already managed from a different source (for example a pack whose `SKILL.md` says `name: pdf`); pass `--force` to replace it. `update` fetches and checks every skill before it replaces any store folder, like `sync`.
 
 Add `.skillwharf/` and the agent folders (`.claude/skills`, `.agents/skills`, and `.cursor/skills` if you enabled `cursor`) to `.gitignore` if you prefer teammates to run `skillwharf sync`, which installs the pinned commit and refuses content whose hash differs from the lockfile. If you commit them instead, `skillwharf doctor` reports any store folder that differs from the lockfile; `sync` does not re-check a folder that is already there. Commit real folders: skillwharf refuses to write through a store or agent folder that is a symlink.
 
@@ -153,7 +155,9 @@ Override a path in the manifest:
 "agentPaths": { "agents": { "projectPath": ".agents/custom-skills" } }
 ```
 
-On Windows without Developer Mode, symlinks fall back to copies; `skillwharf doctor` flags them.
+An override must sit inside one of the agent folders `.claude`, `.agents` or `.cursor` (at least one level below it, such as `.claude/custom`), and each folder name may use only letters, digits, `.`, `_` and `-`. Anything else, such as `node_modules` or `scripts`, is refused; there is no flag to relax this.
+
+On Windows without Developer Mode, symlinks fall back to copies. skillwharf records each copy it makes in the lockfile (`links`), and only a folder the lockfile records as a copy, and that still matches the store exactly, is treated as skillwharf's own; `skillwharf doctor` flags these copies.
 
 ## Usage tracking
 
@@ -199,7 +203,8 @@ MIT
 - The default registry is a starter list; it is schema-checked, not reviewed.
 - A registry URL is fetched without credentials, so a company registry must be reachable over https without a login, or used from a local checkout (`--registry <path>`).
 - The size cap applies to the skill folder that is installed, not to the `git clone` that fetches it.
-- There is no central approval or audit step; changes to skills are reviewed through the pull requests that change `skillwharf.json` and the lockfile.
+- There is no central approval or audit step; changes to skills are reviewed through the pull requests that change `skillwharf.json` and the lockfile. If you commit the store folder (`.skillwharf/skills`), a change to it is not in those files: `sync` does not re-check a store folder that is already there, and only `skillwharf doctor` compares it with the lockfile.
+- skillwharf looks for `skillwharf.json` upward from the working directory, but never uses your home directory or anything above it, and does not climb into a folder you do not own. A project that lives directly in your home directory is not found; run skillwharf from a folder below it.
 - skillwharf does not review a skill's content — read a `SKILL.md` before installing it, as you would a shell script.
 
 ## Security

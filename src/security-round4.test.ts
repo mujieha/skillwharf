@@ -3,15 +3,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { linkStatus } from "./agents.js";
-import { hashDir } from "./fs.js";
-import { loadLock, loadManifest, makeContext, storePath, validateManifest } from "./manifest.js";
+import { copyDir, hashDir } from "./fs.js";
+import { findProjectRoot, loadLock, loadManifest, makeContext, storePath, validateManifest } from "./manifest.js";
 import { addSkill, doctor, removeSkill, syncSkills, updateSkills } from "./ops.js";
 import { loadRegistry } from "./registry.js";
 import { isSkillDir, readSkill } from "./skill.js";
 import { fetchSource, parseSource } from "./source.js";
 import type { Context, Lockfile, Manifest } from "./types.js";
+import { scanClaudeUsage } from "./usage.js";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -150,22 +151,42 @@ describe("R4-2: a folder with .git, links or empty directories is never taken fo
     target = path.join(proj, ".claude", "skills", "s");
   });
 
-  /** Replace the link with a real folder holding the store's exact bytes plus `extra`. */
-  function plant(extra: (dir: string) => void) {
+  /**
+   * Replace the link with a real folder holding the store's exact bytes plus
+   * `extra`, and record in the lock that skillwharf made a copy there (as the
+   * copy fallback does), so only what is in the folder can make it foreign.
+   */
+  function plant(extra: (dir: string) => void, record = true) {
     fs.rmSync(target, { recursive: true, force: true });
     fs.cpSync(store, target, { recursive: true });
     extra(target);
+    if (record) {
+      const lock = loadLock(ctx);
+      lock.skills.s.links = { claude: "copy" };
+      writeLock(lock);
+    }
   }
 
   const variants: [string, (dir: string) => void][] = [
     [".git directory", (d) => { fs.mkdirSync(path.join(d, ".git")); fs.writeFileSync(path.join(d, ".git", "HEAD"), "ref: refs/heads/main\n"); }],
     ["symlink", (d) => fs.symlinkSync(path.join(outside), path.join(d, "link"))],
     ["empty directory", (d) => fs.mkdirSync(path.join(d, "empty"))],
+    ...(process.platform === "win32"
+      ? []
+      : ([["named pipe", (d: string) => execFileSync("mkfifo", [path.join(d, "pipe")])]] as [string, (dir: string) => void][])),
   ];
 
-  it("a plain byte-identical copy is still recognised as ours (control)", () => {
+  it("a plain byte-identical copy the lock records is recognised as ours (control)", () => {
     plant(() => {});
-    expect(linkStatus(ctx, loadManifest(ctx)!, "claude", "s", store)).toBe("stale-copy");
+    expect(linkStatus(ctx, loadManifest(ctx)!, "claude", "s", store, { copyRecorded: true })).toBe("stale-copy");
+  });
+
+  it("the same bytes with no record in the lock are foreign (identical to the store is not proof)", () => {
+    plant(() => {}, false);
+    expect(linkStatus(ctx, loadManifest(ctx)!, "claude", "s", store)).toBe("foreign");
+    expect(() => syncSkills(ctx)).toThrow(/not managed/);
+    removeSkill(ctx, "s");
+    expect(fs.existsSync(target)).toBe(true);
   });
 
   it("remove still deletes a genuine skillwharf copy, as the Windows fallback leaves one", () => {
@@ -437,7 +458,7 @@ describe("R4-9: a lock entry without integrity is not silently accepted", () => 
 
   it("update regenerates the integrity", () => {
     updateSkills(ctx, ["s"]);
-    expect(loadLock(ctx).skills.s.integrity).toMatch(/^sha256-/);
+    expect(loadLock(ctx).skills.s.integrity).toBe(hashDir(storePath(ctx, "s")));
   });
 
   it("doctor says the entry has no integrity", () => {
@@ -740,5 +761,535 @@ describe("R5-path: a path: source inside the project is recorded relative to it"
     fs.rmSync(path.join(proj, ".skillwharf"), { recursive: true });
     fs.rmSync(path.join(proj, ".claude"), { recursive: true });
     expect(() => syncSkills(ctx)).toThrow(/outside the project/);
+  });
+});
+
+// ================================================================== Round 6
+/** Run `fn` as on a machine where symlinks are not permitted (the copy fallback). */
+function withoutSymlinks<T>(fn: () => T): T {
+  const spy = vi.spyOn(fs, "symlinkSync").mockImplementation(() => {
+    throw Object.assign(new Error("EPERM: operation not permitted, symlink"), { code: "EPERM" });
+  });
+  try {
+    return fn();
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+const claudeOnly = (skills: Manifest["skills"]): Manifest => ({ version: 1, agents: ["claude"], skills });
+
+// ------------------------------------------------------------------ D2
+describe("R6-D2: a path: source that is an agent target or the store is refused, never replaced or wiped", () => {
+  const folder = () => path.join(proj, ".claude", "skills", "foo");
+  const intact = () => {
+    expect(fs.lstatSync(folder()).isDirectory()).toBe(true);
+    expect(read(path.join(folder(), "SKILL.md"))).toContain("my own words");
+  };
+
+  beforeEach(() => {
+    writeSkill(folder(), "foo", "my own words");
+    writeManifest(claudeOnly({ foo: { source: "path:./.claude/skills/foo" } }));
+  });
+
+  it("sync refuses, names the folder and creates no store", () => {
+    expect(() => syncSkills(ctx)).toThrow(/\.claude[/\\]skills[/\\]foo/);
+    intact();
+    expect(fs.existsSync(storePath(ctx, "foo"))).toBe(false);
+  });
+
+  it("update refuses and names the folder", () => {
+    expect(() => updateSkills(ctx, ["foo"])).toThrow(/\.claude[/\\]skills[/\\]foo/);
+    intact();
+  });
+
+  it("remove leaves the folder", () => {
+    removeSkill(ctx, "foo");
+    intact();
+  });
+
+  it("remove leaves an identical folder when the lock does not record a copy (a store an old version made)", () => {
+    fs.cpSync(folder(), storePath(ctx, "foo"), { recursive: true });
+    removeSkill(ctx, "foo");
+    intact();
+  });
+
+  it("add refuses the folder even with --force", () => {
+    expect(() => addSkill(ctx, folder(), { force: true })).toThrow(/overlap/);
+    intact();
+    expect(fs.existsSync(storePath(ctx, "foo"))).toBe(false);
+  });
+
+  it("add refuses a folder that contains the agent target", () => {
+    expect(() => addSkill(ctx, path.join(proj, ".claude"), { all: true })).toThrow(/overlap/);
+    intact();
+  });
+
+  it("doctor reports the overlap as an error", () => {
+    expect(doctor(ctx).some((i) => i.level === "error" && /overlap/.test(i.message))).toBe(true);
+  });
+});
+
+describe("R6-D2: a source inside the store, or a copy onto itself, never wipes the store", () => {
+  it("update refuses a source inside the store and the store survives", () => {
+    writeSkill(path.join(proj, "src", "bar"), "bar", "kept");
+    writeManifest(claudeOnly({ bar: { source: "path:./src/bar" } }));
+    syncSkills(ctx);
+    writeManifest(claudeOnly({ bar: { source: "path:./.skillwharf/skills/bar" } }));
+    expect(() => updateSkills(ctx, ["bar"])).toThrow(/overlap/);
+    expect(read(path.join(storePath(ctx, "bar"), "SKILL.md"))).toContain("kept");
+  });
+
+  it("copyDir refuses a destination that is, contains or lies inside the source", () => {
+    const a = path.join(proj, "a");
+    writeSkill(path.join(a, "child"), "child", "kept");
+    expect(() => copyDir(a, a)).toThrow(/overlap/);
+    expect(() => copyDir(a, path.join(a, "child"))).toThrow(/overlap/);
+    expect(() => copyDir(path.join(a, "child"), a)).toThrow(/overlap/);
+    expect(read(path.join(a, "child", "SKILL.md"))).toContain("kept");
+  });
+
+  it("copyDir sees through a symlink to the same folder", () => {
+    const a = path.join(proj, "a");
+    writeSkill(a, "a", "kept");
+    fs.symlinkSync(a, path.join(proj, "alias"));
+    expect(() => copyDir(path.join(proj, "alias"), a)).toThrow(/overlap/);
+    expect(read(path.join(a, "SKILL.md"))).toContain("kept");
+  });
+});
+
+describe("R6-D2: a copy is ours only when the lock records that skillwharf made it", () => {
+  const target = () => path.join(proj, ".claude", "skills", "s");
+
+  beforeEach(() => {
+    writeManifest(claudeOnly({}));
+    writeSkill(path.join(proj, "src", "s"), "s", "v1");
+  });
+
+  it("add falls back to a copy, records it, doctor reports it, and remove deletes it", () => {
+    withoutSymlinks(() => addSkill(ctx, path.join(proj, "src", "s")));
+    expect(fs.lstatSync(target()).isSymbolicLink()).toBe(false);
+    expect(loadLock(ctx).skills.s.links).toEqual({ claude: "copy" });
+    expect(doctor(ctx).some((i) => /is a copy/.test(i.message))).toBe(true);
+    const r = removeSkill(ctx, "s");
+    expect(r.removedLinks).toEqual(["claude"]);
+    expect(fs.existsSync(target())).toBe(false);
+  });
+
+  it("re-adding replaces a recorded copy with a link and clears the record", () => {
+    withoutSymlinks(() => addSkill(ctx, path.join(proj, "src", "s")));
+    addSkill(ctx, path.join(proj, "src", "s"));
+    expect(fs.lstatSync(target()).isSymbolicLink()).toBe(true);
+    expect(loadLock(ctx).skills.s.links).toBeUndefined();
+  });
+
+  it("a lock that says copy does not make a folder with extra files ours", () => {
+    withoutSymlinks(() => addSkill(ctx, path.join(proj, "src", "s")));
+    fs.writeFileSync(path.join(target(), "mine.txt"), "mine");
+    expect(() => syncSkills(ctx)).toThrow(/not managed/);
+    expect(read(path.join(target(), "mine.txt"))).toBe("mine");
+  });
+});
+
+// ------------------------------------------------------------------ D3
+describe("R6-D3: an agentPaths override must sit inside a known agent folder", () => {
+  const m = (p: { projectPath?: string; globalPath?: string }): Manifest =>
+    ({ version: 1, agents: ["claude"], skills: {}, agentPaths: { claude: p } }) as Manifest;
+  const ZWNJ = String.fromCodePoint(0x200c);
+
+  it.each([
+    "node_modules",
+    "scripts",
+    ".husky",
+    ".",
+    "./",
+    "src/skills",
+    ".git.",
+    "GIT~1",
+    `.claude/a${ZWNJ}b`,
+    ".claude",
+    ".claude/..",
+    ".claude/x.",
+    ".claude/x ",
+    ".claude/.git",
+    ".claude/GIT~1",
+    ".claude/a b",
+    ".codex/skills",
+    ".CLAUDE/skills",
+  ])("refuses projectPath %j", (p) => {
+    expect(() => validateManifest(m({ projectPath: p }), "skillwharf.json")).toThrow(/agentPaths/);
+  });
+
+  it.each([".claude/custom", ".agents/custom-skills", ".cursor/skills/team", "./.claude/custom"])("accepts projectPath %j", (p) => {
+    expect(() => validateManifest(m({ projectPath: p }), "skillwharf.json")).not.toThrow();
+  });
+
+  it("applies the same rule to globalPath", () => {
+    expect(() => validateManifest(m({ globalPath: "node_modules" }), "skillwharf.json")).toThrow(/agentPaths/);
+    expect(() => validateManifest(m({ globalPath: ".claude/custom" }), "skillwharf.json")).not.toThrow();
+  });
+
+  it("the error names the allowed folders", () => {
+    expect(() => validateManifest(m({ projectPath: "node_modules" }), "skillwharf.json")).toThrow(/\.claude.*\.agents.*\.cursor/);
+  });
+
+  it("cannot plant a skill where Node loads dependencies from", () => {
+    fs.writeFileSync(
+      path.join(proj, "skillwharf.json"),
+      JSON.stringify({ version: 1, agents: ["cursor"], agentPaths: { cursor: { projectPath: "node_modules" } }, skills: {} }),
+    );
+    writeSkill(path.join(proj, "src", "bufferutil"), "bufferutil");
+    fs.writeFileSync(path.join(proj, "src", "bufferutil", "package.json"), "{}");
+    expect(() => addSkill(ctx, path.join(proj, "src", "bufferutil"))).toThrow(/agentPaths/);
+    expect(fs.existsSync(path.join(proj, "node_modules"))).toBe(false);
+    expect(fs.existsSync(path.join(proj, ".skillwharf"))).toBe(false);
+  });
+});
+
+// ------------------------------------------------------------------ D5
+describe("R6-D5: update checks everything before it replaces any store", () => {
+  let lockText: string, storeA: string;
+
+  beforeEach(() => {
+    writeSkill(path.join(proj, "src", "a"), "a", "v1");
+    writeSkill(path.join(proj, "src", "b"), "b", "v1");
+    writeManifest(claudeOnly({ a: { source: "path:./src/a" }, b: { source: "path:./src/b" } }));
+    syncSkills(ctx);
+    writeSkill(path.join(proj, "src", "a"), "a", "v2");
+    writeSkill(path.join(proj, "src", "b"), "b", "v2");
+    lockText = read(path.join(proj, "skillwharf.lock.json"));
+    storeA = hashDir(storePath(ctx, "a"));
+  });
+
+  const unchanged = () => {
+    expect(hashDir(storePath(ctx, "a"))).toBe(storeA);
+    expect(read(path.join(proj, "skillwharf.lock.json"))).toBe(lockText);
+  };
+
+  it("a failure on the second skill leaves the first store and lock entry unchanged", () => {
+    fs.rmSync(path.join(proj, "src", "b"), { recursive: true });
+    expect(() => updateSkills(ctx)).toThrow(/Path not found/);
+    unchanged();
+  });
+
+  it("a foreign target on the second skill is found before any store is replaced", () => {
+    const tb = path.join(proj, ".claude", "skills", "b");
+    fs.rmSync(tb, { recursive: true, force: true });
+    fs.mkdirSync(tb);
+    fs.writeFileSync(path.join(tb, "mine.txt"), "mine");
+    expect(() => updateSkills(ctx)).toThrow(/not managed/);
+    unchanged();
+    expect(read(path.join(tb, "mine.txt"))).toBe("mine");
+  });
+
+  it("an oversized second skill is found before any store is replaced", () => {
+    fs.writeFileSync(path.join(proj, "src", "b", "blob.bin"), Buffer.alloc(4096));
+    expect(() => updateSkills(ctx, undefined, { limits: { maxBytes: 2048 } })).toThrow(/--max-skill-size/);
+    unchanged();
+  });
+
+  it("updates every skill and keeps the lock in step with the stores (control)", () => {
+    const res = updateSkills(ctx);
+    expect(res.map((r) => r.changed)).toEqual([true, true]);
+    for (const n of ["a", "b"]) expect(loadLock(ctx).skills[n].integrity).toBe(hashDir(storePath(ctx, n)));
+  });
+
+  it("an update reaches a recorded copy too", () => {
+    writeSkill(path.join(proj, "src", "c"), "c", "v1");
+    withoutSymlinks(() => addSkill(ctx, path.join(proj, "src", "c")));
+    writeSkill(path.join(proj, "src", "c"), "c", "v2");
+    withoutSymlinks(() => updateSkills(ctx, ["c"]));
+    const t = path.join(proj, ".claude", "skills", "c");
+    expect(fs.lstatSync(t).isSymbolicLink()).toBe(false);
+    expect(read(path.join(t, "SKILL.md"))).toContain("v2");
+    expect(loadLock(ctx).skills.c.links).toEqual({ claude: "copy" });
+  });
+});
+
+// ------------------------------------------------------------------ D6
+describe("R6-D6: add does not silently replace a managed skill that came from another source", () => {
+  beforeEach(() => {
+    writeManifest(claudeOnly({}));
+    writeSkill(path.join(proj, "src", "one"), "pdf", "from one");
+    writeSkill(path.join(proj, "src", "two"), "pdf", "from two");
+    addSkill(ctx, path.join(proj, "src", "one"));
+  });
+
+  it("refuses a different source for the same name, printing both", () => {
+    expect(() => addSkill(ctx, path.join(proj, "src", "two"))).toThrow(/path:\.\/src\/one[\s\S]*path:\.\/src\/two/);
+    expect(read(path.join(storePath(ctx, "pdf"), "SKILL.md"))).toContain("from one");
+    expect(loadManifest(ctx)!.skills.pdf.source).toBe("path:./src/one");
+  });
+
+  it("--force replaces it", () => {
+    addSkill(ctx, path.join(proj, "src", "two"), { force: true });
+    expect(read(path.join(storePath(ctx, "pdf"), "SKILL.md"))).toContain("from two");
+    expect(loadManifest(ctx)!.skills.pdf.source).toBe("path:./src/two");
+  });
+
+  it("re-adding the same source is allowed", () => {
+    writeSkill(path.join(proj, "src", "one"), "pdf", "from one, edited");
+    expect(() => addSkill(ctx, path.join(proj, "src", "one"))).not.toThrow();
+    expect(read(path.join(storePath(ctx, "pdf"), "SKILL.md"))).toContain("edited");
+  });
+
+  it("add --all cannot overwrite it through a folder named like it, and writes nothing else", () => {
+    writeSkill(path.join(proj, "pack", "other"), "other");
+    writeSkill(path.join(proj, "pack", "sneaky"), "pdf", "evil");
+    expect(() => addSkill(ctx, path.join(proj, "pack"), { all: true })).toThrow(/pdf/);
+    expect(read(path.join(storePath(ctx, "pdf"), "SKILL.md"))).toContain("from one");
+    expect(fs.existsSync(storePath(ctx, "other"))).toBe(false);
+  });
+});
+
+// ------------------------------------------------------------------ lows
+describe("R6-lows: reads are capped and project discovery stays in bounds", () => {
+  it("readSkill refuses a SKILL.md over 1 MB before parsing it", () => {
+    const dir = path.join(proj, "src", "big");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "SKILL.md"), `---\nname: big\n---\n${"x".repeat(1024 * 1024)}`);
+    expect(() => readSkill(dir)).toThrow(/larger than 1 MB/);
+  });
+
+  it("add refuses such a skill and writes nothing", () => {
+    writeManifest(claudeOnly({}));
+    const dir = path.join(proj, "src", "big");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "SKILL.md"), `---\nname: big\n---\n${"x".repeat(1024 * 1024)}`);
+    expect(() => addSkill(ctx, dir)).toThrow(/larger than 1 MB/);
+    expect(fs.existsSync(path.join(proj, ".skillwharf"))).toBe(false);
+  });
+
+  describe("registry responses", () => {
+    afterEach(() => vi.unstubAllGlobals());
+    const url = "https://registry.example.invalid/index.json";
+
+    it("refuses a body over 5 MB, with or without a content-length", async () => {
+      vi.stubGlobal("fetch", async () => new Response("x".repeat(5 * 1024 * 1024 + 10)));
+      await expect(loadRegistry(url)).rejects.toThrow(/larger than 5 MB/);
+      vi.stubGlobal("fetch", async () => new Response("{}", { headers: { "content-length": String(6 * 1024 * 1024) } }));
+      await expect(loadRegistry(url)).rejects.toThrow(/larger than 5 MB/);
+    });
+
+    it("does not follow redirects and cuts descriptions to 300 characters", async () => {
+      const seen: RequestInit[] = [];
+      vi.stubGlobal("fetch", async (_u: string, init: RequestInit) => {
+        seen.push(init);
+        return new Response(JSON.stringify({ version: 1, skills: [{ name: "pdf", description: "d".repeat(1000), source: "github:o/r/pdf" }] }));
+      });
+      const idx = await loadRegistry(url);
+      expect(seen[0].redirect).toBe("error");
+      expect(idx.skills[0].description).toHaveLength(300);
+    });
+  });
+
+  describe("findProjectRoot", () => {
+    const manifestJson = JSON.stringify({ version: 1, agents: ["claude"], skills: {} });
+
+    it("never uses the home directory, or anything above it, as the project root", () => {
+      fs.writeFileSync(path.join(home, "skillwharf.json"), manifestJson);
+      const work = path.join(home, "work");
+      fs.mkdirSync(work);
+      expect(findProjectRoot(work, home)).toBeUndefined();
+      expect(makeContext({ cwd: work, home }).root).toBe(work);
+    });
+
+    it("still finds a project below the home directory (control)", () => {
+      const work = path.join(home, "work", "sub");
+      fs.mkdirSync(work, { recursive: true });
+      fs.writeFileSync(path.join(home, "work", "skillwharf.json"), manifestJson);
+      expect(findProjectRoot(work, home)).toBe(path.join(home, "work"));
+    });
+
+    it.skipIf(process.platform === "win32")("does not climb into a folder the current user does not own", () => {
+      fs.writeFileSync(path.join(proj, "skillwharf.json"), manifestJson);
+      const sub = path.join(proj, "sub");
+      fs.mkdirSync(sub);
+      expect(findProjectRoot(sub, home)).toBe(proj);
+      const uid = process.getuid!();
+      const spy = vi.spyOn(process, "getuid").mockReturnValue(uid + 1);
+      try {
+        expect(findProjectRoot(sub, home)).toBeUndefined();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+
+  describe("usage scoped to a project", () => {
+    const line = (cwd?: string) =>
+      JSON.stringify({
+        timestamp: new Date().toISOString(),
+        ...(cwd ? { cwd } : {}),
+        message: { content: [{ type: "tool_use", name: "Skill", input: { skill: "k" } }] },
+      });
+
+    it("respects a path boundary and does not count lines without a cwd for every project", async () => {
+      const logs = path.join(home, ".claude", "projects", "p");
+      fs.mkdirSync(logs, { recursive: true });
+      fs.writeFileSync(path.join(logs, "s.jsonl"), [line("/a/proj"), line("/a/proj/sub"), line("/a/proj2"), line()].join("\n") + "\n");
+      expect((await scanClaudeUsage({ home, project: "/a/proj" })).get("k")?.count).toBe(2);
+      expect((await scanClaudeUsage({ home })).get("k")?.count).toBe(4);
+    });
+  });
+
+  it("add --all skips a path folder whose name has leading or trailing whitespace", () => {
+    writeManifest(claudeOnly({}));
+    writeSkill(path.join(proj, "multi", "ok"), "ok");
+    writeSkill(path.join(proj, "multi", "spaced "), "spaced");
+    const skipped: string[] = [];
+    const added = addSkill(ctx, path.join(proj, "multi"), { all: true, onSkipped: (s) => skipped.push(s.dir) });
+    expect(added.map((a) => a.name)).toEqual(["ok"]);
+    expect(skipped).toHaveLength(1);
+    expect(Object.keys(loadManifest(ctx)!.skills)).toEqual(["ok"]);
+  });
+});
+
+// ------------------------------------------------------------------ D1
+describe("R6-D1: CI runs on hosted runners only", () => {
+  const wf = () => read(path.join(repo, ".github", "workflows", "test.yml"));
+
+  it("has no self-hosted runner and no false claims about forks", () => {
+    expect(wf()).not.toMatch(/self-hosted/);
+    expect(wf()).not.toMatch(/automatic|gains nothing/);
+  });
+
+  it("keeps the matrix, the check names and least-privilege permissions", () => {
+    const text = wf();
+    expect(text).toMatch(/os:\s*\[ubuntu-latest, macos-latest\]/);
+    expect(text).toMatch(/runs-on: \$\{\{ matrix\.os \}\}/);
+    expect(text).toMatch(/node:\s*\[22, 24\]/);
+    expect(text.match(/permissions:\s*\n\s+contents: read/g)?.length).toBeGreaterThanOrEqual(2); // workflow and job
+  });
+});
+
+// ------------------------------------------------------------------ test adequacy
+describe("R6-lock: a lock entry that does not match its manifest entry is refused before anything is fetched", () => {
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+  const base0 = { source: "github:acme/skills/alpha", resolved: `github:acme/skills/alpha@${sha}`, integrity: "sha256-x", installedAt: "x" };
+
+  beforeEach(() => writeManifest(claudeOnly({ alpha: { source: "github:acme/skills/alpha" } })));
+
+  it.each([
+    ["owner", { resolved: `github:other/skills/alpha@${sha}` }],
+    ["repo", { resolved: `github:acme/other/alpha@${sha}` }],
+    ["sub-path", { resolved: `github:acme/skills/beta@${sha}` }],
+    ["source string", { source: "github:acme/skills/alpha@main" }],
+  ])("a different %s", (_what, change) => {
+    writeLock({ version: 1, skills: { alpha: { ...base0, ...change } } });
+    const before = read(path.join(proj, "skillwharf.lock.json"));
+    expect(() => syncSkills(ctx)).toThrow(/does not match the manifest source/);
+    expect(fs.existsSync(storePath(ctx, "alpha"))).toBe(false);
+    expect(read(path.join(proj, "skillwharf.lock.json"))).toBe(before);
+  });
+
+  it("a path entry that points at a different path", () => {
+    writeSkill(path.join(proj, "src", "s"), "s");
+    writeSkill(path.join(proj, "src", "other"), "s");
+    writeManifest(claudeOnly({ s: { source: "path:./src/s" } }));
+    writeLock({
+      version: 1,
+      skills: { s: { source: "path:./src/s", resolved: `path:${path.join(proj, "src", "other")}`, integrity: "sha256-x", installedAt: "x" } },
+    });
+    expect(() => syncSkills(ctx)).toThrow(/does not match the manifest source/);
+    expect(fs.existsSync(storePath(ctx, "s"))).toBe(false);
+  });
+});
+
+describe("R6-adequacy: behaviour the earlier rounds only claimed", () => {
+  it("a manifest path source that is a symlink inside the project pointing outside is refused (the realpath branch)", () => {
+    writeSkill(path.join(outside, "shared"), "shared");
+    fs.symlinkSync(path.join(outside, "shared"), path.join(proj, "link"));
+    // lexically ./link is inside the project; only the resolved path is not
+    writeManifest(claudeOnly({ x: { source: "path:./link" } }));
+    expect(() => syncSkills(ctx)).toThrow(/outside the project/);
+    expect(fs.existsSync(storePath(ctx, "x"))).toBe(false);
+  });
+
+  it("a .git folder in a source skill is left out of the store", () => {
+    writeManifest(claudeOnly({}));
+    const dir = path.join(proj, "src", "g");
+    writeSkill(dir, "g");
+    fs.mkdirSync(path.join(dir, ".git"));
+    fs.writeFileSync(path.join(dir, ".git", "HEAD"), "ref: refs/heads/main\n");
+    addSkill(ctx, dir);
+    expect(fs.existsSync(path.join(storePath(ctx, "g"), ".git"))).toBe(false);
+    expect(fs.existsSync(path.join(storePath(ctx, "g"), "SKILL.md"))).toBe(true);
+  });
+
+  describe("--global refuses a symlinked agent folder in the home directory", () => {
+    let gctx: Context;
+    beforeEach(() => {
+      gctx = makeContext({ global: true, home });
+      fs.mkdirSync(path.join(home, ".skillwharf"), { recursive: true });
+      fs.writeFileSync(path.join(home, ".skillwharf", "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: {} }));
+      writeSkill(path.join(base, "gsrc", "g"), "g");
+    });
+
+    it("~/.claude is a symlink", () => {
+      fs.symlinkSync(outside, path.join(home, ".claude"));
+      expect(() => addSkill(gctx, path.join(base, "gsrc", "g"))).toThrow(/symlink/);
+      expect(fs.readdirSync(outside)).toEqual([]);
+    });
+
+    it("~/.claude/skills is a symlink", () => {
+      fs.mkdirSync(path.join(home, ".claude"));
+      fs.symlinkSync(outside, path.join(home, ".claude", "skills"));
+      expect(() => addSkill(gctx, path.join(base, "gsrc", "g"))).toThrow(/symlink/);
+      expect(fs.readdirSync(outside)).toEqual([]);
+    });
+  });
+
+  it("the size cap applies to sync, and nothing is installed", () => {
+    const dir = path.join(proj, "src", "many");
+    writeSkill(dir, "many");
+    for (let i = 0; i < 3; i++) fs.writeFileSync(path.join(dir, `f${i}.txt`), "x");
+    writeManifest(claudeOnly({ many: { source: "path:./src/many" } }));
+    expect(() => syncSkills(ctx, { limits: { maxFiles: 2 } })).toThrow(/--max-skill-files/);
+    expect(fs.existsSync(storePath(ctx, "many"))).toBe(false);
+    expect(fs.existsSync(path.join(proj, ".claude"))).toBe(false);
+  });
+
+  describe("non-JSON output is sanitised too", () => {
+    const unsafe = new RegExp("[\\u0080-\\u009f\\u202a-\\u202e\\u2066-\\u2069]");
+
+    it("doctor", () => {
+      writeSkill(path.join(proj, "src", "s"), "s");
+      writeManifest(claudeOnly({ s: { source: "path:./src/s" } }));
+      syncSkills(ctx);
+      const lock = loadLock(ctx);
+      lock.skills.s.resolved = `path:x${RLO}y\u009b`;
+      writeLock(lock);
+      const r = cli(["doctor"]);
+      expect(r.stdout).toContain("does not match");
+      expect(r.stdout + r.stderr).not.toMatch(unsafe);
+    });
+
+    it("the usage table", () => {
+      writeManifest(claudeOnly({}));
+      const logs = path.join(home, ".claude", "projects", "p");
+      fs.mkdirSync(logs, { recursive: true });
+      const entry = {
+        timestamp: new Date().toISOString(),
+        cwd: fs.realpathSync(proj),
+        message: { content: [{ type: "tool_use", name: "Skill", input: { skill: `ev${RLO}il\u009b` } }] },
+      };
+      fs.writeFileSync(path.join(logs, "s.jsonl"), JSON.stringify(entry) + "\n");
+      const r = cli(["usage"]);
+      expect(r.stdout).toContain("evil");
+      expect(r.stdout).not.toMatch(unsafe);
+    });
+
+    it("the search table", () => {
+      const reg = path.join(base, "reg");
+      fs.mkdirSync(reg);
+      fs.writeFileSync(
+        path.join(reg, "index.json"),
+        JSON.stringify({ version: 1, skills: [{ name: "pdf", description: `pdf${RLO} tools\u009b`, source: "github:o/r/pdf", tags: [`t${RLO}`] }] }),
+      );
+      const r = cli(["search", "pdf", "--registry", reg]);
+      expect(r.stdout).toContain("pdf");
+      expect(r.stdout).not.toMatch(unsafe);
+    });
   });
 });

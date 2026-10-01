@@ -44,10 +44,16 @@ function skillFile(dir: string): string | undefined {
   }
 }
 
+/** Largest SKILL.md that is read; the size cap on the folder comes later, so this one is checked on its own. */
+const MAX_SKILL_MD_BYTES = 1024 * 1024;
+
 export function readSkill(dir: string): SkillMeta {
   const file = skillFile(dir);
   if (!file) {
     throw new Error(`No SKILL.md found in ${dir}`);
+  }
+  if (fs.lstatSync(file).size > MAX_SKILL_MD_BYTES) {
+    throw new Error(`SKILL.md in ${dir} is larger than 1 MB; refusing to read it.`);
   }
   return parseSkillMd(fs.readFileSync(file, "utf8"), path.basename(dir));
 }

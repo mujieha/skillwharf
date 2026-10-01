@@ -1,7 +1,19 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { assertWithinLimits, copyDir, exists, findSymlinks, hashDir, isDir, isInside, removePath, resolveLink, type SizeLimits } from "./fs.js";
+import {
+  assertWithinLimits,
+  copyDir,
+  exists,
+  findSymlinks,
+  hashDir,
+  isDir,
+  isInside,
+  pathsOverlap,
+  removePath,
+  resolveLink,
+  type SizeLimits,
+} from "./fs.js";
 import {
   groupLabel,
   linkSkill,
@@ -16,7 +28,7 @@ import { LOCKFILE, assertSafeTarget, loadLock, requireManifest, saveLock, saveMa
 import { normalizeName, readSkill } from "./skill.js";
 import { assertSubpath } from "./validate.js";
 import { discoverSkills, fetchSource, installToStore, parseSource, type ParsedSource } from "./source.js";
-import type { AgentId, Context, LockEntry, Manifest, SkillMeta, SkillSpec } from "./types.js";
+import type { AgentId, Context, LockEntry, Lockfile, Manifest, SkillMeta, SkillSpec } from "./types.js";
 
 export interface SourceOptions {
   /**
@@ -36,8 +48,15 @@ const FULL_SHA_RE = /^[0-9a-f]{40}$/;
  * the user just typed). Relative paths resolve against the project root, never
  * the working directory, and in a project they must stay inside it.
  */
-export function parseStoredSource(ctx: Context, raw: string, opts: SourceOptions = {}): ParsedSource {
+export function parseStoredSource(
+  ctx: Context,
+  raw: string,
+  opts: SourceOptions = {},
+  /** When given, a `path:` source may not overlap this skill's store or agent folders. */
+  skill?: { m: Manifest; name: string },
+): ParsedSource {
   const p = parseSource(raw, ctx.root);
+  if (p.kind === "path" && skill) assertSourceClear(ctx, skill.m, skill.name, raw, p.path);
   if (p.kind === "path" && !ctx.global && !opts.allowOutsidePaths) {
     const real = resolveLink(p.path);
     const realRoot = resolveLink(ctx.root) ?? ctx.root;
@@ -49,6 +68,69 @@ export function parseStoredSource(ctx: Context, raw: string, opts: SourceOptions
     }
   }
   return p;
+}
+
+/**
+ * Refuse a local source that is, contains or lies inside the skill store or one
+ * of this skill's agent folders (after resolving every link). Such a source
+ * makes skillwharf copy a folder onto itself: `sync` would replace the user's
+ * folder with a link into the store, and `update` or `remove` would then delete
+ * the only copy.
+ */
+function assertSourceClear(
+  ctx: Context,
+  m: Manifest,
+  name: string,
+  shown: string,
+  folder: string,
+  agents: AgentId[] = agentsFor(m, name),
+): void {
+  const places: [string, string][] = [
+    ["the skill store", storePath(ctx)],
+    ...targetGroups(ctx, m, agents, name).map((g): [string, string] => ["an agent folder", g.target]),
+  ];
+  for (const [what, place] of places) {
+    if (pathsOverlap(folder, place)) {
+      throw new Error(
+        `Source "${shown}" overlaps ${what} (${place}). A skill's source may not be, contain or lie inside its own store or agent folder, ` +
+          `or skillwharf would replace or delete it. Move the folder elsewhere in the project (for example skills/${name}) and use that path.`,
+      );
+    }
+  }
+}
+
+/** True when the lockfile says skillwharf made a copy (not a link) at this location. */
+function copyRecorded(lock: Lockfile, name: string, g: TargetGroup): boolean {
+  const links = lock.skills[name]?.links;
+  return g.agents.some((a) => links?.[a] === "copy");
+}
+
+/** Update the lock entry's record of which agents hold a copy, from the links just written. */
+function recordLinks(lock: Lockfile, name: string, results: LinkResult[]): void {
+  const entry = lock.skills[name];
+  if (!entry) return;
+  const links = { ...(entry.links ?? {}) };
+  for (const r of results) {
+    for (const a of r.agents) {
+      if (r.mode === "copy") links[a] = "copy";
+      else if (r.mode === "symlink") delete links[a];
+    }
+  }
+  if (Object.keys(links).length > 0) entry.links = links;
+  else delete entry.links;
+}
+
+/** Two sources name the same place, however they were typed (relative or absolute path, URL or shorthand). */
+function sameSource(ctx: Context, a: string, b: string): boolean {
+  const key = (raw: string) => {
+    try {
+      const p = parseSource(raw, ctx.root);
+      return p.kind === "path" ? `path:${p.path}` : `github:${p.owner}/${p.repo}/${p.subpath}@${p.ref ?? ""}`;
+    } catch {
+      return raw;
+    }
+  };
+  return key(a) === key(b);
 }
 
 /** True when a lock entry carries a content hash to verify against. */
@@ -64,8 +146,8 @@ class UnusablePin extends Error {}
  * manifest's source at a full commit. Anything else is refused: a lockfile is
  * as editable by a teammate (or a pull request) as the manifest is.
  */
-function lockedSource(ctx: Context, name: string, spec: SkillSpec, entry: LockEntry, opts: SourceOptions): ParsedSource {
-  const want = parseStoredSource(ctx, spec.source, opts);
+function lockedSource(ctx: Context, m: Manifest, name: string, spec: SkillSpec, entry: LockEntry, opts: SourceOptions): ParsedSource {
+  const want = parseStoredSource(ctx, spec.source, opts, { m, name });
   const mismatch = () =>
     new Error(
       `${LOCKFILE}: the entry for "${name}" (${String(entry.resolved)}) does not match the manifest source ${spec.source}. Run \`skillwharf update ${name}\` to re-pin it.`,
@@ -116,8 +198,18 @@ function assertStoreHasNoSymlinks(name: string, store: string): void {
 }
 
 /** Link one location for every agent that shares it; the result names all of them. */
-function linkGroup(ctx: Context, m: Manifest, g: TargetGroup, name: string, store: string, force?: boolean): LinkResult {
-  return { ...linkSkill(ctx, m, g.agents[0], name, store, { force }), agents: g.agents };
+function linkGroup(
+  ctx: Context,
+  m: Manifest,
+  lock: Lockfile,
+  g: TargetGroup,
+  name: string,
+  store: string,
+  force?: boolean,
+): LinkResult {
+  const result = { ...linkSkill(ctx, m, g.agents[0], name, store, { force, copyRecorded: copyRecorded(lock, name, g) }), agents: g.agents };
+  recordLinks(lock, name, [result]);
+  return result;
 }
 
 export interface AddOptions {
@@ -206,7 +298,18 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
       // make every later sync throw. A folder that fails is skipped, not recorded.
       let sourceForManifest: string;
       let resolved = fetched.resolved;
+      const skip = (label: string, reason: string): [] => {
+        skipped.push({ dir: label, reason });
+        opts.onSkipped?.({ dir: label, reason });
+        return [];
+      };
       if (parsed.kind === "path") {
+        // The recorded source is read back trimmed, so a folder whose name has
+        // leading or trailing whitespace would resolve to a different folder.
+        if (multi && path.basename(dir) !== path.basename(dir).trim()) {
+          const label = path.relative(fetched.dir, dir).split(path.sep).join("/");
+          return skip(label, "the folder name has leading or trailing whitespace, which is lost when the source is read back");
+        }
         // A folder inside the project is recorded relative to it, so a teammate's
         // checkout at another location resolves the same skill. Outside it, the
         // path is recorded absolute (a relative one was typed relative to the
@@ -223,9 +326,7 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
         try {
           assertSubpath(sub);
         } catch (e) {
-          skipped.push({ dir: sub, reason: (e as Error).message });
-          opts.onSkipped?.({ dir: sub, reason: (e as Error).message });
-          return [];
+          return skip(sub, (e as Error).message);
         }
         const refPart = parsed.ref ? `@${parsed.ref}` : "";
         sourceForManifest = `github:${parsed.owner}/${parsed.repo}/${sub}${refPart}`;
@@ -245,8 +346,20 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
       const agentList = opts.agents ?? m.skills[name]?.agents;
       const targets = agentList ?? m.agents;
       assertSafeInstall(ctx, m, name, store, targets);
+      if (parsed.kind === "path") {
+        assertSourceClear(ctx, m, name, sourceRaw, dir, targets);
+        assertSourceClear(ctx, m, name, sourceRaw, parsed.path, targets);
+      }
+      // A skill already managed from somewhere else is not replaced by a folder
+      // that merely carries the same name (a pack's SKILL.md can say `name: pdf`).
+      const existing = m.skills[name];
+      if (existing && !opts.force && !sameSource(ctx, existing.source, sourceForManifest)) {
+        throw new Error(
+          `"${name}" is already managed from ${existing.source}; this source is ${sourceForManifest}. Re-run with --force to replace it.`,
+        );
+      }
       for (const g of targetGroups(ctx, m, targets, name)) {
-        if (!opts.force && linkStatus(ctx, m, g.agents[0], name, store) === "foreign") {
+        if (!opts.force && linkStatus(ctx, m, g.agents[0], name, store, { copyRecorded: copyRecorded(lock, name, g) }) === "foreign") {
           throw new Error(`${g.target} already exists and is not managed by skillwharf. Move it away, or re-run with --force.`);
         }
       }
@@ -270,13 +383,15 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
         integrity: hashDir(store),
         version: meta.version,
         installedAt: new Date().toISOString(),
+        ...(lock.skills[name]?.links ? { links: lock.skills[name].links } : {}),
       };
       lock.skills[name] = entry;
       // Record each skill as soon as its store folder is in place, before the
       // links, so the lockfile always describes what the store holds.
       saveManifest(ctx, m);
       saveLock(ctx, lock);
-      const links = targetGroups(ctx, m, targets, name).map((g) => linkGroup(ctx, m, g, name, store, opts.force));
+      const links = targetGroups(ctx, m, targets, name).map((g) => linkGroup(ctx, m, lock, g, name, store, opts.force));
+      saveLock(ctx, lock); // now also records which agents got a copy instead of a link
       results.push({ name, meta, lock: entry, links, skippedSymlinks });
     }
     return results;
@@ -301,7 +416,7 @@ export function removeSkill(ctx: Context, name: string): RemoveResult {
   assertSafeInstall(ctx, m, name, store, agentsFor(m, name));
   const removed: TargetGroup[] = [];
   for (const g of targetGroups(ctx, m, agentsFor(m, name), name)) {
-    if (unlinkSkill(ctx, m, g.agents[0], name, store)) removed.push(g);
+    if (unlinkSkill(ctx, m, g.agents[0], name, store, { copyRecorded: copyRecorded(lock, name, g) })) removed.push(g);
   }
   const removedLinks = removed.flatMap((g) => g.agents);
   removePath(store);
@@ -336,12 +451,13 @@ export function syncSkills(ctx: Context, opts: SyncOptions = {}): SyncReport {
 
   // Check every committed store folder before linking any of them. Freshly
   // fetched ones cannot contain symlinks: installToStore leaves them out.
-  for (const name of Object.keys(m.skills)) {
+  for (const [name, spec] of Object.entries(m.skills)) {
     const store = storePath(ctx, name);
     if (isDir(store)) {
       assertSafeTarget(ctx, store);
       assertStoreHasNoSymlinks(name, store);
     }
+    assertStoredSourceClear(ctx, m, name, spec.source);
   }
 
   // A lock entry with no integrity hash pins a commit but cannot verify what
@@ -373,13 +489,13 @@ export function syncSkills(ctx: Context, opts: SyncOptions = {}): SyncReport {
       if (isDir(store)) continue;
       // Install exactly what the lockfile pins. Only an explicit
       // --allow-unpinned falls back to the manifest source.
-      const source = parseStoredSource(ctx, spec.source, opts);
+      const source = parseStoredSource(ctx, spec.source, opts, { m, name });
       const entry = lock.skills[name];
       let fetched;
       let pinnedIntegrity: string | undefined;
       if (entry) {
         try {
-          fetched = fetchSource(lockedSource(ctx, name, spec, entry, opts));
+          fetched = fetchSource(lockedSource(ctx, m, name, spec, entry, opts));
           pinnedIntegrity = hasIntegrity(entry) ? entry.integrity : undefined;
         } catch (e) {
           const pinProblem = e instanceof UnusablePin || /^git fetch failed/.test((e as Error).message);
@@ -427,6 +543,7 @@ export function syncSkills(ctx: Context, opts: SyncOptions = {}): SyncReport {
         integrity: s.integrity,
         version: s.version,
         installedAt: new Date().toISOString(),
+        ...(lock.skills[name]?.links ? { links: lock.skills[name].links } : {}),
       };
       report.fetched.push(name);
     }
@@ -439,9 +556,9 @@ export function syncSkills(ctx: Context, opts: SyncOptions = {}): SyncReport {
     const store = storePath(ctx, name);
     let touched = false;
     for (const g of targetGroups(ctx, m, agentsFor(m, name), name)) {
-      const status = linkStatus(ctx, m, g.agents[0], name, store);
+      const status = linkStatus(ctx, m, g.agents[0], name, store, { copyRecorded: copyRecorded(lock, name, g) });
       if (status !== "ok") {
-        report.linked.push({ name, link: linkGroup(ctx, m, g, name, store, opts.force) });
+        report.linked.push({ name, link: linkGroup(ctx, m, lock, g, name, store, opts.force) });
         touched = true;
       }
     }
@@ -449,6 +566,17 @@ export function syncSkills(ctx: Context, opts: SyncOptions = {}): SyncReport {
   }
   saveLock(ctx, lock);
   return report;
+}
+
+/** The overlap check alone, for a source read back from the manifest (a local path only). */
+function assertStoredSourceClear(ctx: Context, m: Manifest, name: string, raw: string): void {
+  let p: ParsedSource;
+  try {
+    p = parseSource(raw, ctx.root);
+  } catch {
+    return; // a source that does not parse is refused where it is used
+  }
+  if (p.kind === "path") assertSourceClear(ctx, m, name, raw, p.path);
 }
 
 /** A skill fetched and verified in phase 1 of `syncSkills`, waiting to be installed. */
@@ -470,37 +598,71 @@ export function updateSkills(ctx: Context, only?: string[], opts: SourceOptions 
   const m = requireManifest(ctx);
   const lock = loadLock(ctx);
   const names = only && only.length ? only : Object.keys(m.skills);
-  const out: UpdateResult[] = [];
-  for (const name of names) {
+
+  // Phase 0: check every skill before touching anything: its place in the
+  // manifest, its paths, its source, and that no agent folder holds something
+  // skillwharf did not put there (update never replaces such a folder).
+  const plan = names.map((name) => {
     const spec = m.skills[name];
     if (!spec) throw new Error(`Skill "${name}" is not in the manifest`);
     const store = storePath(ctx, name);
     assertSafeInstall(ctx, m, name, store, agentsFor(m, name));
-    const parsed = parseStoredSource(ctx, spec.source, opts);
-    const fetched = fetchSource(parsed);
-    try {
-      const dirs = discoverSkills(fetched.dir);
-      if (dirs.length !== 1) throw new Error(`Expected exactly one skill at ${spec.source}, found ${dirs.length}`);
+    const parsed = parseStoredSource(ctx, spec.source, opts, { m, name });
+    const groups = targetGroups(ctx, m, agentsFor(m, name), name);
+    for (const g of groups) {
+      if (linkStatus(ctx, m, g.agents[0], name, store, { copyRecorded: copyRecorded(lock, name, g) }) === "foreign") {
+        throw new Error(`${g.target} already exists and is not managed by skillwharf. Move it away; update does not replace it.`);
+      }
+    }
+    return { name, spec, store, parsed, groups };
+  });
+
+  // Phase 1: fetch every source into a staging folder and size-check it. No
+  // store, link or lockfile changes here, so a failure for any skill (a network
+  // error, a missing folder, an oversized tree) leaves all of them as they were.
+  const staged = new Map<string, StagedSkill>();
+  let stagingRoot: string | undefined;
+  try {
+    for (const { name, spec, parsed } of plan) {
+      const fetched = fetchSource(parsed);
+      try {
+        const dirs = discoverSkills(fetched.dir);
+        if (dirs.length !== 1) throw new Error(`Expected exactly one skill at ${spec.source}, found ${dirs.length}`);
+        stagingRoot ??= fs.mkdtempSync(path.join(os.tmpdir(), "skillwharf-stage-"));
+        const dir = path.join(stagingRoot, name);
+        installToStore(dirs[0], dir, opts.limits);
+        staged.set(name, { dir, resolved: fetched.resolved, integrity: hashDir(dir), version: readSkill(dir).version });
+      } finally {
+        fetched.cleanup();
+      }
+    }
+
+    // Phase 2: install. The lock entry is saved right after its store folder is
+    // replaced, before the links, so a later failure leaves every store and the
+    // lockfile agreeing. The links were checked in phase 0, so they are replaced.
+    const out: UpdateResult[] = [];
+    for (const { name, spec, store, groups } of plan) {
+      const s = staged.get(name) as StagedSkill;
       const before = lock.skills[name]?.integrity;
-      installToStore(dirs[0], store, opts.limits);
-      const after = hashDir(store);
-      const meta = readSkill(store);
+      copyDir(s.dir, store);
       lock.skills[name] = {
         source: spec.source,
-        resolved: fetched.resolved,
-        integrity: after,
-        version: meta.version,
+        resolved: s.resolved,
+        integrity: s.integrity,
+        version: s.version,
         installedAt: new Date().toISOString(),
+        ...(lock.skills[name]?.links ? { links: lock.skills[name].links } : {}),
       };
-      assertStoreHasNoSymlinks(name, store);
-      for (const g of targetGroups(ctx, m, agentsFor(m, name), name)) linkGroup(ctx, m, g, name, store);
-      out.push({ name, before, after, changed: before !== after });
-    } finally {
-      fetched.cleanup();
+      saveLock(ctx, lock);
+      for (const g of groups) linkGroup(ctx, m, lock, g, name, store, true);
+      saveLock(ctx, lock);
+      out.push({ name, before, after: s.integrity, changed: before !== s.integrity });
     }
+    saveLock(ctx, lock);
+    return out;
+  } finally {
+    if (stagingRoot) removePath(stagingRoot);
   }
-  saveLock(ctx, lock);
-  return out;
 }
 
 export interface DoctorIssue {
@@ -527,6 +689,12 @@ export function doctor(ctx: Context): DoctorIssue[] {
       issues.push({ level: "error", skill: name, message: (e as Error).message });
       continue;
     }
+    try {
+      assertStoredSourceClear(ctx, m, name, m.skills[name].source);
+    } catch (e) {
+      issues.push({ level: "error", skill: name, message: (e as Error).message });
+      continue;
+    }
     if (!isDir(store)) {
       issues.push({ level: "error", skill: name, message: "not in store", fix: "skillwharf sync" });
       continue;
@@ -541,7 +709,7 @@ export function doctor(ctx: Context): DoctorIssue[] {
     const entry = lock.skills[name];
     if (entry) {
       try {
-        lockedSource(ctx, name, m.skills[name], entry, { allowOutsidePaths: true });
+        lockedSource(ctx, m, name, m.skills[name], entry, { allowOutsidePaths: true });
       } catch (e) {
         issues.push({ level: "error", skill: name, message: (e as Error).message, fix: "skillwharf update " + name });
       }
@@ -567,14 +735,14 @@ export function doctor(ctx: Context): DoctorIssue[] {
     // Agents sharing one location (codex + agents) are one link: checked and reported once.
     for (const g of targetGroups(ctx, m, agentsFor(m, name), name)) {
       const a = g.agents[0];
-      const status: LinkStatus = linkStatus(ctx, m, a, name, store);
+      const status: LinkStatus = linkStatus(ctx, m, a, name, store, { copyRecorded: copyRecorded(lock, name, g) });
       if (status === "ok") continue;
       const target = g.target;
       const msg: Record<Exclude<LinkStatus, "ok">, string> = {
         missing: `not installed for ${groupLabel(g.agents)}`,
         broken: `broken symlink at ${target}`,
         foreign: `${target} exists but is not managed by skillwharf`,
-        "stale-copy": `${target} is a copy, not a link (will not follow updates)`,
+        "stale-copy": `${target} is a copy, not a link (symlinks were not permitted when it was made; sync or update refreshes it)`,
       };
       issues.push({
         level: status === "foreign" ? "warn" : "error",

@@ -215,11 +215,45 @@ export function isInside(dir: string, p: string): boolean {
 }
 
 /**
+ * The real path of `p`; when it does not exist yet, the real path of its
+ * nearest existing ancestor with the rest appended, so a folder that is about
+ * to be created still compares by where it will actually be.
+ */
+export function realPathLoose(p: string): string {
+  const abs = path.resolve(p);
+  const rest: string[] = [];
+  let cur = abs;
+  for (;;) {
+    try {
+      return path.join(fs.realpathSync.native(cur), ...rest.reverse());
+    } catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) return abs;
+      rest.push(path.basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+/** True when two paths are the same folder, or one lies inside the other, after resolving every link. */
+export function pathsOverlap(a: string, b: string): boolean {
+  const ra = realPathLoose(a);
+  const rb = realPathLoose(b);
+  return isInside(ra, rb) || isInside(rb, ra);
+}
+
+/**
  * Copy a skill folder. Symlinks are never copied: a skill fetched from a
  * remote repo could otherwise smuggle a link to ~/.ssh or similar into the
  * agent's readable tree. Hidden VCS folders are skipped too.
  */
 export function copyDir(src: string, dest: string): void {
+  // The destination is deleted first. If it is, contains or lies inside the
+  // source (a skill whose source is its own store, say), that would delete the
+  // only copy.
+  if (pathsOverlap(src, dest)) {
+    throw new Error(`Refusing to copy ${src} onto ${dest}: the two folders overlap.`);
+  }
   fs.rmSync(dest, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   fs.cpSync(src, dest, {
