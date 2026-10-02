@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { assertWithinLimits, copyDir, isDir, isInside, type SizeLimits } from "./fs.js";
-import { runGit } from "./git.js";
+import { GitError, runGit } from "./git.js";
 import { isSkillDir } from "./skill.js";
 import {
   assertGitRef,
@@ -321,7 +321,17 @@ export interface Fetched {
 export interface FetchOptions {
   /** Longest a single git call may run before it is killed (default 120 s). */
   timeoutMs?: number;
+  /**
+   * For a pinned fetch (the ref is a commit): when the host refuses to serve
+   * the commit by its sha, clone this ref (the default branch when `ref` is
+   * undefined) and accept the result only if HEAD is exactly the pinned commit.
+   * Absent means no fallback.
+   */
+  fallback?: { ref?: string };
 }
+
+/** The host would not serve the pinned commit, and the ref that was cloned instead is not at it. */
+export class PinUnavailable extends Error {}
 
 /** Fetch a source into a directory we can read from. */
 export function fetchSource(src: ParsedSource, opts: FetchOptions = {}): Fetched {
@@ -332,19 +342,27 @@ export function fetchSource(src: ParsedSource, opts: FetchOptions = {}): Fetched
 
   const url = cloneUrl(src);
   const git = (args: string[], contact = false) => runGit(args, { url, timeoutMs: opts.timeoutMs, contact });
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "skillwharf-"));
+  const clone = (ref: string | undefined, into: string) => {
+    const args = ["clone", "--depth", "1", "--quiet"];
+    if (ref) args.push("--branch", ref);
+    args.push("--", url, into);
+    git(args, true);
+  };
+  let tmp = fs.mkdtempSync(path.join(os.tmpdir(), "skillwharf-"));
   try {
     if (src.ref && isCommitSha(src.ref)) {
       // Pinned commit (from the lockfile): fetch exactly that object.
-      git(["init", "--quiet", tmp]);
-      git(["-C", tmp, "remote", "add", "origin", url]);
-      git(["-C", tmp, "fetch", "--depth", "1", "--quiet", "origin", src.ref], true);
-      git(["-C", tmp, "checkout", "--quiet", "FETCH_HEAD"]);
+      try {
+        git(["init", "--quiet", tmp]);
+        git(["-C", tmp, "remote", "add", "origin", url]);
+        git(["-C", tmp, "fetch", "--depth", "1", "--quiet", "origin", src.ref], true);
+        git(["-C", tmp, "checkout", "--quiet", "FETCH_HEAD"]);
+      } catch (e) {
+        if (!opts.fallback || !(e instanceof GitError) || (e.kind !== "object" && e.kind !== "ref" && e.kind !== "unreachable")) throw e;
+        tmp = fallbackClone(src, e, tmp, opts.fallback.ref, clone, git);
+      }
     } else {
-      const args = ["clone", "--depth", "1", "--quiet"];
-      if (src.ref) args.push("--branch", src.ref);
-      args.push("--", url, tmp);
-      git(args, true);
+      clone(src.ref, tmp);
     }
   } catch (e) {
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -368,6 +386,44 @@ export function fetchSource(src: ParsedSource, opts: FetchOptions = {}): Fetched
     resolved: formatSource(src, sha),
     cleanup: () => fs.rmSync(tmp, { recursive: true, force: true }),
   };
+}
+
+/**
+ * The host refused to serve the pinned commit by its sha. Clone the recorded
+ * ref into a fresh folder and keep it only if HEAD is exactly that commit.
+ * Returns the folder to use (the failed one is removed). If the repository
+ * cannot be reached at all the original error is the answer.
+ */
+function fallbackClone(
+  src: GitSource,
+  original: GitError,
+  failed: string,
+  ref: string | undefined,
+  clone: (ref: string | undefined, into: string) => void,
+  git: (args: string[], contact?: boolean) => string,
+): string {
+  const alt = fs.mkdtempSync(path.join(os.tmpdir(), "skillwharf-"));
+  try {
+    try {
+      clone(ref, alt);
+    } catch (e) {
+      if (e instanceof GitError && e.kind === "ref") {
+        throw new PinUnavailable(`the host refused commit ${src.ref} and ${ref ? `"${ref}"` : "the default branch"} cannot be cloned instead (${e.message})`);
+      }
+      throw original;
+    }
+    const head = git(["-C", alt, "rev-parse", "HEAD"]).trim().toLowerCase();
+    if (!src.ref || !head.startsWith(src.ref.toLowerCase())) {
+      throw new PinUnavailable(
+        `the host refused commit ${src.ref} and ${ref ? `"${ref}"` : "the default branch"} is now at ${head.slice(0, 12)}, so the pinned commit cannot be installed`,
+      );
+    }
+  } catch (e) {
+    fs.rmSync(alt, { recursive: true, force: true });
+    throw e;
+  }
+  fs.rmSync(failed, { recursive: true, force: true });
+  return alt;
 }
 
 /**

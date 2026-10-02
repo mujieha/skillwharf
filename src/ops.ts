@@ -27,7 +27,20 @@ import {
 import { LOCKFILE, assertSafeTarget, loadLock, requireManifest, saveLock, saveManifest, storePath } from "./manifest.js";
 import { normalizeName, readSkill } from "./skill.js";
 import { assertSubpath } from "./validate.js";
-import { discoverSkills, fetchSource, formatSource, installToStore, parseSource, sourceKey, type ParsedSource } from "./source.js";
+import { GitError } from "./git.js";
+import {
+  PinUnavailable,
+  discoverSkills,
+  fetchSource,
+  formatSource,
+  installToStore,
+  isCommitSha,
+  parseSource,
+  sourceKey,
+  type FetchOptions,
+  type Fetched,
+  type ParsedSource,
+} from "./source.js";
 import type { AgentId, Context, LockEntry, Lockfile, Manifest, SkillMeta, SkillSpec } from "./types.js";
 
 export interface SourceOptions {
@@ -146,6 +159,33 @@ function hasIntegrity(entry: LockEntry): boolean {
 class UnusablePin extends Error {}
 
 /**
+ * Fetch a source; an unreachable repository is reported in the words that tell
+ * the user what to do. `name` is the managed skill when there is one (it makes
+ * the moved-repository hint a command that can be pasted).
+ */
+function fetchFor(src: ParsedSource, opts: SourceOptions, name?: string, extra: FetchOptions = {}): Fetched {
+  try {
+    return fetchSource(src, { timeoutMs: opts.gitTimeoutMs, ...extra });
+  } catch (e) {
+    throw explainFetchError(e, name);
+  }
+}
+
+function explainFetchError(e: unknown, name?: string): unknown {
+  if (!(e instanceof GitError) || e.kind !== "unreachable") return e;
+  const detail = e.message.replace(/^git fetch failed for \S+: /, "");
+  const hint = name ? `; if it moved, run \`skillwharf update ${name} --source <new>\`` : "";
+  return new Error(`repository not found or no access at ${e.url}${hint} (git said: ${detail})`);
+}
+
+/** What a pinned fetch may fall back to: the manifest's branch or tag, or the default branch; nothing when the manifest names a commit. */
+function fallbackFor(src: ParsedSource): FetchOptions["fallback"] {
+  if (src.kind !== "git") return undefined;
+  if (src.ref && isCommitSha(src.ref)) return undefined;
+  return { ref: src.ref };
+}
+
+/**
  * The exact source the lockfile pins for `name`, after checking that it is the
  * manifest's source at a full commit. Anything else is refused: a lockfile is
  * as editable by a teammate (or a pull request) as the manifest is.
@@ -154,7 +194,7 @@ function lockedSource(ctx: Context, m: Manifest, name: string, spec: SkillSpec, 
   const want = parseStoredSource(ctx, spec.source, opts, { m, name });
   const mismatch = () =>
     new Error(
-      `${LOCKFILE}: the entry for "${name}" (${String(entry.resolved)}) does not match the manifest source ${spec.source}. Run \`skillwharf update ${name}\` to re-pin it.`,
+      `${LOCKFILE}: the entry for "${name}" (${String(entry.resolved)}) does not match the manifest source ${spec.source}. Run \`skillwharf update ${name}\` to re-pin it; if the repository moved, run \`skillwharf update ${name} --source <new>\`.`,
     );
   if (entry.source !== spec.source || typeof entry.resolved !== "string") throw mismatch();
   let got: ParsedSource;
@@ -279,7 +319,7 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
   const m = requireManifest(ctx);
   const lock = loadLock(ctx);
   const parsed = parseSource(sourceRaw);
-  const fetched = fetchSource(parsed, { timeoutMs: opts.gitTimeoutMs });
+  const fetched = fetchFor(parsed, opts);
   try {
     let dirs = discoverSkills(fetched.dir);
     if (dirs.length === 0) throw new Error(`No SKILL.md found under ${sourceRaw}`);
@@ -508,21 +548,28 @@ export function syncSkills(ctx: Context, opts: SyncOptions = {}): SyncReport {
       let pinnedIntegrity: string | undefined;
       if (entry) {
         try {
-          fetched = fetchSource(lockedSource(ctx, m, name, spec, entry, opts), { timeoutMs: opts.gitTimeoutMs });
+          fetched = fetchSource(lockedSource(ctx, m, name, spec, entry, opts), {
+            timeoutMs: opts.gitTimeoutMs,
+            fallback: fallbackFor(source),
+          });
           pinnedIntegrity = hasIntegrity(entry) ? entry.integrity : undefined;
         } catch (e) {
-          const pinProblem = e instanceof UnusablePin || /^git fetch failed/.test((e as Error).message);
-          if (!pinProblem) throw e;
+          // The pin itself is the problem: an abbreviated sha, a commit the host
+          // will not serve (and the recorded ref is no longer at it), a ref that
+          // is gone. An unreachable repository or a timeout is not a pin problem.
+          const pinProblem =
+            e instanceof UnusablePin || e instanceof PinUnavailable || (e instanceof GitError && (e.kind === "object" || e.kind === "ref"));
+          if (!pinProblem) throw explainFetchError(e, name);
           if (!opts.allowUnpinned) {
             throw new Error(
               `Cannot install the pinned commit for "${name}": ${(e as Error).message} ` +
                 `Nothing was installed and the lockfile was not changed. Run \`skillwharf update ${name}\` to re-pin, or re-run sync with --allow-unpinned to install the manifest source as it is now.`,
             );
           }
-          fetched = fetchSource(source, { timeoutMs: opts.gitTimeoutMs });
+          fetched = fetchFor(source, opts, name);
         }
       } else {
-        fetched = fetchSource(source, { timeoutMs: opts.gitTimeoutMs });
+        fetched = fetchFor(source, opts, name);
       }
       try {
         const dirs = discoverSkills(fetched.dir);
@@ -607,20 +654,45 @@ export interface UpdateResult {
   changed: boolean;
 }
 
-export function updateSkills(ctx: Context, only?: string[], opts: SourceOptions = {}): UpdateResult[] {
+export interface UpdateOptions extends SourceOptions {
+  /**
+   * Replace the source of the one named skill with this one (a repository that
+   * moved) and re-pin it. Read like an `add` argument; the manifest and the
+   * lockfile change together, and only after the new source was fetched.
+   */
+  source?: string;
+}
+
+export function updateSkills(ctx: Context, only?: string[], opts: UpdateOptions = {}): UpdateResult[] {
   const m = requireManifest(ctx);
   const lock = loadLock(ctx);
   const names = only && only.length ? only : Object.keys(m.skills);
+  if (opts.source !== undefined && (only?.length ?? 0) !== 1) {
+    throw new Error("--source replaces the source of exactly one skill: name it, as in `skillwharf update <name> --source <new>`");
+  }
 
   // Phase 0: check every skill before touching anything: its place in the
   // manifest, its paths, its source, and that no agent folder holds something
   // skillwharf did not put there (update never replaces such a folder).
   const plan = names.map((name) => {
-    const spec = m.skills[name];
+    let spec = m.skills[name];
     if (!spec) throw new Error(`Skill "${name}" is not in the manifest`);
     const store = storePath(ctx, name);
     assertSafeInstall(ctx, m, name, store, agentsFor(m, name));
-    const parsed = parseStoredSource(ctx, spec.source, opts, { m, name });
+    let parsed: ParsedSource;
+    if (opts.source !== undefined) {
+      // The new source is what the user just typed, so it is read like an `add`
+      // argument (relative to the working directory) and recorded like one.
+      parsed = parseSource(opts.source);
+      let recorded = parsed.raw;
+      if (parsed.kind === "path") {
+        assertSourceClear(ctx, m, name, opts.source, parsed.path);
+        recorded = pathSourceFor(ctx, parsed.path) ?? `path:${parsed.path}`;
+      }
+      spec = { ...spec, source: recorded };
+    } else {
+      parsed = parseStoredSource(ctx, spec.source, opts, { m, name });
+    }
     const groups = targetGroups(ctx, m, agentsFor(m, name), name);
     for (const g of groups) {
       if (linkStatus(ctx, m, g.agents[0], name, store, { copyRecorded: copyRecorded(lock, name, g) }) === "foreign") {
@@ -637,7 +709,7 @@ export function updateSkills(ctx: Context, only?: string[], opts: SourceOptions 
   let stagingRoot: string | undefined;
   try {
     for (const { name, spec, parsed } of plan) {
-      const fetched = fetchSource(parsed, { timeoutMs: opts.gitTimeoutMs });
+      const fetched = fetchFor(parsed, opts, name);
       try {
         const dirs = discoverSkills(fetched.dir);
         if (dirs.length !== 1) throw new Error(`Expected exactly one skill at ${spec.source}, found ${dirs.length}`);
@@ -658,6 +730,10 @@ export function updateSkills(ctx: Context, only?: string[], opts: SourceOptions 
       const s = staged.get(name) as StagedSkill;
       const before = lock.skills[name]?.integrity;
       copyDir(s.dir, store);
+      if (opts.source !== undefined) {
+        m.skills[name] = { ...m.skills[name], source: spec.source };
+        saveManifest(ctx, m);
+      }
       lock.skills[name] = {
         source: spec.source,
         resolved: s.resolved,

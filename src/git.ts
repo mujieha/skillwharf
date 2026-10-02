@@ -51,7 +51,7 @@ export function gitEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv
   };
 }
 
-export type GitErrorKind = "timeout" | "ref" | "unreachable" | "other";
+export type GitErrorKind = "timeout" | "ref" | "object" | "unreachable" | "other";
 
 export class GitError extends Error {
   constructor(
@@ -103,11 +103,17 @@ export function runGit(args: string[], opts: RunGitOptions): string {
         opts.url,
       );
     }
-    const kind: GitErrorKind = /Remote branch .* not found|couldn't find remote ref/i.test(first)
-      ? "ref"
-      : opts.contact
-        ? "unreachable"
-        : "other";
+    const all = String(err.stderr ?? "");
+    // "object": the server is there but will not serve this commit by its sha.
+    // "ref": the branch or tag is not there. Anything else on first contact
+    // means the repository itself could not be reached.
+    const kind: GitErrorKind = /not our ref|unadvertised object|does not allow request/i.test(all)
+      ? "object"
+      : /Remote branch .* not found|couldn't find remote ref/i.test(all)
+        ? "ref"
+        : opts.contact
+          ? "unreachable"
+          : "other";
     throw new GitError(`git fetch failed for ${shown}: ${reason}`, kind, opts.url);
   }
 }

@@ -5,8 +5,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { allowProtocolsForTests, setGitExecForTests } from "./git.js";
-import { loadLock, loadManifest, makeContext, saveManifest } from "./manifest.js";
-import { addSkill, syncSkills } from "./ops.js";
+import { hashDir } from "./fs.js";
+import { loadLock, loadManifest, makeContext, saveManifest, storePath } from "./manifest.js";
+import { addSkill, syncSkills, updateSkills } from "./ops.js";
 import { fetchSource, formatSource, parseSource, sourceKey } from "./source.js";
 import type { Context, Lockfile, Manifest } from "./types.js";
 
@@ -506,5 +507,244 @@ describe("S1.13-S1.15: git is run with fixed arguments, a protocol allowlist and
     const [added] = addSkill(ctx, "gitlab:acme/platform/skills//rn");
     expect(added.name).toBe("rn");
     expect(spy).not.toHaveBeenCalled();
+  });
+});
+
+// ------------------------------------------------------------------ S1.16 / S1.18
+function writeManifest(m: Manifest) {
+  fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify(m));
+}
+function writeLock(l: Lockfile) {
+  fs.writeFileSync(path.join(proj, "skillwharf.lock.json"), JSON.stringify(l));
+}
+function read(p: string): string {
+  return fs.readFileSync(p, "utf8");
+}
+/** The host refuses to serve this commit by sha; everything else runs for real. */
+function refuseShaFetch(sha: string): void {
+  exec.mockImplementation(((file: string, args: string[], options: never) => {
+    if (args.includes("fetch") && args.includes(sha)) {
+      throw Object.assign(new Error("Command failed: git fetch"), {
+        stderr: Buffer.from(`fatal: remote error: upload-pack: not our ref ${sha}\n`),
+        status: 128,
+      });
+    }
+    return realExec.fn(file, args, options);
+  }) as never);
+}
+function privateTmp(): string {
+  const tmp = path.join(base, "tmp");
+  fs.mkdirSync(tmp, { recursive: true });
+  process.env.TMPDIR = tmp;
+  return tmp;
+}
+const alphaRepo = (w: string, body = "body") => writeSkill(path.join(w, "alpha"), "alpha", body);
+/** The integrity the lockfile would hold for alpha at this commit. */
+function integrityAt(source: string): string {
+  const f = fetchSource(parseSource(source));
+  try {
+    return hashDir(f.dir);
+  } finally {
+    f.cleanup();
+  }
+}
+
+describe("S1.16: a pinned fetch the host refuses falls back to the recorded ref, and only if HEAD is the pin", () => {
+  let sha1: string, sha2: string;
+  const lockFor = (sha: string, integrity: string, source = "github:acme/skills/alpha"): Lockfile => ({
+    version: 1,
+    skills: { alpha: { source, resolved: `${source.replace(/@.*$/, "")}@${sha}`, integrity, installedAt: "x" } },
+  });
+
+  describe("the ref still points at the pin", () => {
+    beforeEach(() => {
+      sha1 = makeRepo("acme/skills", (w) => alphaRepo(w, "first"));
+      routeHosts(ALL_HOSTS);
+      writeLock(lockFor(sha1, integrityAt(`github:acme/skills/alpha@${sha1}`)));
+      exec.mockClear();
+      refuseShaFetch(sha1);
+    });
+
+    it("installs it from a clone of the default branch when the manifest has no ref", () => {
+      writeManifest({ version: 1, agents: ["claude"], skills: { alpha: { source: "github:acme/skills/alpha" } } });
+      const r = syncSkills(ctx);
+      expect(r.fetched).toEqual(["alpha"]);
+      expect(read(path.join(storePath(ctx, "alpha"), "SKILL.md"))).toContain("first");
+      expect(loadLock(ctx).skills.alpha.resolved).toBe(`github:acme/skills/alpha@${sha1}`);
+      const calls = gitCalls();
+      const failedFetch = calls.findIndex((c) => c.includes("fetch"));
+      const clone = calls.findIndex((c) => c[0] === "clone");
+      expect(failedFetch).toBeGreaterThanOrEqual(0);
+      expect(clone).toBeGreaterThan(failedFetch);
+      expect(calls[clone]).not.toContain("--branch");
+    });
+
+    it("clones the manifest's branch when it names one", () => {
+      const head = git("-C", path.join(base, "srv", "acme", "skills.git"), "rev-parse", "--abbrev-ref", "HEAD");
+      writeManifest({ version: 1, agents: ["claude"], skills: { alpha: { source: `github:acme/skills/alpha@${head}` } } });
+      const integrity = (JSON.parse(read(path.join(proj, "skillwharf.lock.json"))) as Lockfile).skills.alpha.integrity;
+      writeLock(lockFor(sha1, integrity, `github:acme/skills/alpha@${head}`));
+      syncSkills(ctx);
+      const clone = gitCalls().find((c) => c[0] === "clone") as string[];
+      expect(clone).toContain("--branch");
+      expect(clone).toContain(head);
+    });
+
+    it("leaves no temp folder behind", () => {
+      const tmp = privateTmp();
+      writeManifest({ version: 1, agents: ["claude"], skills: { alpha: { source: "github:acme/skills/alpha" } } });
+      syncSkills(ctx);
+      expect(fs.readdirSync(tmp)).toEqual([]);
+    });
+  });
+
+  describe("the ref has moved past the pin (the host really refuses the old commit)", () => {
+    beforeEach(() => {
+      sha2 = makeRepo("acme/skills", (w) => {
+        alphaRepo(w, "first");
+        git("-C", w, "add", "-A");
+        git("-C", w, "commit", "--quiet", "-m", "first");
+        sha1 = git("-C", w, "rev-parse", "HEAD");
+        alphaRepo(w, "second");
+      });
+      routeHosts(ALL_HOSTS, [["protocol.version", "0"]]);
+      writeManifest({ version: 1, agents: ["claude"], skills: { alpha: { source: "github:acme/skills/alpha" } } });
+      writeLock(lockFor(sha1, "sha256-x"));
+    });
+
+    it("refuses, installs nothing, leaves the lockfile alone and no temp folder", () => {
+      const tmp = privateTmp();
+      const before = read(path.join(proj, "skillwharf.lock.json"));
+      expect(() => syncSkills(ctx)).toThrow(/Cannot install the pinned commit for "alpha"/);
+      expect(read(path.join(proj, "skillwharf.lock.json"))).toBe(before);
+      expect(fs.existsSync(storePath(ctx, "alpha"))).toBe(false);
+      expect(fs.readdirSync(tmp)).toEqual([]);
+    });
+
+    it("--allow-unpinned installs the manifest source as it is now and re-pins", () => {
+      syncSkills(ctx, { allowUnpinned: true });
+      expect(read(path.join(storePath(ctx, "alpha"), "SKILL.md"))).toContain("second");
+      expect(loadLock(ctx).skills.alpha.resolved).toBe(`github:acme/skills/alpha@${sha2}`);
+    });
+  });
+
+  it("does not fall back at all when the manifest ref is itself a commit", () => {
+    sha1 = makeRepo("acme/skills", (w) => alphaRepo(w, "first"));
+    routeHosts(ALL_HOSTS);
+    const source = `github:acme/skills/alpha@${sha1}`;
+    writeManifest({ version: 1, agents: ["claude"], skills: { alpha: { source } } });
+    writeLock(lockFor(sha1, integrityAt(source), source));
+    exec.mockClear();
+    refuseShaFetch(sha1);
+    expect(() => syncSkills(ctx)).toThrow(/Cannot install the pinned commit for "alpha"/);
+    expect(gitCalls().some((c) => c[0] === "clone")).toBe(false);
+  });
+
+  it("a branch that no longer exists is a refused pin too", () => {
+    sha1 = makeRepo("acme/skills", (w) => alphaRepo(w, "first"));
+    routeHosts(ALL_HOSTS);
+    writeManifest({ version: 1, agents: ["claude"], skills: { alpha: { source: "github:acme/skills/alpha@gone-branch" } } });
+    writeLock(lockFor(sha1, integrityAt(`github:acme/skills/alpha@${sha1}`), "github:acme/skills/alpha@gone-branch"));
+    refuseShaFetch(sha1);
+    expect(() => syncSkills(ctx)).toThrow(/Cannot install the pinned commit for "alpha"/);
+  });
+});
+
+describe("S1.18: a moved or missing repository", () => {
+  const missing = "git+https://git.acme.test/gone/x.git";
+
+  it("sync names update --source when the repository cannot be reached", () => {
+    routeHosts(ALL_HOSTS);
+    writeManifest({ version: 1, agents: ["claude"], skills: { x: { source: missing } } });
+    expect(() => syncSkills(ctx)).toThrow(
+      "repository not found or no access at https://git.acme.test/gone/x.git; if it moved, run `skillwharf update x --source <new>`",
+    );
+  });
+
+  it("the same holds for a pinned entry", () => {
+    routeHosts(ALL_HOSTS);
+    writeManifest({ version: 1, agents: ["claude"], skills: { x: { source: missing } } });
+    writeLock({
+      version: 1,
+      skills: { x: { source: missing, resolved: `${missing}@${SHA}`, integrity: "sha256-x", installedAt: "x" } },
+    });
+    expect(() => syncSkills(ctx)).toThrow(/repository not found or no access at https:\/\/git\.acme\.test\/gone\/x\.git; if it moved, run `skillwharf update x --source <new>`/);
+  });
+
+  it("add says the repository is unreachable without inventing a skill name", () => {
+    routeHosts(ALL_HOSTS);
+    writeManifest({ version: 1, agents: ["claude"], skills: {} });
+    let message = "";
+    try {
+      addSkill(ctx, missing);
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    expect(message).toMatch(/repository not found or no access at https:\/\/git\.acme\.test\/gone\/x\.git/);
+    expect(message).not.toMatch(/update <name>|update undefined/);
+  });
+
+  it("a lockfile that does not match the manifest names update --source", () => {
+    writeManifest({ version: 1, agents: ["claude"], skills: { alpha: { source: "gitlab:acme/new//alpha" } } });
+    writeLock({
+      version: 1,
+      skills: { alpha: { source: "gitlab:acme/new//alpha", resolved: `github:acme/old/alpha@${SHA}`, integrity: "sha256-x", installedAt: "x" } },
+    });
+    expect(() => syncSkills(ctx)).toThrow(/does not match.*skillwharf update alpha --source <new>/s);
+  });
+
+  describe("update --source", () => {
+    beforeEach(() => {
+      makeRepo("acme/skills", (w) => alphaRepo(w, "old content"));
+      makeRepo("acme/moved", (w) => alphaRepo(w, "new content"));
+      routeHosts(ALL_HOSTS);
+      fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: {} }));
+      addSkill(ctx, "github:acme/skills/alpha");
+    });
+
+    it("rewrites the manifest source and re-pins in one step", () => {
+      const res = updateSkills(ctx, ["alpha"], { source: "github:acme/moved/alpha" });
+      expect(res[0].changed).toBe(true);
+      expect(loadManifest(ctx)!.skills.alpha.source).toBe("github:acme/moved/alpha");
+      const entry = loadLock(ctx).skills.alpha;
+      expect(entry.source).toBe("github:acme/moved/alpha");
+      expect(entry.resolved).toMatch(/^github:acme\/moved\/alpha@[0-9a-f]{40}$/);
+      expect(read(path.join(storePath(ctx, "alpha"), "SKILL.md"))).toContain("new content");
+      expect(fs.readlinkSync(path.join(proj, ".claude", "skills", "alpha"))).toContain(path.join(".skillwharf", "skills", "alpha"));
+      // and a later sync is happy with the pair
+      expect(syncSkills(ctx).fetched).toEqual([]);
+    });
+
+    it("accepts any host for the new source", () => {
+      makeRepo("team/skills", (w) => alphaRepo(w, "on the company server"));
+      updateSkills(ctx, ["alpha"], { source: "git+https://git.acme.test/team/skills.git//alpha" });
+      expect(loadManifest(ctx)!.skills.alpha.source).toBe("git+https://git.acme.test/team/skills.git//alpha");
+      expect(loadLock(ctx).skills.alpha.resolved).toMatch(/^git\+https:\/\/git\.acme\.test\/team\/skills\.git\/\/alpha@[0-9a-f]{40}$/);
+    });
+
+    it("leaves the manifest, the lockfile and the store byte-identical when the new source fails", () => {
+      const m = read(path.join(proj, "skillwharf.json"));
+      const l = read(path.join(proj, "skillwharf.lock.json"));
+      const store = hashDir(storePath(ctx, "alpha"));
+      expect(() => updateSkills(ctx, ["alpha"], { source: "github:acme/gone/alpha" })).toThrow(/repository not found or no access/);
+      expect(read(path.join(proj, "skillwharf.json"))).toBe(m);
+      expect(read(path.join(proj, "skillwharf.lock.json"))).toBe(l);
+      expect(hashDir(storePath(ctx, "alpha"))).toBe(store);
+    });
+
+    it("needs exactly one skill name", () => {
+      expect(() => updateSkills(ctx, [], { source: "github:acme/moved/alpha" })).toThrow(/exactly one skill/);
+      expect(() => updateSkills(ctx, ["alpha", "beta"], { source: "github:acme/moved/alpha" })).toThrow(/exactly one skill/);
+    });
+
+    it("refuses a local source that is the skill's own store", () => {
+      expect(() => updateSkills(ctx, ["alpha"], { source: storePath(ctx, "alpha") })).toThrow(/overlap/);
+    });
+
+    it("refuses a source that does not parse, before fetching anything", () => {
+      exec.mockClear();
+      expect(() => updateSkills(ctx, ["alpha"], { source: "git+https://u:p@git.acme.test/x.git" })).toThrow(/credential/);
+      expect(gitCalls()).toEqual([]);
+    });
   });
 });

@@ -215,15 +215,21 @@ program
 // ---------------------------------------------------------------- update
 program
   .command("update [names...]")
-  .description("re-fetch skills from their sources and refresh the lockfile")
+  .description("re-fetch skills from their sources and refresh the lockfile (--source: the repository moved, point one skill at its new home)")
+  .option("--source <source>", "replace the source of the one named skill (a repository that moved) and re-pin it")
   .option("--allow-outside-paths", "accept path: sources that resolve outside the project")
   .option("--max-skill-size <mb>", `refuse a skill folder over this many megabytes (default ${DEFAULT_MAX_BYTES / 1024 / 1024})`)
   .option("--max-skill-files <n>", `refuse a skill folder with more than this many files and folders (default ${DEFAULT_MAX_FILES})`)
-  .action((names: string[], opts: { allowOutsidePaths?: boolean; maxSkillSize?: string; maxSkillFiles?: string }, cmd: Command) => {
+  .action((names: string[], opts: { source?: string; allowOutsidePaths?: boolean; maxSkillSize?: string; maxSkillFiles?: string }, cmd: Command) => {
     const ctx = ctxFrom(cmd);
     const timeout = gitTimeoutMs(cmd);
     try {
-      const res = updateSkills(ctx, names, { allowOutsidePaths: opts.allowOutsidePaths, limits: parseLimits(opts), gitTimeoutMs: timeout });
+      const res = updateSkills(ctx, names, {
+        source: opts.source,
+        allowOutsidePaths: opts.allowOutsidePaths,
+        limits: parseLimits(opts),
+        gitTimeoutMs: timeout,
+      });
       for (const r of res) {
         console.log(r.changed ? pc.green("↑") : pc.dim("="), pc.bold(r.name), r.changed ? "updated" : pc.dim("unchanged"));
       }
