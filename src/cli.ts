@@ -32,11 +32,21 @@ const program = new Command()
   .description("skillwharf — install, version, sync and track agent skills across Claude Code, Codex, Cursor and more")
   .version(VERSION)
   .option("-g, --global", "operate on ~/.skillwharf instead of the current project")
-  .option("--json", "machine-readable output where supported");
+  .option("--json", "machine-readable output where supported")
+  .option("--git-timeout <seconds>", "kill a git call that runs longer than this (default 120)");
 
 function ctxFrom(cmd: Command): Context {
   const opts = cmd.optsWithGlobals() as { global?: boolean };
   return makeContext({ global: opts.global });
+}
+
+/** `--git-timeout <seconds>` as milliseconds, or undefined for the default. */
+function gitTimeoutMs(cmd: Command): number | undefined {
+  const raw = (cmd.optsWithGlobals() as { gitTimeout?: string }).gitTimeout;
+  if (raw === undefined) return undefined;
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || seconds <= 0) fail(`--git-timeout takes a positive number of seconds, got "${raw}"`);
+  return Math.round(seconds * 1000);
 }
 
 function parseAgents(s: string | undefined): AgentId[] | undefined {
@@ -128,6 +138,7 @@ program
   .option("--max-skill-files <n>", `refuse a skill folder with more than this many files and folders (default ${DEFAULT_MAX_FILES})`)
   .action((source: string, opts: AddCliOptions, cmd: Command) => {
     const ctx = ctxFrom(cmd);
+    const timeout = gitTimeoutMs(cmd);
     try {
       const added = addSkill(ctx, source, {
         name: opts.name,
@@ -135,6 +146,7 @@ program
         all: opts.all,
         force: opts.force,
         limits: parseLimits(opts),
+        gitTimeoutMs: timeout,
         onSkipped: (s) => console.log(pc.yellow("!"), `skipped ${clean(s.dir)}: ${clean(s.reason)}`),
       });
       for (const a of added) {
@@ -183,12 +195,14 @@ program
   .option("--max-skill-files <n>", `refuse a skill folder with more than this many files and folders (default ${DEFAULT_MAX_FILES})`)
   .action((opts: { force?: boolean; allowUnpinned?: boolean; allowOutsidePaths?: boolean; maxSkillSize?: string; maxSkillFiles?: string }, cmd: Command) => {
     const ctx = ctxFrom(cmd);
+    const timeout = gitTimeoutMs(cmd);
     try {
       const r = syncSkills(ctx, {
         force: opts.force,
         allowUnpinned: opts.allowUnpinned,
         allowOutsidePaths: opts.allowOutsidePaths,
         limits: parseLimits(opts),
+        gitTimeoutMs: timeout,
       });
       for (const n of r.fetched) console.log(pc.green("✔"), "fetched", pc.bold(n));
       for (const l of r.linked) console.log(pc.green("✔"), "linked ", pc.bold(l.name), pc.dim(`→ ${groupLabel(l.link.agents)} (${l.link.mode})`));
@@ -207,8 +221,9 @@ program
   .option("--max-skill-files <n>", `refuse a skill folder with more than this many files and folders (default ${DEFAULT_MAX_FILES})`)
   .action((names: string[], opts: { allowOutsidePaths?: boolean; maxSkillSize?: string; maxSkillFiles?: string }, cmd: Command) => {
     const ctx = ctxFrom(cmd);
+    const timeout = gitTimeoutMs(cmd);
     try {
-      const res = updateSkills(ctx, names, { allowOutsidePaths: opts.allowOutsidePaths, limits: parseLimits(opts) });
+      const res = updateSkills(ctx, names, { allowOutsidePaths: opts.allowOutsidePaths, limits: parseLimits(opts), gitTimeoutMs: timeout });
       for (const r of res) {
         console.log(r.changed ? pc.green("↑") : pc.dim("="), pc.bold(r.name), r.changed ? "updated" : pc.dim("unchanged"));
       }

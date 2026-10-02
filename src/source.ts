@@ -1,8 +1,8 @@
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { assertWithinLimits, copyDir, isDir, isInside, type SizeLimits } from "./fs.js";
+import { runGit } from "./git.js";
 import { isSkillDir } from "./skill.js";
 import {
   assertGitRef,
@@ -318,40 +318,44 @@ export interface Fetched {
   cleanup: () => void;
 }
 
+export interface FetchOptions {
+  /** Longest a single git call may run before it is killed (default 120 s). */
+  timeoutMs?: number;
+}
+
 /** Fetch a source into a directory we can read from. */
-export function fetchSource(src: ParsedSource): Fetched {
+export function fetchSource(src: ParsedSource, opts: FetchOptions = {}): Fetched {
   if (src.kind === "path") {
     if (!isDir(src.path)) throw new Error(`Path not found: ${src.path}`);
     return { dir: src.path, resolved: formatSource(src), cleanup: () => {} };
   }
 
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "skillwharf-"));
   const url = cloneUrl(src);
-  const git = (args: string[]) => execFileSync("git", args, { stdio: ["ignore", "ignore", "pipe"] });
+  const git = (args: string[], contact = false) => runGit(args, { url, timeoutMs: opts.timeoutMs, contact });
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "skillwharf-"));
   try {
     if (src.ref && isCommitSha(src.ref)) {
       // Pinned commit (from the lockfile): fetch exactly that object.
       git(["init", "--quiet", tmp]);
       git(["-C", tmp, "remote", "add", "origin", url]);
-      git(["-C", tmp, "fetch", "--depth", "1", "--quiet", "origin", src.ref]);
+      git(["-C", tmp, "fetch", "--depth", "1", "--quiet", "origin", src.ref], true);
       git(["-C", tmp, "checkout", "--quiet", "FETCH_HEAD"]);
     } else {
       const args = ["clone", "--depth", "1", "--quiet"];
       if (src.ref) args.push("--branch", src.ref);
-      args.push(url, tmp);
-      git(args);
+      args.push("--", url, tmp);
+      git(args, true);
     }
   } catch (e) {
     fs.rmSync(tmp, { recursive: true, force: true });
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(`git fetch failed for ${url}${src.ref ? ` @${src.ref}` : ""}: ${msg.split("\n")[0]}`);
+    throw e;
   }
   // Always the full sha: hosts (GitHub included) refuse to serve an
   // abbreviated one, so a short pin could never be fetched again.
   let dir: string;
   let sha: string;
   try {
-    sha = execFileSync("git", ["-C", tmp, "rev-parse", "HEAD"]).toString().trim();
+    sha = git(["-C", tmp, "rev-parse", "HEAD"]).trim();
     dir = resolveSubpath(tmp, src.subpath, repoLabel(src));
   } catch (e) {
     fs.rmSync(tmp, { recursive: true, force: true });

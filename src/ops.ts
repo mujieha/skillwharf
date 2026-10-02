@@ -39,6 +39,8 @@ export interface SourceOptions {
   allowOutsidePaths?: boolean;
   /** Override the default size cap for one skill folder. */
   limits?: SizeLimits;
+  /** Longest one git call may run, in milliseconds (default 120 s). */
+  gitTimeoutMs?: number;
 }
 
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
@@ -223,6 +225,8 @@ export interface AddOptions {
   force?: boolean;
   /** Override the default size cap for one skill folder */
   limits?: SizeLimits;
+  /** Longest one git call may run, in milliseconds (default 120 s). */
+  gitTimeoutMs?: number;
   /** Called for each folder of a multi-skill source that was left out, with the reason. */
   onSkipped?: (skipped: SkippedSkill) => void;
 }
@@ -275,7 +279,7 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
   const m = requireManifest(ctx);
   const lock = loadLock(ctx);
   const parsed = parseSource(sourceRaw);
-  const fetched = fetchSource(parsed);
+  const fetched = fetchSource(parsed, { timeoutMs: opts.gitTimeoutMs });
   try {
     let dirs = discoverSkills(fetched.dir);
     if (dirs.length === 0) throw new Error(`No SKILL.md found under ${sourceRaw}`);
@@ -504,7 +508,7 @@ export function syncSkills(ctx: Context, opts: SyncOptions = {}): SyncReport {
       let pinnedIntegrity: string | undefined;
       if (entry) {
         try {
-          fetched = fetchSource(lockedSource(ctx, m, name, spec, entry, opts));
+          fetched = fetchSource(lockedSource(ctx, m, name, spec, entry, opts), { timeoutMs: opts.gitTimeoutMs });
           pinnedIntegrity = hasIntegrity(entry) ? entry.integrity : undefined;
         } catch (e) {
           const pinProblem = e instanceof UnusablePin || /^git fetch failed/.test((e as Error).message);
@@ -515,10 +519,10 @@ export function syncSkills(ctx: Context, opts: SyncOptions = {}): SyncReport {
                 `Nothing was installed and the lockfile was not changed. Run \`skillwharf update ${name}\` to re-pin, or re-run sync with --allow-unpinned to install the manifest source as it is now.`,
             );
           }
-          fetched = fetchSource(source);
+          fetched = fetchSource(source, { timeoutMs: opts.gitTimeoutMs });
         }
       } else {
-        fetched = fetchSource(source);
+        fetched = fetchSource(source, { timeoutMs: opts.gitTimeoutMs });
       }
       try {
         const dirs = discoverSkills(fetched.dir);
@@ -633,7 +637,7 @@ export function updateSkills(ctx: Context, only?: string[], opts: SourceOptions 
   let stagingRoot: string | undefined;
   try {
     for (const { name, spec, parsed } of plan) {
-      const fetched = fetchSource(parsed);
+      const fetched = fetchSource(parsed, { timeoutMs: opts.gitTimeoutMs });
       try {
         const dirs = discoverSkills(fetched.dir);
         if (dirs.length !== 1) throw new Error(`Expected exactly one skill at ${spec.source}, found ${dirs.length}`);
