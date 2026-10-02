@@ -34,15 +34,15 @@ describe("normalizeName", () => {
 describe("parseSource", () => {
   it("parses github shorthand with subpath and ref", () => {
     const p = parseSource("github:acme/skills/tools/pdf@v2");
-    expect(p).toMatchObject({ kind: "github", owner: "acme", repo: "skills", subpath: "tools/pdf", ref: "v2" });
+    expect(p).toMatchObject({ kind: "git", shorthand: "github", host: "github.com", repoPath: "acme/skills", subpath: "tools/pdf", ref: "v2" });
     expect(formatSource(p)).toBe("github:acme/skills/tools/pdf@v2");
     expect(formatSource(p, "abc1234")).toBe("github:acme/skills/tools/pdf@abc1234");
   });
   it("parses github tree URLs", () => {
     const p = parseSource("https://github.com/acme/skills/tree/main/tools/pdf");
-    expect(p).toMatchObject({ kind: "github", owner: "acme", repo: "skills", subpath: "tools/pdf", ref: "main" });
+    expect(p).toMatchObject({ kind: "git", shorthand: "github", repoPath: "acme/skills", subpath: "tools/pdf", ref: "main" });
     const r = parseSource("https://github.com/acme/skills.git");
-    expect(r).toMatchObject({ kind: "github", repo: "skills", subpath: "" });
+    expect(r).toMatchObject({ kind: "git", shorthand: "github", repoPath: "acme/skills", subpath: "" });
   });
   it("parses local paths", () => {
     expect(parseSource("./x", "/proj")).toMatchObject({ kind: "path", path: "/proj/x" });

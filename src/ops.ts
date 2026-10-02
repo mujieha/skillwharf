@@ -27,7 +27,7 @@ import {
 import { LOCKFILE, assertSafeTarget, loadLock, requireManifest, saveLock, saveManifest, storePath } from "./manifest.js";
 import { normalizeName, readSkill } from "./skill.js";
 import { assertSubpath } from "./validate.js";
-import { discoverSkills, fetchSource, installToStore, parseSource, type ParsedSource } from "./source.js";
+import { discoverSkills, fetchSource, formatSource, installToStore, parseSource, sourceKey, type ParsedSource } from "./source.js";
 import type { AgentId, Context, LockEntry, Lockfile, Manifest, SkillMeta, SkillSpec } from "./types.js";
 
 export interface SourceOptions {
@@ -127,7 +127,7 @@ function sameSource(ctx: Context, a: string, b: string): boolean {
   const key = (raw: string) => {
     try {
       const p = parseSource(raw, ctx.root);
-      return p.kind === "path" ? `path:${p.path}` : `github:${p.owner}/${p.repo}/${p.subpath}@${p.ref ?? ""}`;
+      return p.kind === "path" ? sourceKey(p) : `${sourceKey(p)}@${p.ref ?? ""}`;
     } catch {
       return raw;
     }
@@ -161,10 +161,8 @@ function lockedSource(ctx: Context, m: Manifest, name: string, spec: SkillSpec, 
   } catch {
     throw mismatch();
   }
-  if (want.kind === "github") {
-    if (got.kind !== "github" || got.owner !== want.owner || got.repo !== want.repo || got.subpath !== want.subpath) {
-      throw mismatch();
-    }
+  if (want.kind === "git") {
+    if (got.kind !== "git" || sourceKey(got) !== sourceKey(want)) throw mismatch();
     if (!got.ref || !FULL_SHA_RE.test(got.ref)) {
       throw new UnusablePin(
         `${LOCKFILE}: "${name}" is pinned to "${String(got.ref)}", not a full 40-character commit sha.`,
@@ -332,9 +330,9 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
         } catch (e) {
           return skip(sub, (e as Error).message);
         }
-        const refPart = parsed.ref ? `@${parsed.ref}` : "";
-        sourceForManifest = `github:${parsed.owner}/${parsed.repo}/${sub}${refPart}`;
-        resolved = resolved.replace(/^github:[^@]+/, `github:${parsed.owner}/${parsed.repo}/${sub}`);
+        const folder: ParsedSource = { ...parsed, subpath: sub };
+        sourceForManifest = formatSource(folder);
+        resolved = formatSource(folder, fetched.sha);
       } else {
         sourceForManifest = parsed.raw;
       }

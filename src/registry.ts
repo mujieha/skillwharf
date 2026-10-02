@@ -68,7 +68,7 @@ function normalize(idx: RegistryIndex): RegistryIndex {
       e && typeof e.name === "string" && SKILL_NAME_RE.test(e.name) &&
       typeof e.description === "string" && typeof e.source === "string" && e.source.length < 512 &&
       e.source === e.source.trim() &&
-      isGithubSource(e.source) &&
+      isGitSource(e.source) &&
       (e.tags === undefined || (Array.isArray(e.tags) && e.tags.every((t) => typeof t === "string" && t.length < 40))),
   );
   return {
@@ -87,10 +87,10 @@ function normalize(idx: RegistryIndex): RegistryIndex {
   };
 }
 
-/** A registry may only point at GitHub; a local path in someone else's index is never an install source. */
-function isGithubSource(s: string): boolean {
+/** A registry entry must name a git source on any host; a local path in someone else's index is never an install source. */
+function isGitSource(s: string): boolean {
   try {
-    return parseSource(s).kind === "github";
+    return parseSource(s).kind === "git";
   } catch {
     return false;
   }
