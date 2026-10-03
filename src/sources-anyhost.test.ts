@@ -1464,6 +1464,10 @@ describe("Round A U2: the user's hooks and LFS are not run on a fetched tree", (
   });
 
   it("an LFS smudge filter (and one the repository's .gitattributes asks for) does not run", () => {
+    // A machine with git-lfs installed has a system-wide `clean` filter that would turn the
+    // committed file into a pointer: build the repository with no configuration but our own.
+    process.env.GIT_CONFIG_NOSYSTEM = "1";
+    process.env.GIT_CONFIG_GLOBAL = os.devNull;
     makeRepo("acme/skills", (w) => {
       writeSkill(path.join(w, "rn"), "rn");
       fs.writeFileSync(path.join(w, ".gitattributes"), "*.bin filter=lfs\n");
