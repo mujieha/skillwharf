@@ -27,7 +27,7 @@ import {
 import { LOCKFILE, assertSafeTarget, loadLock, requireManifest, saveLock, saveManifest, storePath } from "./manifest.js";
 import { normalizeName, readSkill } from "./skill.js";
 import { assertSubpath } from "./validate.js";
-import { GitError } from "./git.js";
+import { GitError, defaultDeadlineMs } from "./git.js";
 import { loadRegistries, resolveRegistryName } from "./registry.js";
 import {
   PinUnavailable,
@@ -58,6 +58,16 @@ export interface SourceOptions {
   limits?: SizeLimits;
   /** Longest one git call may run, in milliseconds (default 120 s). */
   gitTimeoutMs?: number;
+  /** Longest all the git calls of one command may take together, in milliseconds (default four times the timeout). */
+  gitDeadlineMs?: number;
+  /** @internal The moment that limit runs out (epoch milliseconds), set when a command starts. */
+  gitDeadlineAt?: number;
+}
+
+/** The options of a command with its overall git deadline fixed at the moment it starts. */
+function withDeadline<T extends { gitTimeoutMs?: number; gitDeadlineMs?: number; gitDeadlineAt?: number }>(opts: T): T {
+  if (opts.gitDeadlineAt !== undefined) return opts;
+  return { ...opts, gitDeadlineAt: Date.now() + (opts.gitDeadlineMs ?? defaultDeadlineMs(opts.gitTimeoutMs)) };
 }
 
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
@@ -174,7 +184,7 @@ class UnusablePin extends Error {}
  */
 function fetchFor(src: ParsedSource, opts: SourceOptions, name?: string, extra: FetchOptions = {}): Fetched {
   try {
-    return fetchSource(src, { timeoutMs: opts.gitTimeoutMs, ...extra });
+    return fetchSource(src, { timeoutMs: opts.gitTimeoutMs, deadline: opts.gitDeadlineAt, ...extra });
   } catch (e) {
     throw explainFetchError(e, name);
   }
@@ -280,6 +290,10 @@ export interface AddOptions {
   limits?: SizeLimits;
   /** Longest one git call may run, in milliseconds (default 120 s). */
   gitTimeoutMs?: number;
+  /** Longest all the git calls of this command may take together, in milliseconds (default four times the timeout). */
+  gitDeadlineMs?: number;
+  /** @internal */
+  gitDeadlineAt?: number;
   /** Called for each folder of a multi-skill source that was left out, with the reason. */
   onSkipped?: (skipped: SkippedSkill) => void;
 }
@@ -328,7 +342,8 @@ export function agentsFor(m: Manifest, name: string): AgentId[] {
   return m.skills[name]?.agents ?? m.agents;
 }
 
-export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {}): AddedSkill[] {
+export function addSkill(ctx: Context, sourceRaw: string, options: AddOptions = {}): AddedSkill[] {
+  const opts = withDeadline(options);
   const m = requireManifest(ctx);
   const lock = loadLock(ctx);
   const parsed = parseSource(sourceRaw);
@@ -593,7 +608,8 @@ export interface SyncOptions extends SourceOptions {
 }
 
 /** Bring store + agent dirs in line with the manifest. Fetches skills missing from the store. */
-export function syncSkills(ctx: Context, opts: SyncOptions = {}): SyncReport {
+export function syncSkills(ctx: Context, options: SyncOptions = {}): SyncReport {
+  const opts = withDeadline(options);
   const m = requireManifest(ctx);
   const lock = loadLock(ctx);
   const report: SyncReport = { fetched: [], linked: [], unchanged: [] };
@@ -646,6 +662,7 @@ export function syncSkills(ctx: Context, opts: SyncOptions = {}): SyncReport {
         try {
           fetched = fetchSource(lockedSource(ctx, m, name, spec, entry, opts), {
             timeoutMs: opts.gitTimeoutMs,
+            deadline: opts.gitDeadlineAt,
             fallback: fallbackFor(source),
           });
           pinnedIntegrity = hasIntegrity(entry) ? entry.integrity : undefined;
@@ -774,7 +791,8 @@ export interface UpdateOptions extends SourceOptions {
   source?: string;
 }
 
-export function updateSkills(ctx: Context, only?: string[], opts: UpdateOptions = {}): UpdateResult[] {
+export function updateSkills(ctx: Context, only?: string[], options: UpdateOptions = {}): UpdateResult[] {
+  const opts = withDeadline(options);
   const m = requireManifest(ctx);
   const lock = loadLock(ctx);
   const names = only && only.length ? only : Object.keys(m.skills);

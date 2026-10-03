@@ -13,7 +13,7 @@ import {
   isInside,
   type SizeLimits,
 } from "./fs.js";
-import { GitError, runGit } from "./git.js";
+import { GitError, runGit, writeSafeAttributes } from "./git.js";
 import { placeSubmodules } from "./submodules.js";
 import { isSkillDir, isSkillDirIn } from "./skill.js";
 import {
@@ -374,10 +374,14 @@ export function fetchSource(src: ParsedSource, opts: FetchOptions = {}): Fetched
   const url = cloneUrl(src);
   const git = (args: string[], contact = false) => runGit(args, { url, timeoutMs: opts.timeoutMs, deadline: opts.deadline, contact });
   const clone = (ref: string | undefined, into: string) => {
-    const args = ["clone", "--depth", "1", "--quiet"];
+    // No checkout until the attributes that switch a repository's own filter,
+    // ident and eol settings off are in place (see SAFE_ATTRIBUTES).
+    const args = ["clone", "--depth", "1", "--quiet", "--no-checkout"];
     if (ref) args.push("--branch", ref);
     args.push("--", url, into);
     git(args, true);
+    writeSafeAttributes(into);
+    runGit(["-C", into, "checkout", "--quiet", "HEAD"], { url, timeoutMs: opts.timeoutMs, deadline: opts.deadline });
   };
   let tmp = fs.mkdtempSync(path.join(os.tmpdir(), "skillwharf-"));
   try {
@@ -387,6 +391,7 @@ export function fetchSource(src: ParsedSource, opts: FetchOptions = {}): Fetched
         git(["init", "--quiet", tmp]);
         git(["-C", tmp, "remote", "add", "--", "origin", url]);
         git(["-C", tmp, "fetch", "--depth", "1", "--quiet", "origin", src.ref], true);
+        writeSafeAttributes(tmp);
         git(["-C", tmp, "checkout", "--quiet", "FETCH_HEAD"]);
       } catch (e) {
         if (!opts.fallback || !(e instanceof GitError) || (e.kind !== "object" && e.kind !== "ref" && e.kind !== "unreachable")) throw e;

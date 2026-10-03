@@ -1,10 +1,10 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { allowProtocolsForTests, gitEnv, runGit, setGitExecForTests } from "./git.js";
+import { SUPERVISOR_SOURCE, supervisedGit, allowAskpass, allowProtocolsForTests, defaultDeadlineMs, gitEnv, killProcessTree, runGit, setGitExecForTests } from "./git.js";
 import { copyDir, copyResolvingLinks, hashDir, inGitDir } from "./fs.js";
 import { isSkillDirIn } from "./skill.js";
 import { loadLock, loadManifest, makeContext, saveManifest, storePath } from "./manifest.js";
@@ -15,8 +15,8 @@ import type { Context, Lockfile, Manifest } from "./types.js";
 
 // Every git call goes through runGit; this wrapper records the calls and runs
 // the real thing unless a test swaps the implementation.
-const realExec = { fn: execFileSync };
-const exec = vi.fn<typeof execFileSync>(execFileSync);
+const realExec = { fn: supervisedGit };
+const exec = vi.fn<typeof execFileSync>(supervisedGit);
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const savedEnv = { ...process.env };
@@ -48,9 +48,9 @@ function writeSkill(dir: string, name: string, body = "body") {
   fs.writeFileSync(path.join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: d\n---\n${body}\n`);
 }
 
+/** Plain git for building test repositories (not through the supervisor, which is what is under test elsewhere). */
 function git(...args: string[]): string {
-  return realExec
-    .fn("git", ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", ...args], {
+  return execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", ...args], {
       stdio: ["ignore", "pipe", "pipe"],
     })
     .toString()
@@ -93,6 +93,19 @@ const ALL_HOSTS = [
   "https://git.acme.test/",
   "ssh://git@git.acme.test/",
 ];
+
+let built = false;
+/**
+ * Compile the command line into dist/ (as `npm run build` does; CI runs the tests first), so a test can run
+ * the shipped code as a child process: no test-only allowance applies there.
+ */
+function ensureBuilt(): void {
+  if (built) return;
+  const root = path.resolve(here, "..");
+  const r = spawnSync(path.join(root, "node_modules", ".bin", "tsc"), ["-p", "tsconfig.json"], { cwd: root, encoding: "utf8" });
+  if (r.status !== 0) throw new Error(`tsc failed:\n${r.stdout}${r.stderr}`);
+  built = true;
+}
 
 /** An argument list without the `-c key=value` settings every call starts with (see HARDENING in git.ts). */
 function withoutHardening(args: string[]): string[] {
@@ -326,7 +339,9 @@ describe("S1.13-S1.15: git is run with fixed arguments, a protocol allowlist and
       expect(fs.existsSync(path.join(f.dir, "SKILL.md"))).toBe(true);
       expect(f.sha).toBe(sha);
       expect(f.resolved).toBe(formatSource(parseSource(source), sha));
-      expect(gitCalls()[0]).toEqual(["clone", "--depth", "1", "--quiet", "--", url, expect.stringContaining("skillwharf-")]);
+      expect(gitCalls()[0]).toEqual(["clone", "--depth", "1", "--quiet", "--no-checkout", "--", url, expect.stringContaining("skillwharf-")]);
+      // the checkout comes only after the attributes that switch a repository's filters off are in place
+      expect(gitCalls()[1]).toEqual(["-C", expect.stringContaining("skillwharf-"), "checkout", "--quiet", "HEAD"]);
     } finally {
       f.cleanup();
     }
@@ -339,7 +354,7 @@ describe("S1.13-S1.15: git is run with fixed arguments, a protocol allowlist and
     const f = fetchSource(parseSource(`github:acme/skills//rn@${head}`));
     f.cleanup();
     expect(gitCalls()[0]).toEqual([
-      "clone", "--depth", "1", "--quiet", "--branch", head, "--", "https://github.com/acme/skills.git", expect.any(String),
+      "clone", "--depth", "1", "--quiet", "--no-checkout", "--branch", head, "--", "https://github.com/acme/skills.git", expect.any(String),
     ]);
   });
 
@@ -391,17 +406,61 @@ describe("S1.13-S1.15: git is run with fixed arguments, a protocol allowlist and
       for (const o of gitOptions()) expect(o.timeout).toBe(5000);
     });
 
-    it("leaves the user's ssh command and credential settings alone", () => {
+    it("leaves the user's ssh command and credential helper settings alone", () => {
       process.env.GIT_SSH_COMMAND = "ssh -i /somewhere/key";
-      process.env.GIT_ASKPASS = "/somewhere/askpass";
       process.env.GIT_CONFIG_GLOBAL = "/somewhere/gitconfig";
+      process.env.SSH_AUTH_SOCK = "/somewhere/agent";
       fetchSource(parseSource("github:acme/skills")).cleanup();
       for (const o of gitOptions()) {
         const env = o.env as Record<string, string>;
         expect(env.GIT_SSH_COMMAND).toBe("ssh -i /somewhere/key");
-        expect(env.GIT_ASKPASS).toBe("/somewhere/askpass");
         expect(env.GIT_CONFIG_GLOBAL).toBe("/somewhere/gitconfig");
+        expect(env.SSH_AUTH_SOCK).toBe("/somewhere/agent");
       }
+    });
+
+    it("askpass programs are switched off by default: no prompt a repository can reach", () => {
+      process.env.GIT_ASKPASS = "/somewhere/askpass";
+      process.env.SSH_ASKPASS = "/somewhere/ssh-askpass";
+      process.env.SSH_ASKPASS_REQUIRE = "force";
+      fetchSource(parseSource("github:acme/skills")).cleanup();
+      for (const o of gitOptions()) {
+        const env = o.env as Record<string, string>;
+        expect(env.GIT_ASKPASS).toBe("");
+        expect(env.SSH_ASKPASS_REQUIRE).toBe("never");
+        expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+      }
+      for (const c of exec.mock.calls.filter((x) => x[0] === "git")) expect(c[1]).toContain("core.askPass=");
+    });
+
+    it("--allow-askpass passes the user's askpass settings through for that command", () => {
+      process.env.GIT_ASKPASS = "/somewhere/askpass";
+      process.env.SSH_ASKPASS = "/somewhere/ssh-askpass";
+      allowAskpass(true);
+      try {
+        fetchSource(parseSource("github:acme/skills")).cleanup();
+      } finally {
+        allowAskpass(false);
+      }
+      for (const o of gitOptions()) {
+        const env = o.env as Record<string, string>;
+        expect(env.GIT_ASKPASS).toBe("/somewhere/askpass");
+        expect(env.SSH_ASKPASS).toBe("/somewhere/ssh-askpass");
+        expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+      }
+      for (const c of exec.mock.calls.filter((x) => x[0] === "git")) expect(c[1]).not.toContain("core.askPass=");
+    });
+
+    it("an authentication failure says what to configure, and names --allow-askpass", () => {
+      exec.mockImplementation((() => {
+        throw Object.assign(new Error("Command failed"), {
+          stderr: Buffer.from("fatal: could not read Username for 'https://git.acme.test': terminal prompts disabled\n"),
+        });
+      }) as never);
+      expect(() => fetchSource(parseSource("git+https://git.acme.test/team/skills.git"))).toThrow(
+        /authentication failed for git\.acme\.test; configure a git credential helper \(`git config --global credential\.helper/,
+      );
+      expect(() => fetchSource(parseSource("git+https://git.acme.test/team/skills.git"))).toThrow(/--allow-askpass/);
     });
 
     it("narrows a GIT_ALLOW_PROTOCOL the user set, and never widens it", () => {
@@ -959,7 +1018,7 @@ describe("S1.19: submodules, one level, pinned by the parent's recorded commit",
     const modules = git("-C", work, "hash-object", "-w", path.join(base, "real-modules"));
     const link = git("-C", work, "hash-object", "-w", path.join(base, "link-text"));
     const tree = (
-      realExec.fn("git", ["-C", work, "mktree", "--missing"], {
+      execFileSync("git", ["-C", work, "mktree", "--missing"], {
         input: `120000 blob ${link}\t.gitmodules\n100644 blob ${modules}\treal-modules\n160000 commit ${FAKE}\tx\n`,
         stdio: ["pipe", "pipe", "pipe"],
       }) as Buffer
@@ -1390,19 +1449,23 @@ describe("Round A U1: the git environment of the user's own repository never rea
     "GIT_COMMON_DIR",
     "GIT_NAMESPACE",
     "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_GRAFT_FILE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_QUARANTINE_PATH",
+    "GIT_NO_REPLACE_OBJECTS",
   ];
 
   it("gitEnv drops them and keeps the settings that are the user's to make", () => {
     const env = gitEnv({
       ...Object.fromEntries(INHERITED.map((k) => [k, "/somewhere"])),
       GIT_SSH_COMMAND: "ssh -i /k",
-      GIT_ASKPASS: "/askpass",
       GIT_CONFIG_GLOBAL: "/gitconfig",
       SSH_AUTH_SOCK: "/agent",
       PATH: "/bin",
     });
     for (const k of INHERITED) expect(env).not.toHaveProperty(k);
-    expect(env).toMatchObject({ GIT_SSH_COMMAND: "ssh -i /k", GIT_ASKPASS: "/askpass", GIT_CONFIG_GLOBAL: "/gitconfig", SSH_AUTH_SOCK: "/agent", PATH: "/bin" });
+    expect(env).toMatchObject({ GIT_SSH_COMMAND: "ssh -i /k", GIT_CONFIG_GLOBAL: "/gitconfig", SSH_AUTH_SOCK: "/agent", PATH: "/bin" });
   });
 
   it.each([
@@ -1675,12 +1738,13 @@ describe("Round A D3/U1/U2/D6: every git call carries the same hardening", () =>
     const calls = exec.mock.calls.filter((c) => c[0] === "git").map((c) => c[1] as string[]);
     expect(calls.length).toBeGreaterThan(5);
     for (const args of calls) {
-      expect(args.slice(0, 10)).toEqual([
+      expect(args.slice(0, 12)).toEqual([
         "-c", `core.hooksPath=${os.devNull}`,
         "-c", "http.followRedirects=false",
         "-c", "filter.lfs.smudge=",
         "-c", "filter.lfs.process=",
         "-c", "filter.lfs.required=false",
+        "-c", "core.askPass=",
       ]);
     }
   });
@@ -1695,11 +1759,6 @@ describe("Round A D3/U1/U2/D6: every git call carries the same hardening", () =>
       expect(env).not.toHaveProperty("GIT_DIR");
       expect(env).not.toHaveProperty("GIT_WORK_TREE");
     }
-  });
-
-  it("runs git in its own process group so a timeout can take its children with it", () => {
-    fetchSource(parseSource("github:acme/skills")).cleanup();
-    if (process.platform !== "win32") for (const o of gitOptions()) expect(o.detached).toBe(true);
   });
 
   it("an ssh failure about the host key says skillwharf cannot ask, and how to trust the host", () => {
@@ -1729,23 +1788,38 @@ describe("Round A D3/U1/U2/D6: every git call carries the same hardening", () =>
 
 describe("Round A: the built command line runs git the way SECURITY.md says", () => {
   const repoRoot = path.resolve(here, "..");
-  beforeAll(() => {
-    const r = spawnSync(path.join(repoRoot, "node_modules", ".bin", "tsc"), ["-p", "tsconfig.json"], { cwd: repoRoot, encoding: "utf8" });
-    if (r.status !== 0) throw new Error(`tsc failed:\n${r.stdout}${r.stderr}`);
-  }, 180_000);
+  beforeAll(ensureBuilt, 180_000);
 
   it.skipIf(process.platform === "win32")("a fake git on PATH sees the protocol allowlist, no prompts and the hardening settings", () => {
     const bin = path.join(base, "bin");
     const dump = path.join(base, "dump.txt");
     fs.mkdirSync(bin);
-    fs.writeFileSync(path.join(bin, "git"), `#!/bin/sh\n{ echo "ARGV:$*"; env; } >> '${dump}'\nexit 1\n`, { mode: 0o755 });
+    fs.writeFileSync(
+      path.join(bin, "git"),
+      `#!/bin/sh\n{ echo "ARGV:$*"; echo "PGID:$(ps -o pgid= -p $$ | tr -d ' ')"; env; } >> '${dump}'\nexit 1\n`,
+      { mode: 0o755 },
+    );
     fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: {} }));
     // no test allowance exists in this process: it is the shipped code with the user's environment
-    const env = { ...process.env, SKILLWHARF_HOME: home, PATH: `${bin}${path.delimiter}${process.env.PATH}`, GIT_DIR: "/somewhere/.git" } as Record<string, string>;
+    const env = {
+      ...process.env,
+      SKILLWHARF_HOME: home,
+      PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+      GIT_DIR: "/somewhere/.git",
+      GIT_ASKPASS: "/somewhere/askpass",
+    } as Record<string, string>;
     delete env.GIT_ALLOW_PROTOCOL;
     const r = spawnSync(process.execPath, [path.join(repoRoot, "dist", "cli.js"), "add", "github:acme/skills"], { cwd: proj, env, encoding: "utf8" });
     expect(r.status).toBe(1);
     const text = fs.readFileSync(dump, "utf8");
+    // git runs in a process group of its own, not ours
+    const ourGroup = execFileSync("ps", ["-o", "pgid=", "-p", String(process.pid)]).toString().trim();
+    const gitGroup = (text.split("\n").find((l) => l.startsWith("PGID:")) ?? "").slice(5);
+    expect(gitGroup).not.toBe("");
+    expect(gitGroup).not.toBe(ourGroup);
+    expect(text.split("\n")).toContain("GIT_ASKPASS=");
+    expect(text.split("\n")).toContain("SSH_ASKPASS_REQUIRE=never");
+    expect(text).toContain("core.askPass=");
     const argv = (text.split("\n").find((l) => l.startsWith("ARGV:")) ?? "").slice(5);
     for (const s of ["core.hooksPath=", "http.followRedirects=false", "filter.lfs.smudge=", "filter.lfs.process=", "filter.lfs.required=false", "clone"]) {
       expect(argv).toContain(s);
@@ -1757,4 +1831,217 @@ describe("Round A: the built command line runs git the way SECURITY.md says", ()
     expect(lines).toContain("GIT_LFS_SKIP_SMUDGE=1");
     expect(lines.some((l) => l.startsWith("GIT_DIR="))).toBe(false);
   }, 60_000);
+
+  it.skipIf(process.platform === "win32")("the pinned path and --allow-askpass: same protocol list, user's askpass passed through", () => {
+    const bin = path.join(base, "bin");
+    const dump = path.join(base, "dump.txt");
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, "git"), `#!/bin/sh\n{ echo "ARGV:$*"; env; } >> '${dump}'\nexit 1\n`, { mode: 0o755 });
+    fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: { a: { source: "github:acme/skills/a" } } }));
+    fs.writeFileSync(
+      path.join(proj, "skillwharf.lock.json"),
+      JSON.stringify({ version: 1, skills: { a: { source: "github:acme/skills/a", resolved: `github:acme/skills/a@${SHA}`, integrity: "sha256-x", installedAt: "x" } } }),
+    );
+    const env = { ...process.env, SKILLWHARF_HOME: home, PATH: `${bin}${path.delimiter}${process.env.PATH}`, GIT_ASKPASS: "/somewhere/askpass" } as Record<string, string>;
+    delete env.GIT_ALLOW_PROTOCOL;
+    const r = spawnSync(process.execPath, [path.join(repoRoot, "dist", "cli.js"), "--allow-askpass", "sync"], { cwd: proj, env, encoding: "utf8" });
+    expect(r.status).toBe(1);
+    const text = fs.readFileSync(dump, "utf8");
+    expect(text).toContain("ARGV:-c");
+    expect(text).toContain(" init --quiet ");
+    expect(text.split("\n")).toContain("GIT_ALLOW_PROTOCOL=https:ssh");
+    expect(text.split("\n")).toContain("GIT_ASKPASS=/somewhere/askpass");
+    expect(text).not.toContain("core.askPass=");
+  }, 60_000);
+
+  it("--git-deadline takes a positive number of seconds", () => {
+    for (const bad of ["abc", "0", "-3"]) {
+      const r = spawnSync(process.execPath, [path.join(repoRoot, "dist", "cli.js"), "--git-deadline", bad, "sync"], {
+        cwd: proj,
+        env: { ...process.env, SKILLWHARF_HOME: home },
+        encoding: "utf8",
+      });
+      expect(r.status).toBe(1);
+      expect(r.stderr).toMatch(/--git-deadline takes a positive number of seconds/);
+    }
+  });
+});
+
+// ------------------------------------------------------------------ Round B
+describe("Round B B5: filter drivers, ident and eol conversion a repository names do not run", () => {
+  const FILTER_REPO = (w: string) => {
+    writeSkill(path.join(w, "rn"), "rn");
+    fs.writeFileSync(path.join(w, ".gitattributes"), "*.txt filter=x ident text eol=crlf\n");
+    fs.writeFileSync(path.join(w, "rn", "a.txt"), "hello $Id$\nline2\n");
+  };
+  let marker: string;
+
+  beforeEach(() => {
+    marker = path.join(base, "filter-ran");
+    const script = path.join(base, "smudge.sh");
+    fs.writeFileSync(script, `#!/bin/sh\ntouch '${marker}'\nsed 's/^/FILTERED:/'\n`, { mode: 0o755 });
+    fs.writeFileSync(path.join(base, "gitconfig"), `[filter "x"]\n\tsmudge = ${script}\n\tclean = cat\n\trequired = true\n`);
+    process.env.GIT_CONFIG_NOSYSTEM = "1";
+    process.env.GIT_CONFIG_GLOBAL = path.join(base, "gitconfig");
+  });
+
+  it.each([
+    ["a clone", (_sha: string) => "github:acme/skills//rn"],
+    ["a pinned fetch", (sha: string) => `github:acme/skills//rn@${sha}`],
+  ])("%s checks files out as committed", (_name, source) => {
+    const sha = makeRepo("acme/skills", FILTER_REPO);
+    routeHosts(ALL_HOSTS);
+    // control: with this configuration a plain clone runs the filter, expands $Id$ and converts line endings
+    git("clone", "--quiet", path.join(base, "srv", "acme", "skills.git"), path.join(base, "control"));
+    expect(fs.existsSync(marker)).toBe(true);
+    expect(fs.readFileSync(path.join(base, "control", "rn", "a.txt"), "utf8")).toMatch(/^FILTERED:hello \$Id: [0-9a-f]{40} \$\r\n/);
+    fs.rmSync(marker);
+    const f = fetchSource(parseSource(source(sha)));
+    try {
+      expect(fs.readFileSync(path.join(f.dir, "a.txt"), "utf8")).toBe("hello $Id$\nline2\n");
+    } finally {
+      f.cleanup();
+    }
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it("a submodule is checked out the same way", () => {
+    const childSha = makeRepo("team/child", (w) => {
+      writeSkill(w, "cs");
+      fs.writeFileSync(path.join(w, ".gitattributes"), "*.txt filter=x\n");
+      fs.writeFileSync(path.join(w, "a.txt"), "plain\n");
+    });
+    makeRepo("team/parent", (w) => {
+      addGitlink(w, "vendor/child", childSha);
+      writeGitmodules(w, [["vendor/child", "../child.git"]]);
+    });
+    routeHosts(ALL_HOSTS);
+    fs.rmSync(marker, { force: true });
+    const f = fetchSource(parseSource("git+https://git.acme.test/team/parent.git//vendor/child"));
+    try {
+      expect(fs.readFileSync(path.join(f.dir, "a.txt"), "utf8")).toBe("plain\n");
+    } finally {
+      f.cleanup();
+    }
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it("the attributes file is written before checkout (stubbed git)", () => {
+    allowProtocolsForTests([]);
+    let seen = "";
+    exec.mockImplementation(((file: string, args: string[]) => {
+      const a = withoutHardening(args);
+      if (a.includes("checkout")) {
+        const dir = a[a.indexOf("-C") + 1];
+        seen = fs.readFileSync(path.join(dir, ".git", "info", "attributes"), "utf8");
+      }
+      return Buffer.from("");
+    }) as never);
+    fetchSource(parseSource("github:acme/skills")).cleanup();
+    expect(seen).toBe("* -filter -ident -text -eol\n");
+  });
+});
+
+describe("Round B B4/A3: git runs under a supervisor", () => {
+  const repoRoot = path.resolve(here, "..");
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const waitFor = async (what: () => boolean, ms = 8000) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end && !what()) await new Promise((r) => setTimeout(r, 50));
+    return what();
+  };
+  function fakeGit(script: string): string {
+    const bin = path.join(base, "bin");
+    fs.mkdirSync(bin, { recursive: true });
+    fs.writeFileSync(path.join(bin, "git"), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+    return `${bin}${path.delimiter}${process.env.PATH}`;
+  }
+
+  it.skipIf(process.platform === "win32")("git is in a process group of its own", () => {
+    const out = path.join(base, "pgid");
+    process.env.PATH = fakeGit(`ps -o pgid= -p $$ > '${out}'\nexit 1`);
+    expect(() => runGit(["status"], { url: "https://git.acme.test/x.git" })).toThrow();
+    const ours = execFileSync("ps", ["-o", "pgid=", "-p", String(process.pid)]).toString().trim();
+    expect(fs.readFileSync(out, "utf8").trim()).not.toBe(ours);
+  });
+
+  it("the supervisor knows how to end a process tree on Windows", () => {
+    expect(SUPERVISOR_SOURCE).toContain('"taskkill", ["/T", "/F", "/PID"');
+    expect(SUPERVISOR_SOURCE).toContain("windowsHide: true");
+  });
+
+  it("killProcessTree ends a group on POSIX and runs taskkill on Windows", () => {
+    const kill = vi.fn();
+    const run = vi.fn();
+    killProcessTree(4242, { platform: "linux", kill, run });
+    expect(kill).toHaveBeenCalledWith(-4242, "SIGKILL");
+    killProcessTree(4242, { platform: "win32", kill, run });
+    expect(run).toHaveBeenCalledWith("taskkill", ["/T", "/F", "/PID", "4242"], expect.objectContaining({ windowsHide: true }));
+  });
+
+  describe.skipIf(process.platform === "win32")("an interrupt", () => {
+    beforeAll(ensureBuilt, 180_000);
+    function startCli(args: string[]) {
+      const pidFile = path.join(base, "git.pid");
+      const tmp = path.join(base, "tmp");
+      fs.mkdirSync(tmp, { recursive: true });
+      fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: {} }));
+      const env = { ...process.env, SKILLWHARF_HOME: home, TMPDIR: tmp, PATH: fakeGit(`echo $$ > '${pidFile}'\nexec sleep 60`) };
+      // its own group, as a terminal's foreground job is: Ctrl-C reaches everything in it
+      const cli = spawn(process.execPath, [path.join(repoRoot, "dist", "cli.js"), ...args], { cwd: proj, env, detached: true, stdio: "ignore" });
+      const exited = new Promise<number | null>((resolve) => cli.on("exit", (code) => resolve(code)));
+      return { cli, pidFile, tmp, exited };
+    }
+
+    it("Ctrl-C ends git with skillwharf, removes the temporary clone and exits 130", async () => {
+      const { cli, pidFile, tmp, exited } = startCli(["add", "github:acme/skills"]);
+      expect(await waitFor(() => fs.existsSync(pidFile) && fs.readFileSync(pidFile, "utf8").trim() !== "")).toBe(true);
+      const gitPid = Number(fs.readFileSync(pidFile, "utf8"));
+      process.kill(-(cli.pid as number), "SIGINT");
+      expect(await exited).toBe(130);
+      expect(await waitFor(() => !alive(gitPid), 5000)).toBe(true);
+      expect(fs.readdirSync(tmp)).toEqual([]);
+    }, 60_000);
+
+    it("a SIGTERM to skillwharf alone still ends git", async () => {
+      const { cli, pidFile, exited } = startCli(["add", "github:acme/skills"]);
+      expect(await waitFor(() => fs.existsSync(pidFile) && fs.readFileSync(pidFile, "utf8").trim() !== "")).toBe(true);
+      const gitPid = Number(fs.readFileSync(pidFile, "utf8"));
+      process.kill(cli.pid as number, "SIGTERM");
+      await exited;
+      expect(await waitFor(() => !alive(gitPid), 8000)).toBe(true);
+    }, 60_000);
+  });
+
+  it.skipIf(process.platform === "win32")("one deadline covers every fetch of a command (sync of three skills)", async () => {
+    makeRepo("acme/skills", (w) => {
+      for (const n of ["s1", "s2", "s3"]) writeSkill(path.join(w, n), n);
+    });
+    routeHosts(ALL_HOSTS);
+    const realGit = execFileSync("sh", ["-c", "command -v git"]).toString().trim();
+    process.env.PATH = fakeGit(`sleep 0.8\nexec '${realGit}' "$@"`);
+    writeManifest({
+      version: 1,
+      agents: ["claude"],
+      skills: Object.fromEntries(["s1", "s2", "s3"].map((n) => [n, { source: `github:acme/skills/${n}` }])),
+    });
+    const started = Date.now();
+    expect(() => syncSkills(ctx, { gitTimeoutMs: 5000, gitDeadlineMs: 3000 })).toThrow(/time limit/);
+    expect(Date.now() - started).toBeLessThan(9000);
+    // without the limit the same sync succeeds (so the failure above is the deadline, not the fake git)
+    expect(syncSkills(ctx, { gitTimeoutMs: 5000, gitDeadlineMs: 120_000 }).fetched).toEqual(["s1", "s2", "s3"]);
+  }, 60_000);
+
+  it("the default overall limit is four times --git-timeout", () => {
+    expect(defaultDeadlineMs(120_000)).toBe(480_000);
+    expect(defaultDeadlineMs(1000)).toBe(4000);
+    expect(defaultDeadlineMs(undefined)).toBe(480_000);
+  });
 });

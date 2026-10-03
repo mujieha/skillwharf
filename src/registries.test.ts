@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { allowProtocolsForTests, setGitExecForTests } from "./git.js";
+import { allowProtocolsForTests, setGitExecForTests, supervisedGit } from "./git.js";
 import { fetchSource, parseSource } from "./source.js";
 import { DEFAULT_REGISTRY, makeContext, registriesOf, validateManifest } from "./manifest.js";
 import { addFromRegistry } from "./ops.js";
@@ -20,8 +20,8 @@ import {
 import type { Context, LoadedRegistry, Manifest, RegistrySpec } from "./types.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const realExec = { fn: execFileSync };
-const exec = vi.fn<typeof execFileSync>(execFileSync);
+const realExec = { fn: supervisedGit };
+const exec = vi.fn<typeof execFileSync>(supervisedGit);
 const savedEnv = { ...process.env };
 
 let base: string, home: string, proj: string, ctx: Context;
@@ -47,10 +47,9 @@ afterEach(() => {
 
 // ------------------------------------------------------------------ helpers
 function git(...args: string[]): string {
-  return realExec
-    .fn("git", ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", ...args], {
-      stdio: ["ignore", "pipe", "pipe"],
-    })
+  return execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", ...args], {
+    stdio: ["ignore", "pipe", "pipe"],
+  })
     .toString()
     .trim();
 }
@@ -205,8 +204,8 @@ describe("S2.2: loading a registry from https, a git repository or a path", () =
     routeHosts(HOSTS);
     await loadRegistry("git+https://git.acme.test/team/registry.git", { timeoutMs: 7000 });
     const calls = exec.mock.calls.filter((c) => c[0] === "git");
-    const args = (calls[0][1] as string[]).filter((_, i) => i >= 10); // after the five `-c key=value` hardening settings
-    expect(args).toEqual(["clone", "--depth", "1", "--quiet", "--", "https://git.acme.test/team/registry.git", expect.any(String)]);
+    const args = (calls[0][1] as string[]).filter((_, i) => i >= 12); // after the six `-c key=value` hardening settings
+    expect(args).toEqual(["clone", "--depth", "1", "--quiet", "--no-checkout", "--", "https://git.acme.test/team/registry.git", expect.any(String)]);
     for (const c of calls) {
       const o = c[2] as Record<string, unknown>;
       expect((o.env as Record<string, string>).GIT_ALLOW_PROTOCOL).toMatch(/^https:ssh/);
@@ -417,7 +416,7 @@ describe("Round A D5: a registry in a git repository never opens submodules, and
     const elapsed = Date.now() - started;
     expect(elapsed).toBeLessThan(3000); // three registries at 1.5 s each would be 4.5 s
     expect(r.every((x) => x.error !== undefined)).toBe(true);
-    expect(r[0].error).toMatch(/timed out/);
+    expect(r[0].error).toMatch(/timed out|time limit/);
     expect(r[2].error).toMatch(/time limit/);
   }, 20_000);
 });

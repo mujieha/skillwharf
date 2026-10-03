@@ -10,7 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_FILES, assertNoSymlinks, copyResolvingLinks, exists } from "./fs.js";
-import { runGit } from "./git.js";
+import { runGit, writeSafeAttributes } from "./git.js";
 import { sanitizeForTerminal } from "./validate.js";
 
 /** Most gitlinks one fetch will open; more means the sub-path should be narrower. */
@@ -169,6 +169,7 @@ function fetchChild(root: string, link: Gitlink, url: string, ctx: SubmoduleCont
     run(["init", "--quiet", tmp]);
     run(["-C", tmp, "remote", "add", "--", "origin", url]);
     run(["-C", tmp, "fetch", "--depth", "1", "--quiet", "origin", link.sha], true);
+    writeSafeAttributes(tmp);
     run(["-C", tmp, "checkout", "--quiet", "FETCH_HEAD"]);
 
     // One level only: a gitlink inside the child is refused, naming the repository it points at.

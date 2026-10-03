@@ -32,6 +32,7 @@ import { parseSource } from "./source.js";
 import type { AgentId, Context, Manifest } from "./types.js";
 import { daysAgo, scanClaudeUsage } from "./usage.js";
 import { sanitizeForTerminal, toSafeJson } from "./validate.js";
+import { allowAskpass, interruptedBy } from "./git.js";
 import { REGISTRY_HELP, SOURCES_BLOCK, afterSearch, showHintOnce, usesDefaultOnly } from "./hints.js";
 
 const VERSION = "0.2.0";
@@ -44,6 +45,11 @@ const program = new Command()
   .option("--json", "machine-readable output where supported")
   .option("--quiet", "do not print the one-time hint about sources and registries")
   .option("--git-timeout <seconds>", "kill a git call that runs longer than this (default 120)")
+  .option("--git-deadline <seconds>", "most time all the git calls of one add, sync or update may take together (default: four times --git-timeout)")
+  .option("--allow-askpass", "let your askpass programs (GIT_ASKPASS, core.askPass, SSH_ASKPASS) prompt for credentials during this command; off by default")
+  .hook("preAction", (_program, action) => {
+    if ((action.optsWithGlobals() as { allowAskpass?: boolean }).allowAskpass) allowAskpass(true);
+  })
   .addHelpText("after", `\nWhere skills come from:\n${indent(SOURCES_BLOCK)}\n`);
 
 /** Two spaces in front of every line, for help text. */
@@ -54,6 +60,15 @@ function indent(text: string): string {
 function ctxFrom(cmd: Command): Context {
   const opts = cmd.optsWithGlobals() as { global?: boolean };
   return makeContext({ global: opts.global });
+}
+
+/** `--git-deadline <seconds>` as milliseconds, or undefined for the default (four times the timeout). */
+function gitDeadlineMs(cmd: Command): number | undefined {
+  const raw = (cmd.optsWithGlobals() as { gitDeadline?: string }).gitDeadline;
+  if (raw === undefined) return undefined;
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || seconds <= 0) fail(`--git-deadline takes a positive number of seconds, got "${raw}"`);
+  return Math.round(seconds * 1000);
 }
 
 /** `--git-timeout <seconds>` as milliseconds, or undefined for the default. */
@@ -89,6 +104,8 @@ function parseLimits(o: { maxSkillSize?: string; maxSkillFiles?: string }): Size
 }
 
 function fail(msg: string): never {
+  // Ctrl-C ended a git call: the temporary files are already cleaned up; leave as the shell expects.
+  if (interruptedBy()) process.exit(130);
   console.error(pc.red("error:"), clean(msg));
   process.exit(1);
 }
@@ -202,6 +219,7 @@ program
         force: opts.force,
         limits: parseLimits(opts),
         gitTimeoutMs: timeout,
+        gitDeadlineMs: gitDeadlineMs(cmd),
         onSkipped: (s: { dir: string; reason: string }) => console.log(pc.yellow("!"), `skipped ${clean(s.dir)}: ${clean(s.reason)}`),
       };
       const added = byName
@@ -261,6 +279,7 @@ program
         allowOutsidePaths: opts.allowOutsidePaths,
         limits: parseLimits(opts),
         gitTimeoutMs: timeout,
+        gitDeadlineMs: gitDeadlineMs(cmd),
       });
       for (const n of r.fetched) console.log(pc.green("✔"), "fetched", pc.bold(n));
       for (const l of r.linked) console.log(pc.green("✔"), "linked ", pc.bold(l.name), pc.dim(`→ ${groupLabel(l.link.agents)} (${l.link.mode})`));
@@ -287,6 +306,7 @@ program
         allowOutsidePaths: opts.allowOutsidePaths,
         limits: parseLimits(opts),
         gitTimeoutMs: timeout,
+        gitDeadlineMs: gitDeadlineMs(cmd),
       });
       for (const r of res) {
         console.log(r.changed ? pc.green("↑") : pc.dim("="), pc.bold(r.name), r.changed ? "updated" : pc.dim("unchanged"));
