@@ -136,6 +136,7 @@ let spawnGit: typeof execFileSync = supervisedGit;
 /** Test hook: run git through this function (to record calls or fake a host). Pass undefined to restore. */
 export function setGitExecForTests(fn: typeof execFileSync | undefined): void {
   spawnGit = fn ?? supervisedGit;
+  if (fn === undefined) interrupt = undefined; // a test run starts each test with no interrupt on record
 }
 
 /**
@@ -287,11 +288,15 @@ export function runGit(args: string[], opts: RunGitOptions): string {
       opts.url,
     );
   }
-  // Ctrl-C reaches the supervisor (same foreground group), which ends git and
-  // exits 130. This process is blocked until then and cannot run a handler, but
-  // having one stops the signal from killing it first, so it can clean up.
+  // At a terminal, Ctrl-C reaches the supervisor too (same foreground group): it ends
+  // git and exits 130. This process is blocked until then and cannot run a handler, but
+  // having one stops the signal from killing it first, so it can clean up. Without a
+  // terminal (an editor's or CI's cancel button signals this pid alone) there is no such
+  // group and a handler could never run while blocked, so the default applies: the
+  // process ends at once and the supervisor, seeing its parent gone, ends git.
   const hold = () => {};
-  process.on("SIGINT", hold);
+  const holding = process.stdin.isTTY === true;
+  if (holding) process.on("SIGINT", hold);
   try {
     return spawnGit("git", [...hardening(), ...args], {
       stdio: ["ignore", "pipe", "pipe"],
@@ -347,6 +352,6 @@ export function runGit(args: string[], opts: RunGitOptions): string {
           : "other";
     throw new GitError(`git fetch failed for ${shown}: ${reason}`, kind, opts.url);
   } finally {
-    process.off("SIGINT", hold);
+    if (holding) process.off("SIGINT", hold);
   }
 }

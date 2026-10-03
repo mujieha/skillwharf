@@ -370,6 +370,34 @@ describe("S2.1: the global list comes first, the project list after", () => {
 });
 
 // ------------------------------------------------------------------ Round C
+describe("Round C C3: an interrupt during a registry load stops everything", () => {
+  const interrupted = () =>
+    exec.mockImplementation((() => {
+      throw Object.assign(new Error("Command failed"), { status: 130, stderr: Buffer.from("") });
+    }) as never);
+
+  it("loadRegistries rethrows it instead of reporting it as one registry's error, and starts no other registry", async () => {
+    allowProtocolsForTests([]);
+    interrupted();
+    exec.mockClear();
+    const specs: RegistrySpec[] = [
+      { name: "a", location: "git+https://git.acme.test/a/registry.git" },
+      { name: "b", location: "git+https://git.acme.test/b/registry.git" },
+    ];
+    await expect(loadRegistries(ctx, { only: specs })).rejects.toMatchObject({ kind: "interrupted" });
+    expect(exec.mock.calls.filter((c) => c[0] === "git").length).toBe(1);
+  });
+
+  it("add <name> installs nothing after an interrupt", async () => {
+    allowProtocolsForTests([]);
+    interrupted();
+    writeManifest(proj, { registries: [{ name: "r", location: "git+https://git.acme.test/team/registry.git" }] });
+    await expect(addFromRegistry(ctx, "alpha", { cwd: base })).rejects.toMatchObject({ kind: "interrupted" });
+    expect(fs.existsSync(path.join(proj, ".skillwharf"))).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(proj, "skillwharf.json"), "utf8")).skills).toEqual({});
+  });
+});
+
 describe("Round C C1c: a registry location that names a share is refused before the file system is asked", () => {
   afterEach(() => vi.restoreAllMocks());
   const watch = () => {
@@ -644,14 +672,19 @@ describe("S2.4: addFromRegistry installs what the registry says", () => {
     expect(m.skills.alpha.source).toBe("git+https://git.acme.test/team/skills.git//alpha");
   });
 
-  it("takes the first registry's entry when only one lists the name, and warns about one that failed", async () => {
+  it("a registry that failed to load cannot be bypassed: a bare name is refused (the skill may be listed there too), --from goes ahead", async () => {
     const ok = writeIndex(path.join(base, "ok.json"), entry("alpha", "github:acme/skills/alpha"));
     writeManifest(proj, {
       registries: [{ name: "broken", location: path.join(base, "missing.json") }, { name: "ok", location: ok }],
     });
     const warnings: string[] = [];
-    await addFromRegistry(ctx, "alpha", { onWarning: (w) => warnings.push(w) });
+    await expect(addFromRegistry(ctx, "alpha", { onWarning: (w) => warnings.push(w) })).rejects.toThrow(
+      /registry "broken" could not be loaded \(.*Registry index not found.*\), so "alpha" might be listed there too.*--from <registry>/s,
+    );
     expect(warnings).toEqual([expect.stringMatching(/registry broken: .*Registry index not found/)]);
+    expect(fs.existsSync(path.join(proj, ".skillwharf"))).toBe(false);
+    const added = await addFromRegistry(ctx, "alpha", { from: "ok" });
+    expect(added.map((a) => a.name)).toEqual(["alpha"]);
   });
 
   it("refuses a name two registries list, and --from picks one", async () => {

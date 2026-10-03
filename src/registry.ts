@@ -13,7 +13,7 @@ import {
   saveManifest,
   validateManifest,
 } from "./manifest.js";
-import { DEFAULT_GIT_TIMEOUT_MS } from "./git.js";
+import { DEFAULT_GIT_TIMEOUT_MS, GitError, interruptedBy } from "./git.js";
 import { ShortShaError, fetchSource, parseSource } from "./source.js";
 import type { Context, LoadedRegistry, Manifest, RegistryEntry, RegistryIndex, RegistrySpec, SearchHit } from "./types.js";
 import { assertSkillName, sanitizeForTerminal } from "./validate.js";
@@ -192,6 +192,8 @@ export async function loadRegistries(
   const deadline = Date.now() + (opts.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS);
   return Promise.all(
     plans.map(async (p): Promise<LoadedRegistry> => {
+      // After Ctrl-C no further registry is started (the plans run one after another, their git calls block).
+      if (interruptedBy()) throw new GitError("interrupted", "interrupted", p.spec.location);
       const head = { name: p.spec.name, location: p.spec.location, scope: p.scope, ...(p.note ? { note: p.note } : {}) };
       if (p.error) return { ...head, error: sanitizeForTerminal(p.error) };
       try {
@@ -213,6 +215,8 @@ export async function loadRegistries(
         const note = [head.note, hexNote].filter(Boolean).join("; ");
         return { ...head, ...(note ? { note } : {}), index };
       } catch (e) {
+        // An interrupt is not one registry failing: it ends the command.
+        if (e instanceof GitError && e.kind === "interrupted") throw e;
         return { ...head, error: sanitizeForTerminal((e as Error).message) };
       }
     }),

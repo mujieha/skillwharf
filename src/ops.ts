@@ -29,7 +29,7 @@ import {
 import { LOCKFILE, assertSafeTarget, loadLock, requireManifest, saveLock, saveManifest, storePath } from "./manifest.js";
 import { normalizeName, readSkill } from "./skill.js";
 import { assertSubpath } from "./validate.js";
-import { GitError, defaultDeadlineMs } from "./git.js";
+import { GitError, defaultDeadlineMs, interruptedBy } from "./git.js";
 import { loadRegistries, resolveRegistryName } from "./registry.js";
 import {
   PinUnavailable,
@@ -564,9 +564,20 @@ export async function addFromRegistry(ctx: Context, name: string, opts: AddFromR
     );
   }
   const registries = await loadRegistries(ctx, { timeoutMs: opts.gitTimeoutMs });
+  // Ctrl-C ends the command: nothing is resolved or installed after it.
+  if (interruptedBy()) throw new GitError("interrupted", "interrupted", name);
   for (const r of registries) {
     if (r.note !== undefined) opts.onWarning?.(r.note);
     if (r.error !== undefined) opts.onWarning?.(`registry ${r.name}: ${r.error}`);
+  }
+  // A registry that failed to load might list this name too (a second entry would make it
+  // ambiguous): picking from the others would let an unreachable registry be bypassed.
+  const failed = registries.find((r) => r.error !== undefined);
+  if (failed && opts.from === undefined) {
+    throw new Error(
+      `registry "${failed.name}" could not be loaded (${failed.error}), so "${name}" might be listed there too. ` +
+        `Fix it, remove it (skillwharf registry remove ${failed.name}), or choose a registry with --from <registry>.`,
+    );
   }
   const { entry } = resolveRegistryName(registries, name, opts.from);
   return addSkill(ctx, entry.source, { ...opts, name: opts.name ?? entry.name });

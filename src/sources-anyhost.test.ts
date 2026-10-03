@@ -2501,26 +2501,90 @@ describe("Round B B4/A3: git runs under a supervisor", () => {
 
   describe.skipIf(process.platform === "win32")("an interrupt", () => {
     beforeAll(ensureBuilt, 180_000);
-    function startCli(args: string[]) {
+    const hasPython = spawnSync("python3", ["--version"]).status === 0;
+    function cliEnv(pidFile: string, tmp: string) {
+      fs.mkdirSync(tmp, { recursive: true });
+      return { ...process.env, SKILLWHARF_HOME: home, TMPDIR: tmp, PATH: fakeGit(`echo $$ > '${pidFile}'\nexec sleep 60`) };
+    }
+    /** The command line with no terminal: what an editor's or CI's cancel button signals. */
+    function startCli(args: string[], manifest: object = { version: 1, agents: ["claude"], skills: {} }) {
       const pidFile = path.join(base, "git.pid");
       const tmp = path.join(base, "tmp");
-      fs.mkdirSync(tmp, { recursive: true });
-      fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: {} }));
-      const env = { ...process.env, SKILLWHARF_HOME: home, TMPDIR: tmp, PATH: fakeGit(`echo $$ > '${pidFile}'\nexec sleep 60`) };
-      // its own group, as a terminal's foreground job is: Ctrl-C reaches everything in it
-      const cli = spawn(process.execPath, [path.join(repoRoot, "dist", "cli.js"), ...args], { cwd: proj, env, detached: true, stdio: "ignore" });
-      const exited = new Promise<number | null>((resolve) => cli.on("exit", (code) => resolve(code)));
+      fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify(manifest));
+      const cli = spawn(process.execPath, [path.join(repoRoot, "dist", "cli.js"), ...args], { cwd: proj, env: cliEnv(pidFile, tmp), detached: true, stdio: "ignore" });
+      const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => cli.on("exit", (code, signal) => resolve({ code, signal })));
       return { cli, pidFile, tmp, exited };
     }
+    /** The command line on a real pseudo-terminal: a ^C typed there is sent by the terminal driver to the foreground group, as at a shell. */
+    function startCliOnTerminal(args: string[]) {
+      const pidFile = path.join(base, "git.pid");
+      const tmp = path.join(base, "tmp");
+      fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: {} }));
+      const script = path.join(base, "run-on-terminal.py"); // not pty.py: it would shadow the module it imports
+      fs.writeFileSync(
+        script,
+        [
+          "import os, pty, sys, time",
+          "pid, fd = pty.fork()",
+          "if pid == 0:",
+          "    os.execvp(sys.argv[1], sys.argv[1:])",
+          "marker = os.environ['MARKER']",
+          "for _ in range(200):",
+          "    if os.path.exists(marker) and open(marker).read().strip():",
+          "        break",
+          "    time.sleep(0.05)",
+          "os.write(fd, b'\\x03')",
+          "while True:",
+          "    try:",
+          "        if not os.read(fd, 1024):",
+          "            break",
+          "    except OSError:",
+          "        break",
+          "_, status = os.waitpid(pid, 0)",
+          "sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status))",
+        ].join("\n"),
+      );
+      const env = { ...cliEnv(pidFile, tmp), MARKER: pidFile };
+      const py = spawn("python3", [script, process.execPath, path.join(repoRoot, "dist", "cli.js"), ...args], { cwd: proj, env, stdio: "ignore" });
+      const exited = new Promise<number | null>((resolve) => py.on("exit", (code) => resolve(code)));
+      return { pidFile, tmp, exited };
+    }
 
-    it("Ctrl-C ends git with skillwharf, removes the temporary clone and exits 130", async () => {
-      const { cli, pidFile, tmp, exited } = startCli(["add", "github:acme/skills"]);
+    it.skipIf(!hasPython)("Ctrl-C typed at a terminal ends git with skillwharf, removes the temporary clone and exits 130", async () => {
+      const { pidFile, tmp, exited } = startCliOnTerminal(["add", "github:acme/skills"]);
       expect(await waitFor(() => fs.existsSync(pidFile) && fs.readFileSync(pidFile, "utf8").trim() !== "")).toBe(true);
       const gitPid = Number(fs.readFileSync(pidFile, "utf8"));
-      process.kill(-(cli.pid as number), "SIGINT");
       expect(await exited).toBe(130);
       expect(await waitFor(() => !alive(gitPid), 5000)).toBe(true);
       expect(fs.readdirSync(tmp)).toEqual([]);
+    }, 60_000);
+
+    it("a SIGINT to skillwharf's pid alone (a cancel button) ends it at once, and git with it; nothing is installed", async () => {
+      const { cli, pidFile, exited } = startCli(["add", "github:acme/skills"]);
+      expect(await waitFor(() => fs.existsSync(pidFile) && fs.readFileSync(pidFile, "utf8").trim() !== "")).toBe(true);
+      const gitPid = Number(fs.readFileSync(pidFile, "utf8"));
+      process.kill(cli.pid as number, "SIGINT");
+      const end = await exited;
+      expect(end.code === 130 || end.signal === "SIGINT").toBe(true); // a shell reports either as 130
+      expect(await waitFor(() => !alive(gitPid), 8000)).toBe(true);
+      expect(fs.existsSync(path.join(proj, ".skillwharf"))).toBe(false);
+    }, 60_000);
+
+    it("a SIGINT to the pid alone during a git-located registry load: the process ends, git ends, nothing is installed", async () => {
+      const { cli, pidFile, exited } = startCli(["add", "alpha"], {
+        version: 1,
+        agents: ["claude"],
+        skills: {},
+        registries: [{ name: "r", location: "git+https://git.acme.test/team/registry.git" }],
+      });
+      expect(await waitFor(() => fs.existsSync(pidFile) && fs.readFileSync(pidFile, "utf8").trim() !== "")).toBe(true);
+      const gitPid = Number(fs.readFileSync(pidFile, "utf8"));
+      process.kill(cli.pid as number, "SIGINT");
+      const end = await exited;
+      expect(end.code === 130 || end.signal === "SIGINT").toBe(true);
+      expect(await waitFor(() => !alive(gitPid), 8000)).toBe(true);
+      expect(fs.existsSync(path.join(proj, ".skillwharf"))).toBe(false);
+      expect(JSON.parse(fs.readFileSync(path.join(proj, "skillwharf.json"), "utf8")).skills).toEqual({});
     }, 60_000);
 
     it("a SIGTERM to skillwharf alone still ends git", async () => {
