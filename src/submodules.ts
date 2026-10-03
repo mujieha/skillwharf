@@ -9,7 +9,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { assertNoSymlinks, exists } from "./fs.js";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_FILES, assertNoSymlinks, copyResolvingLinks, exists } from "./fs.js";
 import { runGit } from "./git.js";
 import { sanitizeForTerminal } from "./validate.js";
 
@@ -20,6 +20,7 @@ export interface SubmoduleContext {
   /** The clone URL of the repository that was fetched (for relative `.gitmodules` URLs and error messages). */
   parentUrl: string;
   timeoutMs?: number;
+  deadline?: number;
   /**
    * Validate an absolute `.gitmodules` URL (already in the universal
    * `git+https://` / `git+ssh://` spelling) with the source grammar and return
@@ -41,9 +42,10 @@ const shown = (s: string) => sanitizeForTerminal(s).replace(/(\/\/)[^/@\s]*@/g, 
  * that is the sub-path, lies under it, or that the sub-path passes through.
  * Does nothing (and runs no git) when the repository has no `.gitmodules`.
  */
-export function placeSubmodules(root: string, subpath: string, ctx: SubmoduleContext): void {
+export function placeSubmodules(root: string, subpath: string, ctx: SubmoduleContext): string[] {
+  const dropped: string[] = [];
   const modulesFile = path.join(root, ".gitmodules");
-  if (!exists(modulesFile)) return;
+  if (!exists(modulesFile)) return dropped;
   if (fs.lstatSync(modulesFile).isSymbolicLink()) {
     throw new Error(`${shown(ctx.parentUrl)}: .gitmodules is a symlink; refusing to read it.`);
   }
@@ -51,7 +53,7 @@ export function placeSubmodules(root: string, subpath: string, ctx: SubmoduleCon
   const relevant = listGitlinks(root, ctx).filter(
     (l) => subpath === "" || l.path === subpath || l.path.startsWith(`${subpath}/`) || subpath.startsWith(`${l.path}/`),
   );
-  if (relevant.length === 0) return;
+  if (relevant.length === 0) return dropped;
   if (relevant.length > MAX_SUBMODULES) {
     throw new Error(
       `${shown(ctx.parentUrl)} holds ${relevant.length} submodules under "${shown(subpath)}"; skillwharf opens at most ${MAX_SUBMODULES} at once. Point at a narrower sub-path.`,
@@ -65,13 +67,14 @@ export function placeSubmodules(root: string, subpath: string, ctx: SubmoduleCon
       throw new Error(`${shown(ctx.parentUrl)}: the submodule at "${shown(link.path)}" has no entry for it in .gitmodules; refusing it.`);
     }
     const url = childUrl(raw, link.path, ctx);
-    fetchChild(root, link, url, ctx);
+    for (const d of fetchChild(root, link, url, ctx)) dropped.push(`${link.path}/${d}`);
   }
+  return dropped;
 }
 
 /** Gitlinks (mode 160000) in the fetched commit, with their recorded sha. */
 function listGitlinks(root: string, ctx: SubmoduleContext): Gitlink[] {
-  const out = runGit(["-C", root, "ls-tree", "-r", "-z", "HEAD"], { url: ctx.parentUrl, timeoutMs: ctx.timeoutMs });
+  const out = runGit(["-C", root, "ls-tree", "-r", "-z", "HEAD"], { url: ctx.parentUrl, timeoutMs: ctx.timeoutMs, deadline: ctx.deadline });
   const links: Gitlink[] = [];
   for (const rec of out.split("\0")) {
     if (rec === "") continue;
@@ -91,7 +94,7 @@ function listGitlinks(root: string, ctx: SubmoduleContext): Gitlink[] {
 
 /** path → url for every `[submodule "x"]` section of the committed `.gitmodules`. */
 function readSubmoduleUrls(root: string, ctx: SubmoduleContext): Map<string, string> {
-  const opts = { url: ctx.parentUrl, timeoutMs: ctx.timeoutMs };
+  const opts = { url: ctx.parentUrl, timeoutMs: ctx.timeoutMs, deadline: ctx.deadline };
   const entry = runGit(["-C", root, "ls-tree", "-z", "HEAD", "--", ".gitmodules"], opts).split("\0")[0];
   const [mode, type, oid] = entry.slice(0, Math.max(entry.indexOf("\t"), 0)).split(" ");
   if (!entry || type !== "blob" || mode !== "100644" || !/^[0-9a-f]{40}$/.test(oid ?? "")) {
@@ -159,12 +162,12 @@ function resolveRelative(parentUrl: string, rel: string): string | undefined {
 }
 
 /** Fetch `link.sha` from `url` (no fallback: it is exactly the commit the parent records) and place it at the gitlink. */
-function fetchChild(root: string, link: Gitlink, url: string, ctx: SubmoduleContext): void {
+function fetchChild(root: string, link: Gitlink, url: string, ctx: SubmoduleContext): string[] {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "skillwharf-sub-"));
   try {
-    const run = (args: string[], contact = false) => runGit(args, { url, timeoutMs: ctx.timeoutMs, contact });
+    const run = (args: string[], contact = false) => runGit(args, { url, timeoutMs: ctx.timeoutMs, deadline: ctx.deadline, contact });
     run(["init", "--quiet", tmp]);
-    run(["-C", tmp, "remote", "add", "origin", url]);
+    run(["-C", tmp, "remote", "add", "--", "origin", url]);
     run(["-C", tmp, "fetch", "--depth", "1", "--quiet", "origin", link.sha], true);
     run(["-C", tmp, "checkout", "--quiet", "FETCH_HEAD"]);
 
@@ -186,19 +189,27 @@ function fetchChild(root: string, link: Gitlink, url: string, ctx: SubmoduleCont
     if (!st || !st.isDirectory() || fs.readdirSync(target).length > 0) {
       throw new Error(`${shown(ctx.parentUrl)}: the submodule path "${shown(link.path)}" is not an empty folder after checkout; refusing to place files into it.`);
     }
-    fs.cpSync(tmp, target, {
-      recursive: true,
-      dereference: false,
-      filter: (p) => path.basename(p) !== ".git",
-    });
+    // The same copy as the parent's skill folder gets: a link inside the
+    // submodule is followed, one that leaves it is dropped, `.git` is left
+    // out. (A plain recursive copy would rewrite a relative link to an
+    // absolute path into the temp folder that is deleted below.) The
+    // submodule is not capped like a skill folder, since only part of it is
+    // installed, but a link bomb still hits a bound.
+    return copyResolvingLinks(tmp, target, {
+      root: tmp,
+      limits: { maxFiles: 10 * DEFAULT_MAX_FILES, maxBytes: 10 * DEFAULT_MAX_BYTES },
+    }).dropped;
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 }
 
 /** ", <url>" of the inner repository when the child's own `.gitmodules` says it, else "". */
-function innerRepository(childRoot: string, innerPath: string, run: (args: string[]) => string): string {
+export function innerRepository(childRoot: string, innerPath: string, run: (args: string[]) => string): string {
   try {
+    // The child's .gitmodules gets the same refusal of a symlink as the parent's.
+    const file = path.join(childRoot, ".gitmodules");
+    if (!exists(file) || fs.lstatSync(file).isSymbolicLink()) return "";
     const text = run(["-C", childRoot, "config", "--file", ".gitmodules", "--null", "--get-regexp", "^submodule\\..*\\.(path|url)$"]);
     const byName = new Map<string, { path?: string; url?: string }>();
     for (const rec of text.split("\0")) {

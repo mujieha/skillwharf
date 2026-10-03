@@ -322,6 +322,8 @@ export interface Fetched {
   root?: string;
   /** The full commit sha that was checked out (git sources only) */
   sha?: string;
+  /** Links dropped while placing submodules, as repository-relative paths (git sources only) */
+  droppedInSubmodules?: string[];
   /** Resolved source string with exact commit when known */
   resolved: string;
   /** Call to remove temp files */
@@ -331,6 +333,10 @@ export interface Fetched {
 export interface FetchOptions {
   /** Longest a single git call may run before it is killed (default 120 s). */
   timeoutMs?: number;
+  /** An overall limit (epoch milliseconds) shared by every git call this fetch makes, and by other fetches given the same value. */
+  deadline?: number;
+  /** Fetch the submodules the sub-path touches (default true). A registry never opens them. */
+  submodules?: boolean;
   /**
    * For a pinned fetch (the ref is a commit): when the host refuses to serve
    * the commit by its sha, clone this ref (the default branch when `ref` is
@@ -351,7 +357,7 @@ export function fetchSource(src: ParsedSource, opts: FetchOptions = {}): Fetched
   }
 
   const url = cloneUrl(src);
-  const git = (args: string[], contact = false) => runGit(args, { url, timeoutMs: opts.timeoutMs, contact });
+  const git = (args: string[], contact = false) => runGit(args, { url, timeoutMs: opts.timeoutMs, deadline: opts.deadline, contact });
   const clone = (ref: string | undefined, into: string) => {
     const args = ["clone", "--depth", "1", "--quiet"];
     if (ref) args.push("--branch", ref);
@@ -364,7 +370,7 @@ export function fetchSource(src: ParsedSource, opts: FetchOptions = {}): Fetched
       // Pinned commit (from the lockfile): fetch exactly that object.
       try {
         git(["init", "--quiet", tmp]);
-        git(["-C", tmp, "remote", "add", "origin", url]);
+        git(["-C", tmp, "remote", "add", "--", "origin", url]);
         git(["-C", tmp, "fetch", "--depth", "1", "--quiet", "origin", src.ref], true);
         git(["-C", tmp, "checkout", "--quiet", "FETCH_HEAD"]);
       } catch (e) {
@@ -382,17 +388,21 @@ export function fetchSource(src: ParsedSource, opts: FetchOptions = {}): Fetched
   // abbreviated one, so a short pin could never be fetched again.
   let dir: string;
   let sha: string;
+  let droppedInSubmodules: string[] = [];
   try {
     sha = git(["-C", tmp, "rev-parse", "HEAD"]).trim();
-    placeSubmodules(tmp, src.subpath, {
-      parentUrl: url,
-      timeoutMs: opts.timeoutMs,
-      cloneUrlFor: (universal) => {
-        const p = parseSource(universal);
-        if (p.kind !== "git") throw new Error("not a git URL");
-        return cloneUrl(p);
-      },
-    });
+    if (opts.submodules !== false) {
+      droppedInSubmodules = placeSubmodules(tmp, src.subpath, {
+        parentUrl: url,
+        timeoutMs: opts.timeoutMs,
+        deadline: opts.deadline,
+        cloneUrlFor: (universal) => {
+          const p = parseSource(universal);
+          if (p.kind !== "git") throw new Error("not a git URL");
+          return cloneUrl(p);
+        },
+      });
+    }
     dir = resolveSubpath(tmp, src.subpath, repoLabel(src));
   } catch (e) {
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -402,6 +412,7 @@ export function fetchSource(src: ParsedSource, opts: FetchOptions = {}): Fetched
     dir,
     root: tmp,
     sha,
+    droppedInSubmodules,
     resolved: formatSource(src, sha),
     cleanup: () => fs.rmSync(tmp, { recursive: true, force: true }),
   };

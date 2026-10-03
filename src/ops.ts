@@ -412,6 +412,13 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
         stagingRoot ??= fs.mkdtempSync(path.join(os.tmpdir(), "skillwharf-stage-"));
         stagedDir = path.join(stagingRoot, String(index), path.basename(dir));
         dropped = stageSkill(dir, stagedDir, { root: fetched.root, limits: opts.limits }).dropped;
+        // Links a submodule had that left it were dropped when it was placed; they are
+        // reported with the skill whose folder they were in.
+        const here = repoRelative(fetched.root, dir);
+        for (const d of fetched.droppedInSubmodules ?? []) {
+          if (here === "" || d.startsWith(`${here}/`)) dropped.push(here === "" ? d : d.slice(here.length + 1));
+        }
+        dropped.sort();
       }
       const meta = readSkill(stagedDir ?? dir);
       const name = normalizeName(opts.name ?? meta.name);

@@ -3,13 +3,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { allowProtocolsForTests, setGitExecForTests } from "./git.js";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { allowProtocolsForTests, gitEnv, runGit, setGitExecForTests } from "./git.js";
 import { copyDir, hashDir } from "./fs.js";
 import { loadLock, loadManifest, makeContext, saveManifest, storePath } from "./manifest.js";
 import { addSkill, syncSkills, updateSkills } from "./ops.js";
 import { discoverSkills, discoveryBound, fetchSource, formatSource, parseSource, sourceKey } from "./source.js";
-import { placeSubmodules } from "./submodules.js";
+import { innerRepository, placeSubmodules } from "./submodules.js";
 import type { Context, Lockfile, Manifest } from "./types.js";
 
 // Every git call goes through runGit; this wrapper records the calls and runs
@@ -93,9 +93,15 @@ const ALL_HOSTS = [
   "ssh://git@git.acme.test/",
 ];
 
-/** The recorded git invocations (argument lists only). */
+/** An argument list without the `-c key=value` settings every call starts with (see HARDENING in git.ts). */
+function withoutHardening(args: string[]): string[] {
+  let i = 0;
+  while (args[i] === "-c") i += 2;
+  return args.slice(i);
+}
+/** The recorded git invocations (argument lists only, without the hardening settings). */
 function gitCalls(): string[][] {
-  return exec.mock.calls.filter((c) => c[0] === "git").map((c) => c[1] as string[]);
+  return exec.mock.calls.filter((c) => c[0] === "git").map((c) => withoutHardening(c[1] as string[]));
 }
 /** The options of the recorded invocations. */
 function gitOptions(): Record<string, unknown>[] {
@@ -344,7 +350,7 @@ describe("S1.13-S1.15: git is run with fixed arguments, a protocol allowlist and
     const url = "https://git.acme.test/team/skills.git";
     expect(gitCalls()).toEqual([
       ["init", "--quiet", expect.any(String)],
-      ["-C", expect.any(String), "remote", "add", "origin", url],
+      ["-C", expect.any(String), "remote", "add", "--", "origin", url],
       ["-C", expect.any(String), "fetch", "--depth", "1", "--quiet", "origin", sha],
       ["-C", expect.any(String), "checkout", "--quiet", "FETCH_HEAD"],
       ["-C", expect.any(String), "rev-parse", "HEAD"],
@@ -433,13 +439,6 @@ describe("S1.13-S1.15: git is run with fixed arguments, a protocol allowlist and
     expect(fs.readdirSync(tmp)).toEqual([]);
   });
 
-  it("the product never offers the file transport: with no test allowance a rewritten fetch has only https and ssh", () => {
-    allowProtocolsForTests([]);
-    exec.mockImplementation((() => Buffer.from("")) as never);
-    fetchSource(parseSource("github:acme/skills")).cleanup();
-    for (const o of gitOptions()) expect((o.env as Record<string, string>).GIT_ALLOW_PROTOCOL).not.toMatch(/file|ext|git(?!$)/);
-  });
-
   describe.skipIf(process.platform === "win32")("a hung git", () => {
     function fakeGit(script: string): void {
       const bin = path.join(base, "bin");
@@ -457,11 +456,25 @@ describe("S1.13-S1.15: git is run with fixed arguments, a protocol allowlist and
       expect(Date.now() - started).toBeLessThan(10_000);
     });
 
-    it("is killed at the timeout even when it left a child holding the pipes", () => {
-      fakeGit("sleep 20 &\nsleep 30");
+    it("is killed at the timeout even when it left a child holding the pipes, and the child goes with it", async () => {
+      const pidFile = path.join(base, "child.pid");
+      fakeGit(`sleep 30 &\necho $! > '${pidFile}'\nsleep 30`);
       const started = Date.now();
       expect(() => fetchSource(parseSource("github:acme/skills"), { timeoutMs: 1000 })).toThrow(/timed out/);
       expect(Date.now() - started).toBeLessThan(10_000);
+      const child = Number(fs.readFileSync(pidFile, "utf8"));
+      const alive = () => {
+        try {
+          process.kill(child, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      for (let i = 0; i < 20 && alive(); i++) await new Promise((r) => setTimeout(r, 100));
+      const survived = alive();
+      if (survived) process.kill(child, "SIGKILL"); // do not leave it behind, whatever the result
+      expect(survived).toBe(false);
     });
   });
 
@@ -847,9 +860,9 @@ describe("S1.19: submodules, one level, pinned by the parent's recorded commit",
     f.cleanup();
     const childUrl = "https://git.acme.test/team/child-skill.git";
     const calls = exec.mock.calls.filter((c) => (c[1] as string[]).includes(childUrl) || (c[1] as string[]).includes(childSha));
-    expect(calls.map((c) => c[1])).toEqual(
+    expect(calls.map((c) => withoutHardening(c[1] as string[]))).toEqual(
       expect.arrayContaining([
-        ["-C", expect.any(String), "remote", "add", "origin", childUrl],
+        ["-C", expect.any(String), "remote", "add", "--", "origin", childUrl],
         ["-C", expect.any(String), "fetch", "--depth", "1", "--quiet", "origin", childSha],
       ]),
     );
@@ -890,6 +903,8 @@ describe("S1.19: submodules, one level, pinned by the parent's recorded commit",
       ["ext::", "ext::sh -c touch% /tmp/x", /only https and ssh/],
       ["credentials", "https://user:pw@git.acme.test/x.git", /credential/],
       ["a relative URL that climbs out of the host", "../../../../escape.git", /climbs out/],
+      ["an ssh URL whose host is an option for ssh", "ssh://-oProxyCommand=sh/p.git", /Invalid host/],
+      ["an scp-style URL with a user other than git", "bob@git.acme.test:team/x.git", /credential/],
     ])("refuses %s", (_name, url, why) => {
       const repo = `team/bad${n++}`;
       makeRepo(repo, (w) => {
@@ -1361,4 +1376,267 @@ describe("S1.21: add --all finds skills in the layouts real repositories use", (
       expect(syncSkills(ctx).fetched.sort()).toEqual(["x", "y"]);
     });
   });
+});
+
+// ------------------------------------------------------------------ Round A: what git inherits and runs
+describe("Round A U1: the git environment of the user's own repository never reaches skillwharf's git", () => {
+  const INHERITED = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+  ];
+
+  it("gitEnv drops them and keeps the settings that are the user's to make", () => {
+    const env = gitEnv({
+      ...Object.fromEntries(INHERITED.map((k) => [k, "/somewhere"])),
+      GIT_SSH_COMMAND: "ssh -i /k",
+      GIT_ASKPASS: "/askpass",
+      GIT_CONFIG_GLOBAL: "/gitconfig",
+      SSH_AUTH_SOCK: "/agent",
+      PATH: "/bin",
+    });
+    for (const k of INHERITED) expect(env).not.toHaveProperty(k);
+    expect(env).toMatchObject({ GIT_SSH_COMMAND: "ssh -i /k", GIT_ASKPASS: "/askpass", GIT_CONFIG_GLOBAL: "/gitconfig", SSH_AUTH_SOCK: "/agent", PATH: "/bin" });
+  });
+
+  it.each([
+    ["a clone", (sha: string) => `github:acme/skills//rn`, false],
+    ["a pinned fetch", (sha: string) => `github:acme/skills//rn@${sha}`, true],
+  ])("%s run from a git hook (GIT_DIR set) leaves the user's repository untouched", (_name, source) => {
+    const sha = makeRepo("acme/skills", (w) => writeSkill(path.join(w, "rn"), "rn"));
+    routeHosts(ALL_HOSTS);
+    const mine = path.join(base, "mine");
+    git("init", "--quiet", mine);
+    fs.writeFileSync(path.join(mine, "mine.txt"), "mine");
+    git("-C", mine, "add", "-A");
+    git("-C", mine, "commit", "--quiet", "-m", "mine");
+    const snapshot = () => ({
+      config: fs.readFileSync(path.join(mine, ".git", "config"), "utf8"),
+      head: fs.readFileSync(path.join(mine, ".git", "HEAD"), "utf8"),
+      fetchHead: fs.existsSync(path.join(mine, ".git", "FETCH_HEAD")),
+      files: fs.readdirSync(mine).sort(),
+    });
+    const before = snapshot();
+    process.env.GIT_DIR = path.join(mine, ".git");
+    process.env.GIT_WORK_TREE = mine;
+    process.env.GIT_INDEX_FILE = path.join(mine, ".git", "index");
+    let fetched: ReturnType<typeof fetchSource> | undefined;
+    let error: unknown;
+    try {
+      fetched = fetchSource(parseSource(source(sha)));
+    } catch (e) {
+      error = e;
+    }
+    // The user's repository first: whatever happened to the fetch, it must not have been touched.
+    expect(snapshot()).toEqual(before);
+    if (error) throw error;
+    try {
+      expect(fs.existsSync(path.join((fetched as ReturnType<typeof fetchSource>).dir, "SKILL.md"))).toBe(true);
+    } finally {
+      fetched?.cleanup();
+    }
+  });
+});
+
+describe("Round A U2: the user's hooks and LFS are not run on a fetched tree", () => {
+  it("a global core.hooksPath hook does not run", () => {
+    makeRepo("acme/skills", (w) => writeSkill(path.join(w, "rn"), "rn"));
+    routeHosts(ALL_HOSTS);
+    const hooks = path.join(base, "hooks");
+    const marker = path.join(base, "hook-ran");
+    fs.mkdirSync(hooks);
+    fs.writeFileSync(path.join(hooks, "post-checkout"), `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
+    fs.writeFileSync(path.join(base, "gitconfig"), `[core]\n\thooksPath = ${hooks}\n`);
+    process.env.GIT_CONFIG_GLOBAL = path.join(base, "gitconfig");
+    // control: the hook is live for a plain git clone with this configuration
+    git("clone", "--quiet", path.join(base, "srv", "acme", "skills.git"), path.join(base, "control"));
+    expect(fs.existsSync(marker)).toBe(true);
+    fs.rmSync(marker);
+    fetchSource(parseSource("github:acme/skills//rn")).cleanup();
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it("an LFS smudge filter (and one the repository's .gitattributes asks for) does not run", () => {
+    makeRepo("acme/skills", (w) => {
+      writeSkill(path.join(w, "rn"), "rn");
+      fs.writeFileSync(path.join(w, ".gitattributes"), "*.bin filter=lfs\n");
+      fs.writeFileSync(path.join(w, "rn", "data.bin"), "pointer-ish\n");
+    });
+    routeHosts(ALL_HOSTS);
+    const marker = path.join(base, "lfs-ran");
+    const smudge = path.join(base, "smudge.sh");
+    fs.writeFileSync(smudge, `#!/bin/sh\ntouch '${marker}'\ncat\n`, { mode: 0o755 });
+    fs.writeFileSync(path.join(base, "gitconfig"), `[filter "lfs"]\n\tsmudge = ${smudge}\n\tclean = cat\n\trequired = true\n`);
+    process.env.GIT_CONFIG_GLOBAL = path.join(base, "gitconfig");
+    git("clone", "--quiet", path.join(base, "srv", "acme", "skills.git"), path.join(base, "control"));
+    expect(fs.existsSync(marker)).toBe(true); // control: the filter is live for a plain clone
+    fs.rmSync(marker);
+    const f = fetchSource(parseSource("github:acme/skills//rn"));
+    try {
+      expect(fs.readFileSync(path.join(f.dir, "data.bin"), "utf8")).toBe("pointer-ish\n");
+    } finally {
+      f.cleanup();
+    }
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+});
+
+describe("Round A U3: links inside a submodule survive being placed into the parent", () => {
+  it("a relative link in a submodule is copied as the file it points to", () => {
+    const childSha = makeRepo("team/child", (w) => {
+      writeSkill(w, "cs");
+      fs.writeFileSync(path.join(w, "real.txt"), "real content");
+      fs.symlinkSync("real.txt", path.join(w, "alias.txt"));
+    });
+    makeRepo("team/parent", (w) => {
+      addGitlink(w, "vendor/child", childSha);
+      writeGitmodules(w, [["vendor/child", "../child.git"]]);
+    });
+    routeHosts(ALL_HOSTS);
+    fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: {} }));
+    addSkill(ctx, "git+https://git.acme.test/team/parent.git//vendor/child");
+    const copy = path.join(storePath(ctx, "cs"), "alias.txt");
+    expect(fs.readFileSync(copy, "utf8")).toBe("real content");
+    expect(fs.lstatSync(copy).isFile()).toBe(true);
+  });
+});
+
+describe("Round A U4: the child's .gitmodules gets the parent's symlink refusal", () => {
+  it("a symlinked .gitmodules in a submodule is not read", () => {
+    const child = path.join(base, "child-tree");
+    fs.mkdirSync(child);
+    fs.writeFileSync(path.join(base, "elsewhere"), '[submodule "x"]\n\tpath = inner\n\turl = https://example.invalid/x.git\n');
+    fs.symlinkSync(path.join(base, "elsewhere"), path.join(child, ".gitmodules"));
+    const run = vi.fn(() => "submodule.x.path\ninner\0submodule.x.url\nhttps://example.invalid/x.git\0");
+    expect(innerRepository(child, "inner", run)).toBe("");
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("a regular .gitmodules still names the inner repository", () => {
+    const child = path.join(base, "child-tree");
+    fs.mkdirSync(child);
+    fs.writeFileSync(path.join(child, ".gitmodules"), "x");
+    const run = vi.fn(() => "submodule.x.path\ninner\0submodule.x.url\nhttps://example.invalid/x.git\0");
+    expect(innerRepository(child, "inner", run)).toBe(", https://example.invalid/x.git");
+  });
+});
+
+describe("Round A U3: a link in a submodule that leaves the submodule is dropped", () => {
+  it("is reported and not followed into the parent's files", () => {
+    const childSha = makeRepo("team/child", (w) => {
+      writeSkill(w, "cs");
+      fs.symlinkSync("../parent-secret.txt", path.join(w, "up.txt"));
+    });
+    makeRepo("team/parent", (w) => {
+      addGitlink(w, "vendor/child", childSha);
+      writeGitmodules(w, [["vendor/child", "../child.git"]]);
+      fs.writeFileSync(path.join(w, "vendor", "parent-secret.txt"), "parent file");
+    });
+    routeHosts(ALL_HOSTS);
+    fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: {} }));
+    const [added] = addSkill(ctx, "git+https://git.acme.test/team/parent.git//vendor/child");
+    expect(added.skippedSymlinks).toEqual(["up.txt"]);
+    expect(fs.existsSync(path.join(storePath(ctx, "cs"), "up.txt"))).toBe(false);
+  });
+});
+
+describe("Round A D3/U1/U2/D6: every git call carries the same hardening", () => {
+  beforeEach(() => {
+    allowProtocolsForTests([]);
+    exec.mockImplementation((() => Buffer.from("")) as never);
+  });
+
+  it("starts with the five -c settings: no hooks, no redirects, no LFS filter", () => {
+    fetchSource(parseSource(`github:acme/skills@${SHA}`)).cleanup();
+    fetchSource(parseSource("github:acme/skills")).cleanup();
+    const calls = exec.mock.calls.filter((c) => c[0] === "git").map((c) => c[1] as string[]);
+    expect(calls.length).toBeGreaterThan(5);
+    for (const args of calls) {
+      expect(args.slice(0, 10)).toEqual([
+        "-c", `core.hooksPath=${os.devNull}`,
+        "-c", "http.followRedirects=false",
+        "-c", "filter.lfs.smudge=",
+        "-c", "filter.lfs.process=",
+        "-c", "filter.lfs.required=false",
+      ]);
+    }
+  });
+
+  it("sets GIT_LFS_SKIP_SMUDGE=1 and passes none of the inherited repository variables", () => {
+    process.env.GIT_DIR = "/somewhere/.git";
+    process.env.GIT_WORK_TREE = "/somewhere";
+    fetchSource(parseSource("github:acme/skills")).cleanup();
+    for (const o of gitOptions()) {
+      const env = o.env as Record<string, string>;
+      expect(env.GIT_LFS_SKIP_SMUDGE).toBe("1");
+      expect(env).not.toHaveProperty("GIT_DIR");
+      expect(env).not.toHaveProperty("GIT_WORK_TREE");
+    }
+  });
+
+  it("runs git in its own process group so a timeout can take its children with it", () => {
+    fetchSource(parseSource("github:acme/skills")).cleanup();
+    if (process.platform !== "win32") for (const o of gitOptions()) expect(o.detached).toBe(true);
+  });
+
+  it("an ssh failure about the host key says skillwharf cannot ask, and how to trust the host", () => {
+    exec.mockImplementation((() => {
+      throw Object.assign(new Error("Command failed"), {
+        stderr: Buffer.from("No ED25519 host key is known for git.acme.test and you have requested strict checking.\nHost key verification failed.\nfatal: Could not read from remote repository.\n"),
+      });
+    }) as never);
+    expect(() => fetchSource(parseSource("git+ssh://git@git.acme.test/team/skills.git"))).toThrow(
+      /skillwharf runs git without a terminal, so ssh cannot ask.*connect once with ssh/s,
+    );
+  });
+
+  it("a call whose deadline has passed is refused without running git", () => {
+    exec.mockClear();
+    expect(() => runGit(["status"], { url: "https://git.acme.test/x.git", deadline: Date.now() - 1 })).toThrow(/time limit/);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("a call never gets more time than is left before the deadline", () => {
+    runGit(["status"], { url: "https://git.acme.test/x.git", timeoutMs: 120_000, deadline: Date.now() + 3000 });
+    const timeout = gitOptions()[0].timeout as number;
+    expect(timeout).toBeLessThanOrEqual(3000);
+    expect(timeout).toBeGreaterThan(0);
+  });
+});
+
+describe("Round A: the built command line runs git the way SECURITY.md says", () => {
+  const repoRoot = path.resolve(here, "..");
+  beforeAll(() => {
+    const r = spawnSync(path.join(repoRoot, "node_modules", ".bin", "tsc"), ["-p", "tsconfig.json"], { cwd: repoRoot, encoding: "utf8" });
+    if (r.status !== 0) throw new Error(`tsc failed:\n${r.stdout}${r.stderr}`);
+  }, 180_000);
+
+  it.skipIf(process.platform === "win32")("a fake git on PATH sees the protocol allowlist, no prompts and the hardening settings", () => {
+    const bin = path.join(base, "bin");
+    const dump = path.join(base, "dump.txt");
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, "git"), `#!/bin/sh\n{ echo "ARGV:$*"; env; } >> '${dump}'\nexit 1\n`, { mode: 0o755 });
+    fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: {} }));
+    // no test allowance exists in this process: it is the shipped code with the user's environment
+    const env = { ...process.env, SKILLWHARF_HOME: home, PATH: `${bin}${path.delimiter}${process.env.PATH}`, GIT_DIR: "/somewhere/.git" } as Record<string, string>;
+    delete env.GIT_ALLOW_PROTOCOL;
+    const r = spawnSync(process.execPath, [path.join(repoRoot, "dist", "cli.js"), "add", "github:acme/skills"], { cwd: proj, env, encoding: "utf8" });
+    expect(r.status).toBe(1);
+    const text = fs.readFileSync(dump, "utf8");
+    const argv = (text.split("\n").find((l) => l.startsWith("ARGV:")) ?? "").slice(5);
+    for (const s of ["core.hooksPath=", "http.followRedirects=false", "filter.lfs.smudge=", "filter.lfs.process=", "filter.lfs.required=false", "clone"]) {
+      expect(argv).toContain(s);
+    }
+    expect(argv).toContain("-- https://github.com/acme/skills.git");
+    const lines = text.split("\n");
+    expect(lines).toContain("GIT_ALLOW_PROTOCOL=https:ssh");
+    expect(lines).toContain("GIT_TERMINAL_PROMPT=0");
+    expect(lines).toContain("GIT_LFS_SKIP_SMUDGE=1");
+    expect(lines.some((l) => l.startsWith("GIT_DIR="))).toBe(false);
+  }, 60_000);
 });

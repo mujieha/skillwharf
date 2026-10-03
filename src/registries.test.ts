@@ -203,7 +203,8 @@ describe("S2.2: loading a registry from https, a git repository or a path", () =
     routeHosts(HOSTS);
     await loadRegistry("git+https://git.acme.test/team/registry.git", { timeoutMs: 7000 });
     const calls = exec.mock.calls.filter((c) => c[0] === "git");
-    expect(calls[0][1]).toEqual(["clone", "--depth", "1", "--quiet", "--", "https://git.acme.test/team/registry.git", expect.any(String)]);
+    const args = (calls[0][1] as string[]).filter((_, i) => i >= 10); // after the five `-c key=value` hardening settings
+    expect(args).toEqual(["clone", "--depth", "1", "--quiet", "--", "https://git.acme.test/team/registry.git", expect.any(String)]);
     for (const c of calls) {
       const o = c[2] as Record<string, unknown>;
       expect((o.env as Record<string, string>).GIT_ALLOW_PROTOCOL).toMatch(/^https:ssh/);
