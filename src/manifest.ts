@@ -155,6 +155,11 @@ function validateRegistries(m: Manifest, bad: (msg: string) => Error): void {
     if (hasTerminalUnsafe(r.location)) {
       throw bad(`registries[${i}]: "location" may not contain control or bidirectional-override characters`);
     }
+    // `default` is what the hint, `doctor` and `registry remove default` call the public
+    // registry; a manifest from a cloned repository must not make it mean another one.
+    if (r.name === "default" && r.location !== "default") {
+      throw bad(`registries[${i}]: the name "default" is the public registry; it cannot point at another location (choose another name)`);
+    }
     if (seen.has(r.name)) throw bad(`registry "${r.name}" is listed more than once`);
     seen.add(r.name);
   });

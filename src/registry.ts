@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { isInside, readJson, writeJson } from "./fs.js";
+import { assertNoSymlinks, isInside, readJson, writeJson } from "./fs.js";
 import {
   DEFAULT_REGISTRY,
   listsRegistries,
@@ -366,6 +366,9 @@ export async function addRegistry(
 ): Promise<{ entries: number }> {
   const m = requireManifest(ctx);
   const list = materialize(m);
+  if (name === "default" && location.trim() !== "default") {
+    throw new Error(`the name "default" is the public registry; it cannot point at another location (choose another name)`);
+  }
   if (list.some((r) => r.name === name)) throw new Error(`registry "${name}" is already listed`);
   const spec: RegistrySpec = { name, location: locationForManifest(ctx, location.trim()) };
   validateManifest({ ...m, registries: [...list, spec], registry: undefined }, manifestPath(ctx));
@@ -394,6 +397,9 @@ export function publishToRegistry(registryDir: string, entry: RegistryEntry): { 
   // shell command; loadRegistry would drop an entry with a bad name anyway.
   assertSkillName(entry.name);
   const file = path.join(registryDir, "index.json");
+  // A checkout cloned from someone else's repository may hold index.json as a link;
+  // writing would then change a file elsewhere. The checkout folder itself may be a link.
+  assertNoSymlinks(registryDir, file);
   const idx = readJson<RegistryIndex>(file) ?? { version: 1, skills: [] };
   const i = idx.skills.findIndex((s) => s.name === entry.name);
   const created = i < 0;

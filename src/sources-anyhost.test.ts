@@ -1868,6 +1868,44 @@ describe("Round A: the built command line runs git the way SECURITY.md says", ()
 });
 
 // ------------------------------------------------------------------ Round B
+describe("Round B B3: the lock is fetched from the manifest's URL, and a lock for another URL is refused before any git call", () => {
+  const lockFor = (source: string, resolved: string): void => {
+    fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: { a: { source } } }));
+    fs.writeFileSync(
+      path.join(proj, "skillwharf.lock.json"),
+      JSON.stringify({ version: 1, skills: { a: { source, resolved, integrity: "sha256-x", installedAt: "x" } } }),
+    );
+  };
+
+  it.each([
+    ["the .git suffix", "git+https://git.acme.test/team/skills.git//a", `git+https://git.acme.test/team/skills//a@${SHA}`],
+    ["the .git suffix the other way", "git+https://git.acme.test/team/skills//a", `git+https://git.acme.test/team/skills.git//a@${SHA}`],
+    ["the ssh user", "git+ssh://git@git.acme.test/team/skills.git//a", `git+ssh://git.acme.test/team/skills.git//a@${SHA}`],
+  ])("differing in %s is a mismatch: zero git calls, and the manifest/lock pair is named", (_what, source, resolved) => {
+    lockFor(source, resolved);
+    exec.mockClear();
+    expect(() => syncSkills(ctx)).toThrow(/does not match the manifest source/);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("the same URL spelled the same way is fetched, at the lock's commit, from the manifest's spelling", () => {
+    const sha = makeRepo("team/skills", (w) => writeSkill(path.join(w, "a"), "a"));
+    routeHosts(ALL_HOSTS);
+    const source = "git+https://git.acme.test/team/skills.git//a";
+    lockFor(source, `${source}@${sha}`);
+    const integrity = integrityAt(`${source}@${sha}`);
+    lockFor(source, `${source}@${sha}`);
+    const lock = JSON.parse(read(path.join(proj, "skillwharf.lock.json"))) as Lockfile;
+    lock.skills.a.integrity = integrity;
+    writeLock(lock);
+    exec.mockClear();
+    expect(syncSkills(ctx).fetched).toEqual(["a"]);
+    const urls = exec.mock.calls.map((c) => (c[1] as string[]).join(" ")).join("\n");
+    expect(urls).toContain("https://git.acme.test/team/skills.git");
+    expect(urls).not.toContain("team/skills ");
+  });
+});
+
 describe("Round B B5: filter drivers, ident and eol conversion a repository names do not run", () => {
   const FILTER_REPO = (w: string) => {
     writeSkill(path.join(w, "rn"), "rn");

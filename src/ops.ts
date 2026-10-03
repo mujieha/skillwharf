@@ -32,6 +32,7 @@ import { loadRegistries, resolveRegistryName } from "./registry.js";
 import {
   PinUnavailable,
   ShortShaError,
+  cloneUrl,
   discoverSkills,
   fetchSource,
   formatSource,
@@ -227,13 +228,17 @@ function lockedSource(ctx: Context, m: Manifest, name: string, spec: SkillSpec, 
     throw mismatch();
   }
   if (want.kind === "git") {
-    if (got.kind !== "git" || sourceKey(got) !== sourceKey(want)) throw mismatch();
+    // Same repository path, host and port, and also the same URL: sourceKey leaves out the
+    // `.git` suffix and the ssh user, which can reach a different repository or identity.
+    if (got.kind !== "git" || sourceKey(got) !== sourceKey(want) || cloneUrl(got) !== cloneUrl(want)) throw mismatch();
     if (!got.ref || !FULL_SHA_RE.test(got.ref)) {
       throw new UnusablePin(
         `${LOCKFILE}: "${name}" is pinned to "${String(got.ref)}", not a full 40-character commit sha.`,
       );
     }
-    return got;
+    // Fetch the manifest's own spelling of the URL (the one a reviewer saw in the pull
+    // request) at the commit the lock pins; never the lock's spelling.
+    return { ...want, ref: got.ref };
   }
   if (got.kind !== "path" || got.path !== want.path) throw mismatch();
   return want;

@@ -13,6 +13,7 @@ import {
   isRegistryName,
   loadRegistries,
   loadRegistry,
+  publishToRegistry,
   removeRegistry,
   resolveRegistryName,
   searchRegistries,
@@ -365,6 +366,58 @@ describe("S2.1: the global list comes first, the project list after", () => {
     const r = await loadRegistries(ctx);
     expect(r.map((x) => x.name)).toEqual(["registry"]);
     expect(names(r[0])).toEqual(["from-a"]);
+  });
+});
+
+// ------------------------------------------------------------------ Round B
+describe("Round B A2: the name default belongs to the public registry", () => {
+  it("validateManifest refuses a registry called default that points somewhere else", () => {
+    const m = { version: 1, agents: ["claude"], skills: {}, registries: [{ name: "default", location: "https://evil.example/index.json" }] } as Manifest;
+    expect(() => validateManifest(m, "m.json")).toThrow(/the name "default" is the public registry; it cannot point at/);
+  });
+
+  it("validateManifest accepts default pointing at default, and any other name anywhere", () => {
+    const ok = { version: 1, agents: ["claude"], skills: {}, registries: [{ name: "default", location: "default" }, { name: "mine", location: "./x" }] } as Manifest;
+    expect(() => validateManifest(ok, "m.json")).not.toThrow();
+  });
+
+  it("registry add refuses default for a location of your own, before loading anything", async () => {
+    writeManifest(proj, {});
+    const spy = vi.fn(async () => new Response("{}"));
+    vi.stubGlobal("fetch", spy);
+    await expect(addRegistry(ctx, "default", "https://evil.example/index.json")).rejects.toThrow(/the name "default" is the public registry/);
+    expect(spy).not.toHaveBeenCalled();
+  });
+});
+
+describe("Round B B6: publish never writes through a symlink", () => {
+  it("refuses an index.json that is a symlink and leaves its target alone", () => {
+    const reg = path.join(base, "checkout");
+    const outside = path.join(base, "outside.json");
+    fs.mkdirSync(reg);
+    fs.writeFileSync(outside, '{"version":1,"skills":[]}\n');
+    fs.symlinkSync(outside, path.join(reg, "index.json"));
+    expect(() => publishToRegistry(reg, { name: "x", description: "d", source: "github:a/b/x" })).toThrow(/symlink/);
+    expect(fs.readFileSync(outside, "utf8")).toBe('{"version":1,"skills":[]}\n');
+  });
+
+  it("refuses a checkout whose folder inside is a symlink out of it", () => {
+    const reg = path.join(base, "checkout");
+    fs.mkdirSync(reg);
+    fs.mkdirSync(path.join(base, "elsewhere"));
+    // index.json would be reached through a linked folder only for a nested location; the file itself is the one case here
+    fs.symlinkSync(path.join(base, "elsewhere", "index.json"), path.join(reg, "index.json"));
+    expect(() => publishToRegistry(reg, { name: "x", description: "d", source: "github:a/b/x" })).toThrow(/symlink/);
+    expect(fs.existsSync(path.join(base, "elsewhere", "index.json"))).toBe(false);
+  });
+
+  it("still publishes into an ordinary checkout, and into one reached through a symlinked folder", () => {
+    const reg = path.join(base, "checkout");
+    fs.mkdirSync(reg);
+    const alias = path.join(base, "alias");
+    fs.symlinkSync(reg, alias);
+    expect(publishToRegistry(alias, { name: "x", description: "d", source: "github:a/b/x" }).created).toBe(true);
+    expect(fs.readFileSync(path.join(reg, "index.json"), "utf8")).toContain('"name": "x"');
   });
 });
 
