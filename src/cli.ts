@@ -66,18 +66,26 @@ function ctxFrom(cmd: Command): Context {
 function gitDeadlineMs(cmd: Command): number | undefined {
   const raw = (cmd.optsWithGlobals() as { gitDeadline?: string }).gitDeadline;
   if (raw === undefined) return undefined;
-  const seconds = Number(raw);
-  if (!Number.isFinite(seconds) || seconds <= 0) fail(`--git-deadline takes a positive number of seconds, got "${raw}"`);
-  return Math.round(seconds * 1000);
+  return seconds("--git-deadline", raw);
+}
+
+/** Longest limit a timer can hold (Node's setTimeout overflows past about 2^31 ms). */
+const MAX_LIMIT_SECONDS = 2_000_000;
+
+/** A positive number of seconds, at most MAX_LIMIT_SECONDS, as milliseconds. */
+function seconds(flag: string, raw: string): number {
+  const s = Number(raw);
+  if (!Number.isFinite(s) || s <= 0 || s > MAX_LIMIT_SECONDS) {
+    fail(`${flag} takes a positive number of seconds (at most ${MAX_LIMIT_SECONDS}), got "${raw}"`);
+  }
+  return Math.round(s * 1000);
 }
 
 /** `--git-timeout <seconds>` as milliseconds, or undefined for the default. */
 function gitTimeoutMs(cmd: Command): number | undefined {
   const raw = (cmd.optsWithGlobals() as { gitTimeout?: string }).gitTimeout;
   if (raw === undefined) return undefined;
-  const seconds = Number(raw);
-  if (!Number.isFinite(seconds) || seconds <= 0) fail(`--git-timeout takes a positive number of seconds, got "${raw}"`);
-  return Math.round(seconds * 1000);
+  return seconds("--git-timeout", raw);
 }
 
 function parseAgents(s: string | undefined): AgentId[] | undefined {

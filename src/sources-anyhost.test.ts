@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { SUPERVISOR_SOURCE, supervisedGit, allowAskpass, allowProtocolsForTests, defaultDeadlineMs, gitEnv, killProcessTree, runGit, setGitExecForTests } from "./git.js";
+import { SUPERVISOR_SOURCE, isGitProcess, supervisedGit, allowAskpass, allowProtocolsForTests, defaultDeadlineMs, gitEnv, killProcessTree, runGit, setGitExecForTests } from "./git.js";
 import { linkStatus, unlinkSkill } from "./agents.js";
 import { copyDir, copyResolvingLinks, hashDir, inGitDir, isAbsoluteLinkText, isInside, resolveInside } from "./fs.js";
 import { isSkillDirIn } from "./skill.js";
@@ -1932,15 +1932,17 @@ describe("Round A: the built command line runs git the way SECURITY.md says", ()
     expect(text).not.toContain("core.askPass=");
   }, 60_000);
 
-  it("--git-deadline takes a positive number of seconds", () => {
-    for (const bad of ["abc", "0", "-3"]) {
-      const r = spawnSync(process.execPath, [path.join(repoRoot, "dist", "cli.js"), "--git-deadline", bad, "sync"], {
-        cwd: proj,
-        env: { ...process.env, SKILLWHARF_HOME: home },
-        encoding: "utf8",
-      });
-      expect(r.status).toBe(1);
-      expect(r.stderr).toMatch(/--git-deadline takes a positive number of seconds/);
+  it("--git-deadline takes a positive number of seconds, and so does --git-timeout, up to a limit a timer can hold", () => {
+    for (const flag of ["--git-deadline", "--git-timeout"]) {
+      for (const bad of ["abc", "0", "-3", "2000001", "1e12", "Infinity"]) {
+        const r = spawnSync(process.execPath, [path.join(repoRoot, "dist", "cli.js"), flag, bad, "sync"], {
+          cwd: proj,
+          env: { ...process.env, SKILLWHARF_HOME: home },
+          encoding: "utf8",
+        });
+        expect(r.status).toBe(1);
+        expect(r.stderr).toMatch(new RegExp(`${flag} takes a positive number of seconds \\(at most 2000000\\)`));
+      }
     }
   });
 });
@@ -2431,18 +2433,70 @@ describe("Round B B4/A3: git runs under a supervisor", () => {
     expect(fs.readFileSync(out, "utf8").trim()).not.toBe(ours);
   });
 
-  it("the supervisor knows how to end a process tree on Windows", () => {
-    expect(SUPERVISOR_SOURCE).toContain('"taskkill", ["/T", "/F", "/PID"');
+  it("the supervisor is written for Windows too: its own hidden session, taskkill by full path, a liveness probe for its parent", () => {
+    expect(SUPERVISOR_SOURCE).toContain("detached: true");
     expect(SUPERVISOR_SOURCE).toContain("windowsHide: true");
+    expect(SUPERVISOR_SOURCE).toContain("System32");
+    expect(SUPERVISOR_SOURCE).toContain("taskkill.exe");
+    expect(SUPERVISOR_SOURCE).not.toMatch(/spawnSync\("taskkill"/); // never a bare name that a PATH entry could shadow
+    expect(SUPERVISOR_SOURCE).toContain("process.kill(parent, 0)"); // process.ppid never changes on Windows
   });
 
-  it("killProcessTree ends a group on POSIX and runs taskkill on Windows", () => {
+  it("killProcessTree ends a group on POSIX and runs the full-path taskkill on Windows", () => {
     const kill = vi.fn();
     const run = vi.fn();
     killProcessTree(4242, { platform: "linux", kill, run });
     expect(kill).toHaveBeenCalledWith(-4242, "SIGKILL");
-    killProcessTree(4242, { platform: "win32", kill, run });
-    expect(run).toHaveBeenCalledWith("taskkill", ["/T", "/F", "/PID", "4242"], expect.objectContaining({ windowsHide: true }));
+    killProcessTree(4242, { platform: "win32", kill, run, env: { SystemRoot: "C:\\Windows" } });
+    expect(run).toHaveBeenCalledWith("C:\\Windows\\System32\\taskkill.exe", ["/T", "/F", "/PID", "4242"], expect.objectContaining({ windowsHide: true }));
+  });
+
+  it.skipIf(process.platform === "win32")("the supervisor reports git's own pid first, and git's exit status", () => {
+    const r = spawnSync(process.execPath, ["-e", SUPERVISOR_SOURCE, "5000", "sh", "-c", "echo out; echo err >&2; exit 3"], { encoding: "utf8" });
+    expect(r.status).toBe(3);
+    expect(r.stdout).toBe("out\n");
+    expect(r.stderr).toMatch(/^SKILLWHARF-GIT-PID \d+\n/);
+    expect(r.stderr).toContain("err\n");
+  });
+
+  describe("the backstop after a timeout", () => {
+    afterEach(() => vi.restoreAllMocks());
+    const killed = () => (process.kill as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((c) => c[0]);
+    const failWith = (props: object) =>
+      exec.mockImplementation((() => {
+        throw Object.assign(new Error("Command failed"), props);
+      }) as never);
+
+    it("does nothing when the supervisor itself reported the timeout (status 124): its pid is gone and may be reused", () => {
+      allowProtocolsForTests([]);
+      vi.spyOn(process, "kill").mockImplementation((() => true) as never);
+      failWith({ status: 124, pid: 777777, stderr: Buffer.from("SKILLWHARF-GIT-PID 888888\nskillwharf: git timed out\n") });
+      expect(() => runGit(["status"], { url: "https://git.acme.test/x.git" })).toThrow(/timed out/);
+      expect(killed()).toEqual([]);
+    });
+
+    it("when the supervisor hung and was killed, only git's own pid is ended, and only if it is still git", () => {
+      allowProtocolsForTests([]);
+      const kill = vi.spyOn(process, "kill").mockImplementation((() => true) as never);
+      failWith({ code: "ETIMEDOUT", signal: "SIGKILL", pid: 777777, stderr: Buffer.from("SKILLWHARF-GIT-PID 888888\n") });
+      expect(() => runGit(["status"], { url: "https://git.acme.test/x.git" })).toThrow(/timed out/);
+      // pid 888888 is not a git process here, so nothing is killed (and the supervisor's pid is never targeted)
+      expect(killed().filter((p) => p === -777777 || p === 777777)).toEqual([]);
+      kill.mockRestore();
+    });
+
+    it.skipIf(process.platform === "win32")("isGitProcess recognises a real git process and nothing else", async () => {
+      const git = spawn("git", ["hash-object", "--stdin"], { stdio: ["pipe", "ignore", "ignore"] });
+      const sleeper = spawn("sleep", ["30"], { stdio: "ignore" });
+      try {
+        expect(isGitProcess(git.pid as number)).toBe(true);
+        expect(isGitProcess(sleeper.pid as number)).toBe(false);
+        expect(isGitProcess(2 ** 22 - 3)).toBe(false); // no such process
+      } finally {
+        git.kill("SIGKILL");
+        sleeper.kill("SIGKILL");
+      }
+    });
   });
 
   describe.skipIf(process.platform === "win32")("an interrupt", () => {

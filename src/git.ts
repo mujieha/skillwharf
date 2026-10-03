@@ -58,16 +58,26 @@ const { spawn, spawnSync } = require("node:child_process");
 const [ms, file, ...args] = process.argv.slice(1);
 const win = process.platform === "win32";
 const parent = process.ppid;
-const child = spawn(file, args, { stdio: ["ignore", "inherit", "inherit"], detached: !win, windowsHide: true });
+// Its own session on POSIX (no terminal); on Windows a new, hidden console, so git does not share ours.
+const child = spawn(file, args, { stdio: ["ignore", "inherit", "inherit"], detached: true, windowsHide: true });
 child.on("error", (e) => { process.stderr.write("skillwharf: cannot run git: " + (e && e.message) + "\\n"); process.exit(127); });
+// git's own pid, first on stderr, so a parent whose supervisor hung can end git and not a stale pid.
+process.stderr.write("SKILLWHARF-GIT-PID " + child.pid + "\\n");
 const killTree = () => {
   try {
-    if (win) spawnSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], { windowsHide: true });
-    else process.kill(-child.pid, "SIGKILL");
+    if (win) {
+      const root = process.env.SystemRoot || process.env.windir || "C:\\\\Windows";
+      spawnSync(root + "\\\\System32\\\\taskkill.exe", ["/T", "/F", "/PID", String(child.pid)], { windowsHide: true });
+    } else process.kill(-child.pid, "SIGKILL");
   } catch (e) {}
 };
 const timer = setTimeout(() => { killTree(); process.stderr.write("skillwharf: git timed out\\n"); process.exit(124); }, Number(ms));
-const watch = setInterval(() => { if (process.ppid !== parent) { killTree(); process.exit(143); } }, 300);
+// process.ppid never changes on Windows, so ask whether the parent still exists (on POSIX the ppid check is enough, the probe is harmless).
+const watch = setInterval(() => {
+  let gone = false;
+  try { process.kill(parent, 0); } catch (e) { gone = e && e.code === "ESRCH"; }
+  if (gone || (!win && process.ppid !== parent)) { killTree(); process.exit(143); }
+}, 300);
 for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143], ["SIGHUP", 129]]) {
   process.on(signal, () => { killTree(); process.exit(code); });
 }
@@ -78,17 +88,36 @@ child.on("exit", (code, signal) => {
 });
 `;
 
-/** End a process and everything it started: its group on POSIX, `taskkill /T /F` on Windows. Never throws. */
+/** `%SystemRoot%\System32\<exe>`: Windows system tools are run by full path, never by a bare name a PATH entry could shadow. */
+function windowsTool(exe: string, env: NodeJS.ProcessEnv): string {
+  return `${env.SystemRoot || env.windir || "C:\\Windows"}\\System32\\${exe}`;
+}
+
+/** End a process and everything it started: its group on POSIX, `taskkill /T /F` (by full path) on Windows. Never throws. */
 export function killProcessTree(
   pid: number,
-  deps: { platform?: NodeJS.Platform; kill?: (pid: number, signal: NodeJS.Signals) => void; run?: typeof spawnSync } = {},
+  deps: { platform?: NodeJS.Platform; kill?: (pid: number, signal: NodeJS.Signals) => void; run?: typeof spawnSync; env?: NodeJS.ProcessEnv } = {},
 ): void {
   const platform = deps.platform ?? process.platform;
   try {
-    if (platform === "win32") (deps.run ?? spawnSync)("taskkill", ["/T", "/F", "/PID", String(pid)], { windowsHide: true });
+    if (platform === "win32") (deps.run ?? spawnSync)(windowsTool("taskkill.exe", deps.env ?? process.env), ["/T", "/F", "/PID", String(pid)], { windowsHide: true });
     else (deps.kill ?? process.kill.bind(process))(-pid, "SIGKILL");
   } catch {
     /* already gone */
+  }
+}
+
+/** True when `pid` is a running process whose name is git (so a recycled pid is never signalled). Never throws. */
+export function isGitProcess(pid: number): boolean {
+  try {
+    if (process.platform === "win32") {
+      const r = spawnSync(windowsTool("tasklist.exe", process.env), ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], { encoding: "utf8", windowsHide: true });
+      return /^"git(\.exe)?"/i.test(String(r.stdout).trim());
+    }
+    const r = spawnSync("ps", ["-p", String(pid), "-o", "comm="], { encoding: "utf8" });
+    return /(^|\/)git$/.test(String(r.stdout).trim());
+  } catch {
+    return false;
   }
 }
 
@@ -273,7 +302,10 @@ export function runGit(args: string[], opts: RunGitOptions): string {
     } as Parameters<typeof execFileSync>[2]).toString();
   } catch (e) {
     const err = e as NodeJS.ErrnoException & { stderr?: Buffer | string; signal?: string; pid?: number; status?: number | null };
-    const stderr = String(err.stderr ?? "");
+    // The supervisor's first stderr line is git's own pid; it is not part of git's message.
+    const rawStderr = String(err.stderr ?? "");
+    const gitPid = Number(/^SKILLWHARF-GIT-PID (\d+)$/m.exec(rawStderr)?.[1]);
+    const stderr = rawStderr.replace(/^SKILLWHARF-GIT-PID \d+\n/m, "");
     const first = (stderr || String(err.message ?? "")).split("\n").find((l) => l.trim() !== "") ?? "";
     let reason = sanitizeForTerminal(first.trim() || err.message || "unknown error");
     if (err.status === 130) {
@@ -290,8 +322,10 @@ export function runGit(args: string[], opts: RunGitOptions): string {
       reason += `. authentication failed for ${sanitizeForTerminal(hostOf(opts.url))}; configure a git credential helper (\`git config --global credential.helper ...\`) or re-run with --allow-askpass to let your editor ask`;
     }
     if (err.status === 124 || err.code === "ETIMEDOUT" || err.signal === "SIGKILL") {
-      // Backstop: the supervisor normally ended the whole group itself; if it did not, end git's.
-      if (typeof err.pid === "number") killProcessTree(err.pid);
+      // The supervisor ended git's group itself when it reported the timeout (status 124): nothing
+      // more to do, and its own pid is gone (it could be reused). Only when the supervisor hung and
+      // was killed is git ended here, by git's own pid, and only if that pid is still a git process.
+      if (err.status !== 124 && Number.isInteger(gitPid) && gitPid > 1 && isGitProcess(gitPid)) killProcessTree(gitPid);
       const seconds = Math.round((timeoutMs / 1000) * 100) / 100;
       throw new GitError(
         limitedByDeadline
