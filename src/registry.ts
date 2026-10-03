@@ -1,15 +1,46 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { readJson, writeJson } from "./fs.js";
-import { DEFAULT_REGISTRY } from "./manifest.js";
-import { parseSource } from "./source.js";
-import type { RegistryEntry, RegistryIndex } from "./types.js";
+import { DEFAULT_REGISTRY, listsRegistries, loadManifest, makeContext, registriesOf } from "./manifest.js";
+import { fetchSource, parseSource } from "./source.js";
+import type { Context, LoadedRegistry, RegistryEntry, RegistryIndex, RegistrySpec } from "./types.js";
 import { assertSkillName, sanitizeForTerminal } from "./validate.js";
 
-/** Load a registry index from an http(s) URL, a local index.json, or a directory containing one. */
-export async function loadRegistry(location: string): Promise<RegistryIndex> {
-  if (/^http:\/\//i.test(location)) throw new Error(`Registry must be served over https: ${location}`);
-  if (/^https:\/\//i.test(location)) {
+export interface LoadRegistryOptions {
+  /** Longest one git call may run, in milliseconds (git locations only). */
+  timeoutMs?: number;
+}
+
+/** What a registry location is: the words `default`, an https index URL, a git source, or a local path. */
+export function classifyLocation(location: string): "https" | "http" | "git" | "path" {
+  if (/^http:\/\//i.test(location)) return "http";
+  if (/^https:\/\//i.test(location)) return "https";
+  if (/^(github|gitlab|bitbucket):/.test(location) || /^git\+(https|ssh):\/\//.test(location)) return "git";
+  return "path";
+}
+
+/**
+ * Load a registry index from the public default (`default`), an https URL, a
+ * git repository whose root (or `//folder`) holds `index.json`, a local
+ * index.json, or a directory containing one. Whatever the source, the index
+ * goes through the same schema check.
+ */
+export async function loadRegistry(location: string, opts: LoadRegistryOptions = {}): Promise<RegistryIndex> {
+  if (location === "default") location = DEFAULT_REGISTRY;
+  const kind = classifyLocation(location);
+  if (kind === "http") throw new Error(`Registry must be served over https: ${location}`);
+  if (kind === "https") {
+    let credentials = false;
+    try {
+      const u = new URL(location);
+      credentials = u.username !== "" || u.password !== "";
+    } catch {
+      /* fetch reports a URL that does not parse */
+    }
+    if (credentials) {
+      throw new Error("A registry URL with credentials is refused: skillwharf sends none. Use a git location (credentials come from git) or a local checkout.");
+    }
     const res = await fetch(location, { redirect: "error", signal: AbortSignal.timeout(15_000) });
     if (res.status === 404 && location === DEFAULT_REGISTRY) {
       throw new Error("the default registry is not available yet; pass --registry <url|path>");
@@ -17,7 +48,24 @@ export async function loadRegistry(location: string): Promise<RegistryIndex> {
     if (!res.ok) throw new Error(`Registry fetch failed (${res.status}) for ${location}`);
     return normalize(JSON.parse(await readCapped(res, MAX_REGISTRY_BYTES)) as RegistryIndex);
   }
+  if (kind === "git") {
+    const src = parseSource(location);
+    if (src.kind !== "git") throw new Error(`Registry location ${location} is not a git source`);
+    // The same fetch as a skill: protocol allowlist, no prompts, timeout, sub-path
+    // and link checks. The clone is read once and removed.
+    const fetched = fetchSource(src, { timeoutMs: opts.timeoutMs });
+    try {
+      return readIndexFile(path.join(fetched.dir, "index.json"));
+    } finally {
+      fetched.cleanup();
+    }
+  }
   const p = fs.existsSync(location) && fs.statSync(location).isDirectory() ? path.join(location, "index.json") : location;
+  return readIndexFile(p);
+}
+
+/** Read an index.json that is a regular file of at most 5 MB (links, devices and pipes are refused). */
+function readIndexFile(p: string): RegistryIndex {
   // lstat before reading: a device file (/dev/zero) or a named pipe would
   // otherwise be read until memory runs out or forever.
   let st: fs.Stats;
@@ -29,6 +77,88 @@ export async function loadRegistry(location: string): Promise<RegistryIndex> {
   if (!st.isFile()) throw new Error(`Registry index ${p} is not a regular file; refusing to read it.`);
   if (st.size > MAX_REGISTRY_BYTES) throw tooBigError(MAX_REGISTRY_BYTES);
   return normalize(JSON.parse(fs.readFileSync(p, "utf8")) as RegistryIndex);
+}
+
+/** A registry to load, with the folder a relative path location is read from. */
+interface RegistryPlan {
+  spec: RegistrySpec;
+  scope: LoadedRegistry["scope"];
+  root: string;
+  /** Set when the entry could not even be planned (an unreadable global manifest). */
+  error?: string;
+}
+
+/**
+ * The registries to search for this context, in order: the global manifest's,
+ * then the project's. A project entry with the name and location of a global one
+ * is the same registry (kept at the global position); with another location the
+ * project keeps the name and the global one is shown as `global:<name>`. When
+ * neither manifest lists any, the public registry.
+ */
+function planRegistries(ctx: Context): RegistryPlan[] {
+  const globalCtx = ctx.global ? ctx : makeContext({ global: true, home: ctx.home });
+  const plans: RegistryPlan[] = [];
+  try {
+    const gm = loadManifest(globalCtx);
+    if (listsRegistries(gm)) {
+      for (const spec of registriesOf(gm!)) plans.push({ spec, scope: "global", root: globalCtx.root });
+    }
+  } catch (e) {
+    plans.push({
+      spec: { name: "global manifest", location: path.join(globalCtx.root, "skillwharf.json") },
+      scope: "global",
+      root: globalCtx.root,
+      error: (e as Error).message,
+    });
+  }
+  let anyListed = plans.length > 0;
+  if (!ctx.global) {
+    const pm = loadManifest(ctx);
+    if (listsRegistries(pm)) {
+      anyListed = true;
+      for (const spec of registriesOf(pm!)) {
+        const clash = plans.find((p) => p.scope === "global" && p.spec.name === spec.name);
+        if (clash && clash.spec.location === spec.location) continue;
+        if (clash) clash.spec = { ...clash.spec, name: `global:${clash.spec.name}` };
+        plans.push({ spec, scope: "project", root: ctx.root });
+      }
+    }
+  }
+  if (!anyListed) plans.push({ spec: { name: "default", location: "default" }, scope: "project", root: ctx.root });
+  return plans;
+}
+
+/** A path location as a path: `~/` expands, a relative path is read from `root`. */
+function resolveLocation(location: string, root: string, home: string): string {
+  if (location === "default" || classifyLocation(location) !== "path") return location;
+  if (location === "~" || location.startsWith("~/")) return path.join(home || os.homedir(), location.slice(1));
+  return path.resolve(root, location);
+}
+
+/**
+ * Load every registry that applies, concurrently. A registry that fails to load
+ * is reported by name with the reason and does not hide the others. `only`
+ * replaces the manifests' lists (the `--registry` flag).
+ */
+export async function loadRegistries(
+  ctx: Context,
+  opts: { only?: RegistrySpec[]; timeoutMs?: number } = {},
+): Promise<LoadedRegistry[]> {
+  const plans: RegistryPlan[] = opts.only
+    ? opts.only.map((spec) => ({ spec, scope: "cli" as const, root: process.cwd() }))
+    : planRegistries(ctx);
+  return Promise.all(
+    plans.map(async (p): Promise<LoadedRegistry> => {
+      const head = { name: p.spec.name, location: p.spec.location, scope: p.scope };
+      if (p.error) return { ...head, error: sanitizeForTerminal(p.error) };
+      try {
+        const index = await loadRegistry(resolveLocation(p.spec.location, p.root, ctx.home), { timeoutMs: opts.timeoutMs });
+        return { ...head, index };
+      } catch (e) {
+        return { ...head, error: sanitizeForTerminal((e as Error).message) };
+      }
+    }),
+  );
 }
 
 /** Largest registry index that is read; a remote server could otherwise stream without end. */
