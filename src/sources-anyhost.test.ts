@@ -1454,6 +1454,7 @@ describe("Round A U2: the user's hooks and LFS are not run on a fetched tree", (
     fs.writeFileSync(path.join(hooks, "post-checkout"), `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
     fs.writeFileSync(path.join(base, "gitconfig"), `[core]\n\thooksPath = ${hooks}\n`);
     process.env.GIT_CONFIG_GLOBAL = path.join(base, "gitconfig");
+    process.env.GIT_CONFIG_NOSYSTEM = "1";
     // control: the hook is live for a plain git clone with this configuration
     git("clone", "--quiet", path.join(base, "srv", "acme", "skills.git"), path.join(base, "control"));
     expect(fs.existsSync(marker)).toBe(true);
@@ -1474,6 +1475,9 @@ describe("Round A U2: the user's hooks and LFS are not run on a fetched tree", (
     fs.writeFileSync(smudge, `#!/bin/sh\ntouch '${marker}'\ncat\n`, { mode: 0o755 });
     fs.writeFileSync(path.join(base, "gitconfig"), `[filter "lfs"]\n\tsmudge = ${smudge}\n\tclean = cat\n\trequired = true\n`);
     process.env.GIT_CONFIG_GLOBAL = path.join(base, "gitconfig");
+    // Only this configuration: a machine with git-lfs installed has its own system-wide filter,
+    // which would make the control clone below fail for a different reason.
+    process.env.GIT_CONFIG_NOSYSTEM = "1";
     git("clone", "--quiet", path.join(base, "srv", "acme", "skills.git"), path.join(base, "control"));
     expect(fs.existsSync(marker)).toBe(true); // control: the filter is live for a plain clone
     fs.rmSync(marker);
