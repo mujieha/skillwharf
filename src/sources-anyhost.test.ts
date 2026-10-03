@@ -1634,7 +1634,7 @@ describe("Round A D4: .git is recognised in any letter case", () => {
 });
 
 describe("Round A D1: a commit pin is exactly 40 hex characters", () => {
-  const MSG = /pin with the full 40-character commit sha \(or use a branch or tag name\)/;
+  const MSG = /a hex ref must be the full 40-character commit sha; for a tag or branch with that name write @refs\/tags\/<name> or @refs\/heads\/<name>/;
 
   it.each([
     "github:o/r@abc1234",
@@ -1684,6 +1684,80 @@ describe("Round A D1: a commit pin is exactly 40 hex characters", () => {
       JSON.stringify({ version: 1, skills: { a: { source: "github:o/r/a", resolved: "github:o/r/a@34040c9c5685", integrity: "sha256-x", installedAt: "x" } } }),
     );
     expect(() => syncSkills(ctx)).toThrow(/Cannot install the pinned commit for "a".*40-character/s);
+  });
+});
+
+describe("Round B A1: tags and branches with hex names are written @refs/tags/<name> and @refs/heads/<name>", () => {
+  const MSG = /a hex ref must be the full 40-character commit sha; for a tag or branch with that name write @refs\/tags\/<name> or @refs\/heads\/<name>/;
+
+  it.each([`github:o/r@${SHA}0`, `github:o/r@${SHA}${SHA.slice(0, 24)}`, "github:o/r@deadbeef", "github:o/r@abcdef0"])("refuses %s", (s) => {
+    expect(() => parseSource(s)).toThrow(MSG);
+  });
+
+  it.each(["refs/tags/deadbeef", "refs/heads/1a2b3c4", "refs/tags/v1.2.0", "refs/heads/feature/x"])("accepts @%s and never reads it as a pin", (ref) => {
+    const p = parseSource(`github:o/r/x@${ref}`);
+    expect(p).toMatchObject({ ref });
+    expect(isCommitSha(ref)).toBe(false);
+    expect(formatSource(p)).toBe(`github:o/r/x@${ref}`);
+  });
+
+  it.each(["refs/tags/", "refs/tags/-x", "refs/tags/a..b", "refs/tags/x.lock", "refs/remotes/origin/x", "refs/tags/x y"])("refuses the malformed %s", (ref) => {
+    expect(() => parseSource(`github:o/r/x@${ref}`)).toThrow();
+  });
+
+  it("fetches a tag named like a short sha by its full ref, at the tag's commit", () => {
+    makeRepo("acme/skills", (w) => {
+      writeSkill(path.join(w, "rn"), "rn", "first");
+      git("-C", w, "add", "-A");
+      git("-C", w, "commit", "--quiet", "-m", "first");
+      git("-C", w, "tag", "deadbeef");
+      git("-C", w, "branch", "1a2b3c4");
+      writeSkill(path.join(w, "rn"), "rn", "second");
+    });
+    routeHosts(ALL_HOSTS);
+    for (const ref of ["refs/tags/deadbeef", "refs/heads/1a2b3c4"]) {
+      const f = fetchSource(parseSource(`github:acme/skills//rn@${ref}`));
+      try {
+        expect(fs.readFileSync(path.join(f.dir, "SKILL.md"), "utf8")).toContain("first");
+        expect(f.resolved).toMatch(/^github:acme\/skills\/rn@[0-9a-f]{40}$/);
+      } finally {
+        f.cleanup();
+      }
+    }
+    const calls = exec.mock.calls.map((c) => withoutHardening(c[1] as string[]).join(" "));
+    expect(calls.some((c) => c.includes("fetch --depth 1 --quiet origin refs/tags/deadbeef"))).toBe(true);
+    expect(calls.some((c) => c.includes("--branch refs/"))).toBe(false);
+  });
+
+  it("add records the full ref and the lock pins the commit; sync reinstalls it", () => {
+    makeRepo("acme/skills", (w) => {
+      writeSkill(path.join(w, "rn"), "rn", "first");
+      git("-C", w, "add", "-A");
+      git("-C", w, "commit", "--quiet", "-m", "first");
+      git("-C", w, "tag", "deadbeef");
+      writeSkill(path.join(w, "rn"), "rn", "second");
+    });
+    routeHosts(ALL_HOSTS);
+    fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: {} }));
+    addSkill(ctx, "github:acme/skills/rn@refs/tags/deadbeef");
+    expect(loadManifest(ctx)!.skills.rn.source).toBe("github:acme/skills/rn@refs/tags/deadbeef");
+    expect(loadLock(ctx).skills.rn.resolved).toMatch(/^github:acme\/skills\/rn@[0-9a-f]{40}$/);
+    fs.rmSync(path.join(proj, ".skillwharf"), { recursive: true });
+    fs.rmSync(path.join(proj, ".claude"), { recursive: true });
+    expect(syncSkills(ctx).fetched).toEqual(["rn"]);
+    expect(fs.readFileSync(path.join(storePath(ctx, "rn"), "SKILL.md"), "utf8")).toContain("first");
+  });
+
+  it("a 0.1.x manifest pinned to a hex-named tag makes sync say which skill and what to write, with no git call", () => {
+    fs.copyFileSync(path.join(here, "fixtures", "v0.1", "hex-ref-manifest.json"), path.join(proj, "skillwharf.json"));
+    exec.mockClear();
+    expect(() => syncSkills(ctx)).toThrow(/Skill "tagged": .*a hex ref must be the full 40-character commit sha; for a tag or branch with that name write @refs\/tags\/<name> or @refs\/heads\/<name>/);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("update names the skill too", () => {
+    fs.copyFileSync(path.join(here, "fixtures", "v0.1", "hex-ref-manifest.json"), path.join(proj, "skillwharf.json"));
+    expect(() => updateSkills(ctx, ["tagged"])).toThrow(/Skill "tagged": .*a hex ref must be/);
   });
 });
 

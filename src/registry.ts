@@ -14,7 +14,7 @@ import {
   validateManifest,
 } from "./manifest.js";
 import { DEFAULT_GIT_TIMEOUT_MS } from "./git.js";
-import { fetchSource, parseSource } from "./source.js";
+import { ShortShaError, fetchSource, parseSource } from "./source.js";
 import type { Context, LoadedRegistry, Manifest, RegistryEntry, RegistryIndex, RegistrySpec, SearchHit } from "./types.js";
 import { assertSkillName, sanitizeForTerminal } from "./validate.js";
 
@@ -189,7 +189,13 @@ export async function loadRegistries(
       if (p.error) return { ...head, error: sanitizeForTerminal(p.error) };
       try {
         const index = await loadRegistry(resolveLocation(p.spec.location, p.root, ctx.home), { timeoutMs: opts.timeoutMs, deadline });
-        return { ...head, index };
+        const skipped = index.skippedHexRefs ?? [];
+        const hexNote =
+          skipped.length > 0
+            ? `registry ${p.spec.name}: ${skipped.length} ${skipped.length === 1 ? "entry" : "entries"} skipped: ${skipped.slice(0, 5).join(", ")}${skipped.length > 5 ? ` and ${skipped.length - 5} more` : ""} (a source ends in a hex ref that is not a full 40-character commit sha; for a tag or branch with that name the registry should write @refs/tags/<name> or @refs/heads/<name>)`
+            : undefined;
+        const note = [head.note, hexNote].filter(Boolean).join("; ");
+        return { ...head, ...(note ? { note } : {}), index };
       } catch (e) {
         return { ...head, error: sanitizeForTerminal((e as Error).message) };
       }
@@ -228,6 +234,11 @@ async function readCapped(res: Response, max: number): Promise<string> {
 
 function normalize(idx: RegistryIndex): RegistryIndex {
   const skills = Array.isArray(idx?.skills) ? idx.skills : [];
+  // Entries that are fine except for a hex ref (a 0.1.x registry may pin a tag called @deadbeef):
+  // not installable as written, so they are left out, but the user is told which and what to write.
+  const skippedHexRefs = skills
+    .filter((e) => e && typeof e.name === "string" && SKILL_NAME_RE.test(e.name) && typeof e.source === "string" && hasHexRef(e.source))
+    .map((e) => e.name);
   // Keep only well-formed entries; a registry is remote data, not trusted input.
   const clean = skills.filter(
     (e) =>
@@ -239,6 +250,7 @@ function normalize(idx: RegistryIndex): RegistryIndex {
   );
   return {
     version: 1,
+    ...(skippedHexRefs.length > 0 ? { skippedHexRefs } : {}),
     // Known fields only: whatever else an entry carries is not ours to pass on.
     skills: clean.map((e) => {
       const entry: RegistryEntry = {
@@ -251,6 +263,15 @@ function normalize(idx: RegistryIndex): RegistryIndex {
       return entry;
     }),
   };
+}
+
+function hasHexRef(s: string): boolean {
+  try {
+    parseSource(s);
+    return false;
+  } catch (e) {
+    return e instanceof ShortShaError;
+  }
 }
 
 /** A registry entry must name a git source on any host; a local path in someone else's index is never an install source. */

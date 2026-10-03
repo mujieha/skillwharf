@@ -261,7 +261,7 @@ function makeSource(a: {
     dotGit: a.dotGit,
     ...(a.shorthand ? { shorthand: a.shorthand } : {}),
     subpath: assertSubpath(a.sub),
-    ref: a.ref === undefined ? undefined : assertNotShortSha(assertGitRef(a.ref)),
+    ref: a.ref === undefined ? undefined : assertRef(a.ref),
     raw: a.raw,
   };
   return src;
@@ -272,13 +272,29 @@ export function isCommitSha(ref: string): boolean {
   return /^[0-9a-f]{40}$/i.test(ref);
 }
 
-/** A ref of 7 to 39 hex characters: neither a full commit pin nor something git can be asked for safely by that name. */
+/** An all-hex ref that is not exactly 40 characters: neither a full commit pin nor a name git can safely be asked for as a bare word. */
 export class ShortShaError extends Error {}
 
-function assertNotShortSha(ref: string): string {
-  if (/^[0-9a-f]{7,39}$/i.test(ref)) {
+/**
+ * The ref of a source. A bare ref is a branch or tag name, or (exactly 40 hex
+ * characters) a commit. Other hex strings (7-39 and 41-64) are refused: git reads
+ * them as names that anyone who can push to the repository can create, so they
+ * could stand in for a commit. A tag or branch that is really called that is
+ * written in full, `refs/tags/<name>` or `refs/heads/<name>`, which is never
+ * taken for a commit.
+ */
+function assertRef(ref: string): string {
+  assertGitRef(ref);
+  if (ref.startsWith("refs/")) {
+    const m = /^refs\/(?:tags|heads)\/(.+)$/.exec(ref);
+    if (!m || !m[1].split("/").every((c) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(c) && !c.endsWith(".") && !c.endsWith(".lock"))) {
+      throw new Error(`Invalid git ref "${ref}": a full ref is refs/tags/<name> or refs/heads/<name>`);
+    }
+    return ref;
+  }
+  if (/^(?:[0-9a-f]{7,39}|[0-9a-f]{41,64})$/i.test(ref)) {
     throw new ShortShaError(
-      `Invalid git ref "${ref}": pin with the full 40-character commit sha (or use a branch or tag name). Git reads a shorter hex string as a name, which anyone who can push to the repository can create.`,
+      `Invalid git ref "${ref}": a hex ref must be the full 40-character commit sha; for a tag or branch with that name write @refs/tags/<name> or @refs/heads/<name>`,
     );
   }
   return ref;
@@ -374,6 +390,15 @@ export function fetchSource(src: ParsedSource, opts: FetchOptions = {}): Fetched
   const url = cloneUrl(src);
   const git = (args: string[], contact = false) => runGit(args, { url, timeoutMs: opts.timeoutMs, deadline: opts.deadline, contact });
   const clone = (ref: string | undefined, into: string) => {
+    if (ref?.startsWith("refs/")) {
+      // A full ref (`refs/tags/x`): `clone --branch` takes names, not full refs, so fetch exactly it.
+      git(["init", "--quiet", into]);
+      git(["-C", into, "remote", "add", "--", "origin", url]);
+      git(["-C", into, "fetch", "--depth", "1", "--quiet", "origin", ref], true);
+      writeSafeAttributes(into);
+      git(["-C", into, "checkout", "--quiet", "FETCH_HEAD"]);
+      return;
+    }
     // No checkout until the attributes that switch a repository's own filter,
     // ident and eol settings off are in place (see SAFE_ATTRIBUTES).
     const args = ["clone", "--depth", "1", "--quiet", "--no-checkout"];

@@ -65,6 +65,8 @@ export interface RegistryEntry {
 export interface RegistryIndex {
   version: 1;
   skills: RegistryEntry[];
+  /** Names of entries left out because their source ends in a hex ref that is not a full commit sha. */
+  skippedHexRefs?: string[];
 }
 
 /** One registry after an attempt to load it: its index, or why it could not be loaded. */

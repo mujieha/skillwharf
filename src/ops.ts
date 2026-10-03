@@ -85,7 +85,14 @@ export function parseStoredSource(
   /** When given, a `path:` source may not overlap this skill's store or agent folders. */
   skill?: { m: Manifest; name: string },
 ): ParsedSource {
-  const p = parseSource(raw, ctx.root);
+  let p: ParsedSource;
+  try {
+    p = parseSource(raw, ctx.root);
+  } catch (e) {
+    // A 0.1.x manifest may pin a tag that is called like a short sha: say which skill, and what to write now.
+    if (e instanceof ShortShaError && skill) throw new Error(`Skill "${skill.name}": ${e.message}`);
+    throw e;
+  }
   if (p.kind === "path" && skill) assertSourceClear(ctx, skill.m, skill.name, raw, p.path);
   if (p.kind === "path" && !ctx.global && !opts.allowOutsidePaths) {
     const real = resolveLink(p.path);

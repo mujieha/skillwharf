@@ -370,6 +370,37 @@ describe("S2.1: the global list comes first, the project list after", () => {
 });
 
 // ------------------------------------------------------------------ Round B
+describe("Round B A1: registry entries pinned to a hex ref are reported, not silently dropped", () => {
+  it("names them in a note, keeps the rest, and says what to write", async () => {
+    const file = writeIndex(
+      path.join(base, "i.json"),
+      entry("good", "github:a/b/good"),
+      entry("tagged", "github:a/b/tagged@deadbeef"),
+      entry("other", "github:a/b/other@abcdef0123"),
+      entry("local", "path:/etc"),
+    );
+    const idx = await loadRegistry(file);
+    expect(idx.skills.map((s) => s.name)).toEqual(["good"]);
+    expect(idx.skippedHexRefs).toEqual(["tagged", "other"]);
+    const [r] = await loadRegistries(ctx, { only: [{ name: "reg", location: file }] });
+    expect(r.note).toMatch(/2 entries skipped: tagged, other.*hex ref.*@refs\/tags\/<name> or @refs\/heads\/<name>/);
+  });
+
+  it("an entry that writes the full ref is kept", async () => {
+    const file = writeIndex(path.join(base, "i.json"), entry("tagged", "github:a/b/tagged@refs/tags/deadbeef"));
+    const idx = await loadRegistry(file);
+    expect(idx.skills.map((s) => s.name)).toEqual(["tagged"]);
+    expect(idx.skippedHexRefs).toBeUndefined();
+  });
+
+  it("a registry full of such entries cannot flood the note", async () => {
+    const entries = Array.from({ length: 40 }, (_, i) => entry(`t${i}`, `github:a/b/x@deadbeef${i}`));
+    const file = writeIndex(path.join(base, "i.json"), ...entries);
+    const [r] = await loadRegistries(ctx, { only: [{ name: "reg", location: file }] });
+    expect(r.note).toMatch(/40 entries skipped: t0, t1, t2, t3, t4 and 35 more/);
+  });
+});
+
 describe("Round B A2: the name default belongs to the public registry", () => {
   it("validateManifest refuses a registry called default that points somewhere else", () => {
     const m = { version: 1, agents: ["claude"], skills: {}, registries: [{ name: "default", location: "https://evil.example/index.json" }] } as Manifest;
