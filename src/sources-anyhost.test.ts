@@ -9,6 +9,7 @@ import { hashDir } from "./fs.js";
 import { loadLock, loadManifest, makeContext, saveManifest, storePath } from "./manifest.js";
 import { addSkill, syncSkills, updateSkills } from "./ops.js";
 import { fetchSource, formatSource, parseSource, sourceKey } from "./source.js";
+import { placeSubmodules } from "./submodules.js";
 import type { Context, Lockfile, Manifest } from "./types.js";
 
 // Every git call goes through runGit; this wrapper records the calls and runs
@@ -746,5 +747,241 @@ describe("S1.18: a moved or missing repository", () => {
       expect(() => updateSkills(ctx, ["alpha"], { source: "git+https://u:p@git.acme.test/x.git" })).toThrow(/credential/);
       expect(gitCalls()).toEqual([]);
     });
+  });
+});
+
+// ------------------------------------------------------------------ S1.19 submodules
+/** A new commit on top of a bare repository's default branch; returns its sha. */
+function commitTo(repoPath: string, change: (work: string) => void): string {
+  const bare = path.join(base, "srv", `${repoPath}.git`);
+  const work = path.join(base, "work", String(repoCount++));
+  git("clone", "--quiet", bare, work);
+  change(work);
+  git("-C", work, "add", "-A");
+  git("-C", work, "commit", "--quiet", "-m", "more");
+  git("-C", work, "push", "--quiet", "origin", "HEAD");
+  return git("-C", work, "rev-parse", "HEAD");
+}
+
+/** Declare `p` a submodule of `w` at `sha` (a gitlink in the tree, an entry in .gitmodules), without cloning anything. */
+function addGitlink(w: string, p: string, sha: string): void {
+  fs.mkdirSync(path.join(w, p), { recursive: true });
+  git("-C", w, "update-index", "--add", "--cacheinfo", `160000,${sha},${p}`);
+}
+function writeGitmodules(w: string, entries: [string, string][]): void {
+  fs.writeFileSync(path.join(w, ".gitmodules"), entries.map(([p, u]) => `[submodule "${p}"]\n\tpath = ${p}\n\turl = ${u}\n`).join(""));
+}
+
+describe("S1.19: submodules, one level, pinned by the parent's recorded commit", () => {
+  const FAKE = "1234567890abcdef1234567890abcdef12345678";
+  const parentUrl = (sub: string, repo = "team/parent") => `git+https://git.acme.test/${repo}.git//${sub}`;
+  let childSha: string, collectionSha: string, parentSha: string, newerChildSha: string;
+
+  beforeEach(() => {
+    childSha = makeRepo("team/child-skill", (w) => writeSkill(w, "cs", "pinned content"));
+    collectionSha = makeRepo("team/collection", (w) => {
+      writeSkill(path.join(w, "skills", "pdf"), "pdf", "pdf body");
+      writeSkill(path.join(w, "skills", "ocr"), "ocr", "ocr body");
+    });
+    parentSha = makeRepo("team/parent", (w) => {
+      writeSkill(path.join(w, "own"), "own");
+      addGitlink(w, "vendor/child-skill", childSha);
+      addGitlink(w, "vendor/collection", collectionSha);
+      writeGitmodules(w, [
+        ["vendor/child-skill", "../child-skill.git"],
+        ["vendor/collection", "../collection.git"],
+      ]);
+    });
+    // The child moves on; the parent still records the old commit.
+    newerChildSha = commitTo("team/child-skill", (w) => writeSkill(w, "cs", "newer content"));
+    routeHosts(ALL_HOSTS);
+    exec.mockClear();
+  });
+
+  function fetched(sub: string, repo?: string) {
+    return fetchSource(parseSource(parentUrl(sub, repo)));
+  }
+
+  it("a sub-path that is a gitlink installs the child at the commit the parent records, not its newer head", () => {
+    expect(newerChildSha).not.toBe(childSha);
+    const f = fetched("vendor/child-skill");
+    try {
+      expect(fs.readFileSync(path.join(f.dir, "SKILL.md"), "utf8")).toContain("pinned content");
+      expect(fs.existsSync(path.join(f.dir, ".git"))).toBe(false);
+      expect(f.sha).toBe(parentSha);
+      expect(f.resolved).toBe(`git+https://git.acme.test/team/parent.git//vendor/child-skill@${parentSha}`);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("a sub-path that contains a gitlink finds the child's skills (add --all)", () => {
+    fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: {} }));
+    const added = addSkill(ctx, parentUrl("vendor/collection"), { all: true });
+    expect(added.map((a) => a.name).sort()).toEqual(["ocr", "pdf"]);
+    expect(loadManifest(ctx)!.skills.pdf.source).toBe("git+https://git.acme.test/team/parent.git//vendor/collection/skills/pdf");
+  });
+
+  it("a sub-path that passes through a gitlink installs the folder inside the child", () => {
+    const f = fetched("vendor/collection/skills/pdf");
+    try {
+      expect(fs.readFileSync(path.join(f.dir, "SKILL.md"), "utf8")).toContain("pdf body");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("sync from the lockfile reinstalls the same content", () => {
+    fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: {} }));
+    addSkill(ctx, parentUrl("vendor/collection/skills/pdf"));
+    const lock = loadLock(ctx).skills.pdf;
+    expect(lock.resolved).toBe(`git+https://git.acme.test/team/parent.git//vendor/collection/skills/pdf@${parentSha}`);
+    fs.rmSync(path.join(proj, ".skillwharf"), { recursive: true });
+    fs.rmSync(path.join(proj, ".claude"), { recursive: true });
+    expect(syncSkills(ctx).fetched).toEqual(["pdf"]);
+    expect(hashDir(storePath(ctx, "pdf"))).toBe(lock.integrity);
+  });
+
+  it("the child is fetched with the same guards as the parent", () => {
+    const f = fetched("vendor/child-skill");
+    f.cleanup();
+    const childUrl = "https://git.acme.test/team/child-skill.git";
+    const calls = exec.mock.calls.filter((c) => (c[1] as string[]).includes(childUrl) || (c[1] as string[]).includes(childSha));
+    expect(calls.map((c) => c[1])).toEqual(
+      expect.arrayContaining([
+        ["-C", expect.any(String), "remote", "add", "origin", childUrl],
+        ["-C", expect.any(String), "fetch", "--depth", "1", "--quiet", "origin", childSha],
+      ]),
+    );
+    for (const c of calls) {
+      const o = c[2] as Record<string, unknown>;
+      expect((o.env as Record<string, string>).GIT_ALLOW_PROTOCOL).toMatch(/^https:ssh/);
+      expect((o.env as Record<string, string>).GIT_TERMINAL_PROMPT).toBe("0");
+      expect((o.stdio as string[])[0]).toBe("ignore");
+      expect(o.timeout).toBe(120_000);
+    }
+  });
+
+  it("opens no submodule, and runs no extra git, for a repository without .gitmodules", () => {
+    makeRepo("team/plain", (w) => writeSkill(path.join(w, "rn"), "rn"));
+    exec.mockClear();
+    fetched("rn", "team/plain").cleanup();
+    expect(gitCalls().some((c) => c.includes("ls-tree"))).toBe(false);
+  });
+
+  it("an unreachable commit in the child names the child's URL and leaves no temp folder", () => {
+    const tmp = privateTmp();
+    makeRepo("team/broken", (w) => {
+      writeSkill(path.join(w, "own"), "own");
+      addGitlink(w, "vendor/x", FAKE);
+      writeGitmodules(w, [["vendor/x", "../child-skill.git"]]);
+    });
+    expect(() => fetched("vendor/x", "team/broken")).toThrow(/git fetch failed for https:\/\/git\.acme\.test\/team\/child-skill\.git/);
+    expect(fs.readdirSync(tmp)).toEqual([]);
+  });
+
+  describe("a .gitmodules URL is held to the source grammar", () => {
+    let n = 0;
+    it.each([
+      ["a local path", "/etc/passwd", /only https and ssh/],
+      ["file://", "file:///etc/passwd", /only https and ssh/],
+      ["git://", "git://git.acme.test/x.git", /only https and ssh/],
+      ["http://", "http://git.acme.test/x.git", /only https and ssh/],
+      ["ext::", "ext::sh -c touch% /tmp/x", /only https and ssh/],
+      ["credentials", "https://user:pw@git.acme.test/x.git", /credential/],
+      ["a relative URL that climbs out of the host", "../../../../escape.git", /climbs out/],
+    ])("refuses %s", (_name, url, why) => {
+      const repo = `team/bad${n++}`;
+      makeRepo(repo, (w) => {
+        addGitlink(w, "vendor/x", FAKE);
+        writeGitmodules(w, [["vendor/x", url]]);
+      });
+      let message = "";
+      try {
+        fetched("vendor/x", repo);
+      } catch (e) {
+        message = (e as Error).message;
+      }
+      expect(message).toMatch(/the submodule at "vendor\/x" has the URL/);
+      expect(message).toMatch(why);
+      expect(message).not.toContain(":pw@");
+      expect(gitCalls().some((c) => c.includes("fetch") && c.includes(FAKE))).toBe(false);
+    });
+  });
+
+  it("refuses a gitlink inside the child, naming the inner repository", () => {
+    const outer = makeRepo("team/outer", (w) => {
+      writeSkill(w, "outer");
+      addGitlink(w, "inner", FAKE);
+      writeGitmodules(w, [["inner", "https://git.acme.test/team/inner.git"]]);
+    });
+    makeRepo("team/with-nested", (w) => {
+      addGitlink(w, "vendor/outer", outer);
+      writeGitmodules(w, [["vendor/outer", "../outer.git"]]);
+    });
+    expect(() => fetched("vendor/outer", "team/with-nested")).toThrow(
+      /contains another submodule \("inner", https:\/\/git\.acme\.test\/team\/inner\.git\); only one level/,
+    );
+  });
+
+  it("refuses a gitlink that has no entry in .gitmodules", () => {
+    makeRepo("team/noentry", (w) => {
+      addGitlink(w, "vendor/x", FAKE);
+      addGitlink(w, "vendor/y", FAKE);
+      writeGitmodules(w, [["vendor/y", "../child-skill.git"]]);
+    });
+    expect(() => fetched("vendor/x", "team/noentry")).toThrow(/the submodule at "vendor\/x" has no entry for it in \.gitmodules/);
+  });
+
+  it("refuses a .gitmodules that is a symlink", () => {
+    // git itself refuses to `add` a symlinked .gitmodules, so the tree is built with plumbing.
+    const work = path.join(base, "work", "linked");
+    git("init", "--quiet", work);
+    writeGitmodules(work, [["x", "../child-skill.git"]]);
+    fs.renameSync(path.join(work, ".gitmodules"), path.join(base, "real-modules"));
+    fs.writeFileSync(path.join(base, "link-text"), "real-modules");
+    const modules = git("-C", work, "hash-object", "-w", path.join(base, "real-modules"));
+    const link = git("-C", work, "hash-object", "-w", path.join(base, "link-text"));
+    const tree = (
+      realExec.fn("git", ["-C", work, "mktree", "--missing"], {
+        input: `120000 blob ${link}\t.gitmodules\n100644 blob ${modules}\treal-modules\n160000 commit ${FAKE}\tx\n`,
+        stdio: ["pipe", "pipe", "pipe"],
+      }) as Buffer
+    )
+      .toString()
+      .trim();
+    const commit = git("-C", work, "commit-tree", tree, "-m", "one");
+    git("-C", work, "update-ref", "HEAD", commit);
+    const bare = path.join(base, "srv", "team", "linked.git");
+    fs.mkdirSync(path.dirname(bare), { recursive: true });
+    git("clone", "--quiet", "--bare", work, bare);
+    // Current git refuses to check such a file out at all; either way nothing is installed.
+    const tmp = privateTmp();
+    expect(() => fetched("x", "team/linked")).toThrow(/invalid path '\.gitmodules'|\.gitmodules is a symlink/);
+    expect(fs.readdirSync(tmp)).toEqual([]);
+  });
+
+  it("placeSubmodules itself refuses a symlinked .gitmodules before running git", () => {
+    const root = path.join(base, "plain-tree");
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(base, "elsewhere"), "[submodule]");
+    fs.symlinkSync(path.join(base, "elsewhere"), path.join(root, ".gitmodules"));
+    exec.mockClear();
+    expect(() =>
+      placeSubmodules(root, "x", { parentUrl: "https://git.acme.test/team/p.git", cloneUrlFor: (u) => u }),
+    ).toThrow(/\.gitmodules is a symlink/);
+    expect(gitCalls()).toEqual([]);
+  });
+
+  it("refuses more than 16 gitlinks under the sub-path", () => {
+    makeRepo("team/many", (w) => {
+      const entries: [string, string][] = [];
+      for (let i = 0; i < 17; i++) {
+        addGitlink(w, `vendor/m${i}`, FAKE);
+        entries.push([`vendor/m${i}`, "../child-skill.git"]);
+      }
+      writeGitmodules(w, entries);
+    });
+    expect(() => fetched("vendor", "team/many")).toThrow(/17 submodules under "vendor".*at most 16/);
   });
 });

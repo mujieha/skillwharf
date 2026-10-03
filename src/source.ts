@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { assertWithinLimits, copyDir, isDir, isInside, type SizeLimits } from "./fs.js";
 import { GitError, runGit } from "./git.js";
+import { placeSubmodules } from "./submodules.js";
 import { isSkillDir } from "./skill.js";
 import {
   assertGitRef,
@@ -374,6 +375,15 @@ export function fetchSource(src: ParsedSource, opts: FetchOptions = {}): Fetched
   let sha: string;
   try {
     sha = git(["-C", tmp, "rev-parse", "HEAD"]).trim();
+    placeSubmodules(tmp, src.subpath, {
+      parentUrl: url,
+      timeoutMs: opts.timeoutMs,
+      cloneUrlFor: (universal) => {
+        const p = parseSource(universal);
+        if (p.kind !== "git") throw new Error("not a git URL");
+        return cloneUrl(p);
+      },
+    });
     dir = resolveSubpath(tmp, src.subpath, repoLabel(src));
   } catch (e) {
     fs.rmSync(tmp, { recursive: true, force: true });
