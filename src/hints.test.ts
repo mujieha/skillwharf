@@ -280,6 +280,20 @@ describe("S3.6/S3.7: the README and SECURITY.md name what the code does", () => 
   });
 });
 
+describe("release: the version is 0.2.0 everywhere it is written", () => {
+  it("package.json, package-lock.json and --version agree", () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(repo, "package.json"), "utf8")) as { version: string };
+    const lock = JSON.parse(fs.readFileSync(path.join(repo, "package-lock.json"), "utf8")) as {
+      version: string;
+      packages: Record<string, { version?: string }>;
+    };
+    expect(pkg.version).toBe("0.2.0");
+    expect(lock.version).toBe("0.2.0");
+    expect(lock.packages[""].version).toBe("0.2.0");
+    expect(cli(["--version"]).stdout.trim()).toBe("0.2.0");
+  });
+});
+
 describe("S3.5: the package has no script that runs on install", () => {
   it("package.json lists no preinstall, install, postinstall or prepare script", () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(repo, "package.json"), "utf8")) as { scripts: Record<string, string> };

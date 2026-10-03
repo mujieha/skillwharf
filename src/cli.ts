@@ -34,7 +34,7 @@ import { daysAgo, scanClaudeUsage } from "./usage.js";
 import { sanitizeForTerminal, toSafeJson } from "./validate.js";
 import { REGISTRY_HELP, SOURCES_BLOCK, afterSearch, showHintOnce, usesDefaultOnly } from "./hints.js";
 
-const VERSION = "0.1.2";
+const VERSION = "0.2.0";
 
 const program = new Command()
   .name("skillwharf")
