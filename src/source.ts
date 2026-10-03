@@ -7,7 +7,9 @@ import {
   copyDir,
   copyResolvingLinks,
   findSymlinks,
+  inGitDir,
   isDir,
+  isGitName,
   isInside,
   type SizeLimits,
 } from "./fs.js";
@@ -259,14 +261,27 @@ function makeSource(a: {
     dotGit: a.dotGit,
     ...(a.shorthand ? { shorthand: a.shorthand } : {}),
     subpath: assertSubpath(a.sub),
-    ref: a.ref === undefined ? undefined : assertGitRef(a.ref),
+    ref: a.ref === undefined ? undefined : assertNotShortSha(assertGitRef(a.ref)),
     raw: a.raw,
   };
   return src;
 }
 
+/** A commit pin is exactly 40 hex characters. Shorter hex is a ref name to git, which a repository's owner can create. */
 export function isCommitSha(ref: string): boolean {
-  return /^[0-9a-f]{7,40}$/i.test(ref);
+  return /^[0-9a-f]{40}$/i.test(ref);
+}
+
+/** A ref of 7 to 39 hex characters: neither a full commit pin nor something git can be asked for safely by that name. */
+export class ShortShaError extends Error {}
+
+function assertNotShortSha(ref: string): string {
+  if (/^[0-9a-f]{7,39}$/i.test(ref)) {
+    throw new ShortShaError(
+      `Invalid git ref "${ref}": pin with the full 40-character commit sha (or use a branch or tag name). Git reads a shorter hex string as a name, which anyone who can push to the repository can create.`,
+    );
+  }
+  return ref;
 }
 
 function splitRef(spec: string): [string, string | undefined] {
@@ -500,15 +515,15 @@ export function discoverSkills(dir: string, opts: { root?: string; maxDepth?: nu
   const isSkill = (d: string) => (root !== undefined ? isSkillDirIn(d, root) : isSkillDir(d));
   if (isSkill(dir)) return [dir];
 
-  const realRoot = root !== undefined ? fs.realpathSync(root) : "";
-  const realWalk = inRepo ? fs.realpathSync(dir) : "";
+  const realRoot = root !== undefined ? fs.realpathSync.native(root) : "";
+  const realWalk = inRepo ? fs.realpathSync.native(dir) : "";
   const found: string[] = [];
   const followed = new Set<string>();
   let entries = 0;
   const walk = (d: string, depth: number) => {
     if (depth > maxDepth) return;
     for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-      if (e.name === "node_modules" || (inRepo ? e.name === ".git" : e.name.startsWith("."))) continue;
+      if (e.name === "node_modules" || (inRepo ? isGitName(e.name) : e.name.startsWith("."))) continue;
       entries += 1;
       if (entries > maxEntries) {
         throw new Error(
@@ -525,14 +540,14 @@ export function discoverSkills(dir: string, opts: { root?: string; maxDepth?: nu
         if (!inRepo) continue;
         let target: string;
         try {
-          target = fs.realpathSync(child);
+          target = fs.realpathSync.native(child);
           if (!fs.statSync(target).isDirectory()) continue;
         } catch {
           continue;
         }
         if (
           !isInside(realRoot, target) ||
-          path.relative(realRoot, target).split(path.sep).includes(".git") ||
+          inGitDir(path.relative(realRoot, target)) ||
           isInside(realWalk, target) ||
           isInside(target, realWalk) ||
           followed.has(target)

@@ -148,9 +148,18 @@ function tooManyBytes(dir: string, maxBytes: number): Error {
   );
 }
 
-/** True when `p` is, or lies below, a `.git` folder. */
-function inGitDir(p: string): boolean {
-  return p.split(path.sep).includes(".git");
+/** True for a path component that is `.git` in any letter case (and the look-alike forms a file system folds to it). */
+export function isGitName(name: string): boolean {
+  return name.normalize("NFKC").toLowerCase() === ".git";
+}
+
+/**
+ * True when `p` is, or lies below, a `.git` folder. Components are compared
+ * without regard to case: on a case-insensitive file system `.GIT` is the same
+ * folder as `.git`, and a real path can come back in either spelling.
+ */
+export function inGitDir(p: string): boolean {
+  return p.split(/[\\/]/).some(isGitName);
 }
 
 /**
@@ -167,8 +176,8 @@ function inGitDir(p: string): boolean {
 export function copyResolvingLinks(src: string, dest: string, opts: { root: string; limits?: SizeLimits }): { dropped: string[] } {
   const maxFiles = opts.limits?.maxFiles ?? DEFAULT_MAX_FILES;
   const maxBytes = opts.limits?.maxBytes ?? DEFAULT_MAX_BYTES;
-  const realRoot = fs.realpathSync(opts.root);
-  const realSrc = fs.realpathSync(src);
+  const realRoot = fs.realpathSync.native(opts.root);
+  const realSrc = fs.realpathSync.native(src);
   if (!isInside(realRoot, realSrc) || inGitDir(path.relative(realRoot, realSrc))) {
     throw new Error(`${path.basename(src)} resolves outside the fetched repository; refusing it.`);
   }
@@ -199,7 +208,7 @@ export function copyResolvingLinks(src: string, dest: string, opts: { root: stri
   const walk = (from: string, to: string, rel: string, chain: string[]) => {
     fs.mkdirSync(to, { recursive: true });
     for (const e of fs.readdirSync(from, { withFileTypes: true })) {
-      if (e.name === ".git") continue;
+      if (isGitName(e.name)) continue;
       const childFrom = path.join(from, e.name);
       const childTo = path.join(to, e.name);
       const childRel = rel ? `${rel}/${e.name}` : e.name;
@@ -207,7 +216,7 @@ export function copyResolvingLinks(src: string, dest: string, opts: { root: stri
         let target: string;
         let st: fs.Stats;
         try {
-          target = fs.realpathSync(childFrom);
+          target = fs.realpathSync.native(childFrom);
           st = fs.statSync(target);
         } catch {
           dropped.push(childRel); // a broken link
@@ -226,7 +235,7 @@ export function copyResolvingLinks(src: string, dest: string, opts: { root: stri
         }
       } else if (e.isDirectory()) {
         count(undefined);
-        walk(childFrom, childTo, childRel, [...chain, fs.realpathSync(childFrom)]);
+        walk(childFrom, childTo, childRel, [...chain, fs.realpathSync.native(childFrom)]);
       } else if (e.isFile()) {
         copyFile(childFrom, childTo, fs.lstatSync(childFrom));
       }

@@ -31,6 +31,7 @@ import { GitError } from "./git.js";
 import { loadRegistries, resolveRegistryName } from "./registry.js";
 import {
   PinUnavailable,
+  ShortShaError,
   discoverSkills,
   fetchSource,
   formatSource,
@@ -208,7 +209,11 @@ function lockedSource(ctx: Context, m: Manifest, name: string, spec: SkillSpec, 
   let got: ParsedSource;
   try {
     got = parseSource(entry.resolved, ctx.root);
-  } catch {
+  } catch (e) {
+    // A 0.1.x lock may pin an abbreviated sha: that is an unusable pin, not a different source.
+    if (e instanceof ShortShaError) {
+      throw new UnusablePin(`${LOCKFILE}: "${name}" is pinned to an abbreviated sha, not a full 40-character commit sha.`);
+    }
     throw mismatch();
   }
   if (want.kind === "git") {

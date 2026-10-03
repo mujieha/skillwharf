@@ -5,10 +5,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { allowProtocolsForTests, gitEnv, runGit, setGitExecForTests } from "./git.js";
-import { copyDir, hashDir } from "./fs.js";
+import { copyDir, copyResolvingLinks, hashDir, inGitDir } from "./fs.js";
+import { isSkillDirIn } from "./skill.js";
 import { loadLock, loadManifest, makeContext, saveManifest, storePath } from "./manifest.js";
 import { addSkill, syncSkills, updateSkills } from "./ops.js";
-import { discoverSkills, discoveryBound, fetchSource, formatSource, parseSource, sourceKey } from "./source.js";
+import { discoverSkills, discoveryBound, fetchSource, formatSource, isCommitSha, parseSource, sourceKey } from "./source.js";
 import { innerRepository, placeSubmodules } from "./submodules.js";
 import type { Context, Lockfile, Manifest } from "./types.js";
 
@@ -1503,6 +1504,115 @@ describe("Round A U3: links inside a submodule survive being placed into the par
     const copy = path.join(storePath(ctx, "cs"), "alias.txt");
     expect(fs.readFileSync(copy, "utf8")).toBe("real content");
     expect(fs.lstatSync(copy).isFile()).toBe(true);
+  });
+});
+
+describe("Round A D4: .git is recognised in any letter case", () => {
+  it.each([
+    [".git/config", true],
+    [".GIT/config", true],
+    ["a/.Git/x", true],
+    ["a/.gIt", true],
+    ["a/x.git/y", false],
+    ["a/.github/y", false],
+    ["a/git/y", false],
+    ["", false],
+  ])("inGitDir(%s) is %s", (p, want) => {
+    expect(inGitDir(p.split("/").join(path.sep))).toBe(want);
+  });
+
+  it("copyResolvingLinks drops a link into .GIT", () => {
+    const root = path.join(base, "r");
+    fs.mkdirSync(path.join(root, ".GIT"), { recursive: true });
+    fs.writeFileSync(path.join(root, ".GIT", "config"), "[core]");
+    writeSkill(path.join(root, "skill"), "s");
+    fs.symlinkSync("../.GIT/config", path.join(root, "skill", "cfg"));
+    const { dropped } = copyResolvingLinks(path.join(root, "skill"), path.join(base, "out"), { root });
+    expect(dropped).toEqual(["cfg"]);
+    expect(fs.existsSync(path.join(base, "out", "cfg"))).toBe(false);
+  });
+
+  it("a link written as .GIT/config to a real .git folder is dropped too, on a case-insensitive file system", (ctxt) => {
+    const root = path.join(base, "r");
+    fs.mkdirSync(path.join(root, ".git"), { recursive: true });
+    fs.writeFileSync(path.join(root, ".git", "config"), "[core]");
+    if (fs.existsSync(path.join(root, ".GIT"))) {
+      writeSkill(path.join(root, "skill"), "s");
+      fs.symlinkSync("../.GIT/config", path.join(root, "skill", "cfg"));
+      expect(copyResolvingLinks(path.join(root, "skill"), path.join(base, "out"), { root }).dropped).toEqual(["cfg"]);
+    } else {
+      ctxt.skip(); // a case-sensitive file system: .GIT is not .git there, and the pure tests above cover the rule
+    }
+  });
+
+  it("a SKILL.md that links into .GIT is not a skill", () => {
+    const root = path.join(base, "r");
+    fs.mkdirSync(path.join(root, ".GIT"), { recursive: true });
+    fs.writeFileSync(path.join(root, ".GIT", "SKILL.md"), "---\nname: x\ndescription: d\n---\n");
+    fs.mkdirSync(path.join(root, "skill"));
+    fs.symlinkSync("../.GIT/SKILL.md", path.join(root, "skill", "SKILL.md"));
+    expect(isSkillDirIn(path.join(root, "skill"), root)).toBe(false);
+  });
+
+  it("discovery does not look inside a folder called .GIT", () => {
+    const root = path.join(base, "r");
+    writeSkill(path.join(root, ".GIT", "skills", "g"), "g");
+    writeSkill(path.join(root, "real"), "real");
+    expect(discoverSkills(root, { root }).map((d) => path.relative(root, d))).toEqual(["real"]);
+  });
+});
+
+describe("Round A D1: a commit pin is exactly 40 hex characters", () => {
+  const MSG = /pin with the full 40-character commit sha \(or use a branch or tag name\)/;
+
+  it.each([
+    "github:o/r@abc1234",
+    `github:o/r/x@${SHA.slice(0, 39)}`,
+    "gitlab:a/b/c//x@ABCDEF1",
+    "bitbucket:a/b/x@1a2b3c4",
+    "git+https://h.example/r.git//x@abc1234",
+    "https://github.com/o/r/tree/abc1234/x",
+  ])("refuses %s at parse time", (source) => {
+    expect(() => parseSource(source)).toThrow(MSG);
+  });
+
+  it("accepts the full sha, and ref names that merely contain hex", () => {
+    expect(parseSource(`github:o/r@${SHA}`)).toMatchObject({ ref: SHA });
+    expect(parseSource(`github:o/r@${SHA.toUpperCase()}`)).toMatchObject({ ref: SHA.toUpperCase() });
+    for (const ref of ["v1234567", "release-1234567", "1234567-fix", "main", "abc123"]) {
+      expect(() => parseSource(`github:o/r@${ref}`)).not.toThrow();
+    }
+  });
+
+  it("isCommitSha is true only for 40 hex characters", () => {
+    expect(isCommitSha(SHA)).toBe(true);
+    expect(isCommitSha(SHA.slice(0, 39))).toBe(false);
+    expect(isCommitSha("abc1234")).toBe(false);
+  });
+
+  it("add and update --source refuse a 7-hex ref before any git call", () => {
+    fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: { a: { source: "github:o/r/a" } } }));
+    exec.mockClear();
+    expect(() => addSkill(ctx, "github:acme/skills/alpha@abc1234")).toThrow(MSG);
+    expect(() => updateSkills(ctx, ["a"], { source: "github:acme/skills/alpha@abc1234" })).toThrow(MSG);
+    expect(gitCalls()).toEqual([]);
+  });
+
+  it("a branch that a repository owner named like a short sha is not installed under a pin", () => {
+    // The scenario of the finding: `@1a2b3c4` used to take the pinned path, where git reads short hex as a ref name.
+    const sha = makeRepo("acme/skills", (w) => writeSkill(path.join(w, "rn"), "real"));
+    git("-C", path.join(base, "srv", "acme", "skills.git"), "branch", "1a2b3c4", sha);
+    routeHosts(ALL_HOSTS);
+    expect(() => fetchSource(parseSource("github:acme/skills//rn@1a2b3c4"))).toThrow(MSG);
+  });
+
+  it("a 0.1.x lock that holds an abbreviated pin is still reported as an unusable pin, not as a mismatch", () => {
+    fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: { a: { source: "github:o/r/a" } } }));
+    fs.writeFileSync(
+      path.join(proj, "skillwharf.lock.json"),
+      JSON.stringify({ version: 1, skills: { a: { source: "github:o/r/a", resolved: "github:o/r/a@34040c9c5685", integrity: "sha256-x", installedAt: "x" } } }),
+    );
+    expect(() => syncSkills(ctx)).toThrow(/Cannot install the pinned commit for "a".*40-character/s);
   });
 });
 

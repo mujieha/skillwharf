@@ -52,7 +52,9 @@ describe("parseSource", () => {
     expect(() => parseSource("github:acme")).toThrow();
   });
   it("detects commit shas", () => {
-    expect(isCommitSha("34040c9c5685")).toBe(true);
+    // A commit pin is the full 40 characters: shorter hex is a ref name to git (a branch or tag can be called that).
+    expect(isCommitSha("34040c9c568585f6929bedeaad110ad08f079624")).toBe(true);
+    expect(isCommitSha("34040c9c5685")).toBe(false);
     expect(isCommitSha("main")).toBe(false);
     expect(isCommitSha("v1.2.0")).toBe(false);
   });

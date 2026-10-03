@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import YAML from "yaml";
-import { isInside } from "./fs.js";
+import { inGitDir, isInside } from "./fs.js";
 import type { SkillMeta } from "./types.js";
 
 const FM_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
@@ -75,9 +75,9 @@ export function isSkillDirIn(dir: string, root: string): boolean {
   try {
     const file = path.join(dir, "SKILL.md");
     if (!fs.lstatSync(file).isSymbolicLink()) return false;
-    const realRoot = fs.realpathSync(root);
-    const real = fs.realpathSync(file);
-    return isInside(realRoot, real) && !path.relative(realRoot, real).split(path.sep).includes(".git") && fs.statSync(real).isFile();
+    const realRoot = fs.realpathSync.native(root);
+    const real = fs.realpathSync.native(file);
+    return isInside(realRoot, real) && !inGitDir(path.relative(realRoot, real)) && fs.statSync(real).isFile();
   } catch {
     return false;
   }
