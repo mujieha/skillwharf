@@ -127,21 +127,119 @@ export function assertWithinLimits(dir: string, limits: SizeLimits = {}): void {
       if (e.isDirectory()) stack.push(p);
       else if (!e.isFile()) continue;
       entries += 1;
-      if (entries > maxFiles) {
-        throw new Error(
-          `${path.basename(dir)}: more than ${maxFiles} files and folders; refusing to install it. Raise the cap with --max-skill-files <n> if you trust it.`,
-        );
-      }
+      if (entries > maxFiles) throw tooManyEntries(dir, maxFiles);
       if (e.isFile()) {
         bytes += fs.lstatSync(p).size;
-        if (bytes > maxBytes) {
-          throw new Error(
-            `${path.basename(dir)}: more than ${formatBytes(maxBytes)} of files; refusing to install it. Raise the cap with --max-skill-size <mb> if you trust it.`,
-          );
-        }
+        if (bytes > maxBytes) throw tooManyBytes(dir, maxBytes);
       }
     }
   }
+}
+
+function tooManyEntries(dir: string, maxFiles: number): Error {
+  return new Error(
+    `${path.basename(dir)}: more than ${maxFiles} files and folders; refusing to install it. Raise the cap with --max-skill-files <n> if you trust it.`,
+  );
+}
+
+function tooManyBytes(dir: string, maxBytes: number): Error {
+  return new Error(
+    `${path.basename(dir)}: more than ${formatBytes(maxBytes)} of files; refusing to install it. Raise the cap with --max-skill-size <mb> if you trust it.`,
+  );
+}
+
+/** True when `p` is, or lies below, a `.git` folder. */
+function inGitDir(p: string): boolean {
+  return p.split(path.sep).includes(".git");
+}
+
+/**
+ * Copy a skill folder out of a fetched repository, following the links that
+ * stay inside it. A link whose real target lies inside `root` (the fetched
+ * repository) and outside every `.git` folder is copied as the file or folder
+ * it points to; any other link (outside, into `.git`, broken, or to a special
+ * file) is dropped and its path returned. A folder link that leads back into a
+ * folder being copied is a cycle and is refused. Every entry and byte of the
+ * resolved content counts against the size cap while it is copied, so links
+ * cannot multiply a folder past it, and nothing is left behind on failure.
+ * `src` itself is resolved the same way (it may be a link found by discovery).
+ */
+export function copyResolvingLinks(src: string, dest: string, opts: { root: string; limits?: SizeLimits }): { dropped: string[] } {
+  const maxFiles = opts.limits?.maxFiles ?? DEFAULT_MAX_FILES;
+  const maxBytes = opts.limits?.maxBytes ?? DEFAULT_MAX_BYTES;
+  const realRoot = fs.realpathSync(opts.root);
+  const realSrc = fs.realpathSync(src);
+  if (!isInside(realRoot, realSrc) || inGitDir(path.relative(realRoot, realSrc))) {
+    throw new Error(`${path.basename(src)} resolves outside the fetched repository; refusing it.`);
+  }
+  if (pathsOverlap(realSrc, dest)) {
+    throw new Error(`Refusing to copy ${src} onto ${dest}: the two folders overlap.`);
+  }
+  fs.rmSync(dest, { recursive: true, force: true });
+  const dropped: string[] = [];
+  let entries = 0;
+  let bytes = 0;
+  const count = (size: number | undefined) => {
+    entries += 1;
+    if (entries > maxFiles) throw tooManyEntries(src, maxFiles);
+    if (size !== undefined) {
+      bytes += size;
+      if (bytes > maxBytes) throw tooManyBytes(src, maxBytes);
+    }
+  };
+
+  const copyFile = (from: string, to: string, st: fs.Stats) => {
+    count(st.size);
+    fs.copyFileSync(from, to);
+    fs.chmodSync(to, st.mode & 0o777);
+  };
+
+  // `chain` holds the real path of every folder on the way down to here: a link
+  // back to one of them would be followed forever.
+  const walk = (from: string, to: string, rel: string, chain: string[]) => {
+    fs.mkdirSync(to, { recursive: true });
+    for (const e of fs.readdirSync(from, { withFileTypes: true })) {
+      if (e.name === ".git") continue;
+      const childFrom = path.join(from, e.name);
+      const childTo = path.join(to, e.name);
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isSymbolicLink()) {
+        let target: string;
+        let st: fs.Stats;
+        try {
+          target = fs.realpathSync(childFrom);
+          st = fs.statSync(target);
+        } catch {
+          dropped.push(childRel); // a broken link
+          continue;
+        }
+        if (!isInside(realRoot, target) || inGitDir(path.relative(realRoot, target))) {
+          dropped.push(childRel);
+        } else if (st.isDirectory()) {
+          if (chain.includes(target)) throw new Error(`symlink cycle at ${childRel}: it points back into a folder that is being copied; refusing it.`);
+          count(undefined);
+          walk(target, childTo, childRel, [...chain, target]);
+        } else if (st.isFile()) {
+          copyFile(target, childTo, st);
+        } else {
+          dropped.push(childRel);
+        }
+      } else if (e.isDirectory()) {
+        count(undefined);
+        walk(childFrom, childTo, childRel, [...chain, fs.realpathSync(childFrom)]);
+      } else if (e.isFile()) {
+        copyFile(childFrom, childTo, fs.lstatSync(childFrom));
+      }
+    }
+  };
+
+  try {
+    walk(realSrc, dest, "", [realSrc]);
+  } catch (e) {
+    fs.rmSync(dest, { recursive: true, force: true });
+    throw e;
+  }
+  return { dropped: dropped.sort() };
 }
 
 /**

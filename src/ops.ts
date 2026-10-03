@@ -37,6 +37,7 @@ import {
   isCommitSha,
   parseSource,
   sourceKey,
+  stageSkill,
   type FetchOptions,
   type Fetched,
   type ParsedSource,
@@ -320,11 +321,23 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
   const lock = loadLock(ctx);
   const parsed = parseSource(sourceRaw);
   const fetched = fetchFor(parsed, opts);
+  // Skills from a git repository are copied into a staging folder first (see
+  // stageSkill), so the size cap, the link rule and the metadata all apply to
+  // what would actually be installed, and before anything is written.
+  let stagingRoot: string | undefined;
   try {
-    let dirs = discoverSkills(fetched.dir);
+    const dirs = discoverSkills(fetched.dir, { root: fetched.root });
     if (dirs.length === 0) throw new Error(`No SKILL.md found under ${sourceRaw}`);
     if (dirs.length > 1 && !opts.all) {
-      const names = dirs.map((d) => readSkill(d).name).join(", ");
+      const names = dirs
+        .map((d) => {
+          try {
+            return readSkill(d).name;
+          } catch {
+            return path.basename(d); // e.g. a SKILL.md that is a link inside the repository
+          }
+        })
+        .join(", ");
       throw new Error(
         `Source contains ${dirs.length} skills (${names}). Point at one sub-folder, or pass --all to install every skill.`,
       );
@@ -337,7 +350,7 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
     const multi = dirs.length > 1;
     const skipped: SkippedSkill[] = [];
     const seen = new Set<string>();
-    const plan = dirs.flatMap((dir) => {
+    const plan = dirs.flatMap((dir, index) => {
       // The source recorded for this skill. In a multi-skill source it is built
       // from the folder name, so it has to pass the same checks as a typed one:
       // `skills/x@y` would re-parse as branch `y`, and `skills/my skill` would
@@ -381,7 +394,17 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
         sourceForManifest = parsed.raw;
       }
 
-      const meta = readSkill(dir);
+      // A git skill is read from its staged copy (the folder as it would be
+      // installed); the staged folder keeps the original's name for the
+      // metadata fallback. A local folder is read in place.
+      let stagedDir: string | undefined;
+      let dropped: string[] | undefined;
+      if (fetched.root) {
+        stagingRoot ??= fs.mkdtempSync(path.join(os.tmpdir(), "skillwharf-stage-"));
+        stagedDir = path.join(stagingRoot, String(index), path.basename(dir));
+        dropped = stageSkill(dir, stagedDir, { root: fetched.root, limits: opts.limits }).dropped;
+      }
+      const meta = readSkill(stagedDir ?? dir);
       const name = normalizeName(opts.name ?? meta.name);
       if (seen.has(name)) throw new Error(`Two skills in ${sourceRaw} resolve to the name "${name}". Install them one at a time with --name.`);
       seen.add(name);
@@ -409,8 +432,20 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
           throw new Error(`${g.target} already exists and is not managed by skillwharf. Move it away, or re-run with --force.`);
         }
       }
-      assertWithinLimits(dir, opts.limits);
-      return [{ dir, meta, name, store, agentList, targets, sourceForManifest, resolved, skippedSymlinks: findSymlinks(dir) }];
+      if (!stagedDir) assertWithinLimits(dir, opts.limits);
+      return [
+        {
+          dir: stagedDir ?? dir,
+          meta,
+          name,
+          store,
+          agentList,
+          targets,
+          sourceForManifest,
+          resolved,
+          skippedSymlinks: dropped ?? findSymlinks(dir),
+        },
+      ];
     });
     if (plan.length === 0) {
       throw new Error(
@@ -443,6 +478,7 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
     return results;
   } finally {
     fetched.cleanup();
+    if (stagingRoot) removePath(stagingRoot);
   }
 }
 
@@ -572,12 +608,27 @@ export function syncSkills(ctx: Context, opts: SyncOptions = {}): SyncReport {
         fetched = fetchFor(source, opts, name);
       }
       try {
-        const dirs = discoverSkills(fetched.dir);
+        const dirs = discoverSkills(fetched.dir, { root: fetched.root });
         if (dirs.length !== 1) throw new Error(`Expected exactly one skill at ${spec.source}, found ${dirs.length}`);
         stagingRoot ??= fs.mkdtempSync(path.join(os.tmpdir(), "skillwharf-stage-"));
-        const dir = path.join(stagingRoot, name);
-        installToStore(dirs[0], dir, opts.limits);
-        const integrity = hashDir(dir);
+        let dir = path.join(stagingRoot, name);
+        stageSkill(dirs[0], dir, { root: fetched.root, limits: opts.limits });
+        let integrity = hashDir(dir);
+        if (pinnedIntegrity !== undefined && integrity !== pinnedIntegrity && fetched.root) {
+          // A lockfile written by 0.1.x hashed the folder with every link left
+          // out. The pin decides: if that older rule reproduces it exactly, that
+          // is what was pinned, and it is the stricter of the two rules.
+          const old = path.join(stagingRoot, `${name}.0.1`);
+          try {
+            stageSkill(dirs[0], old, { root: fetched.root, limits: opts.limits, legacy: true });
+            if (hashDir(old) === pinnedIntegrity) {
+              dir = old;
+              integrity = pinnedIntegrity;
+            }
+          } catch {
+            /* the old rule does not fit either: report the mismatch below */
+          }
+        }
         if (pinnedIntegrity !== undefined && integrity !== pinnedIntegrity) {
           throw new Error(
             `integrity mismatch for "${name}": the pinned content hashes to ${integrity}, the lockfile expects ${pinnedIntegrity}. ` +
@@ -711,11 +762,11 @@ export function updateSkills(ctx: Context, only?: string[], opts: UpdateOptions 
     for (const { name, spec, parsed } of plan) {
       const fetched = fetchFor(parsed, opts, name);
       try {
-        const dirs = discoverSkills(fetched.dir);
+        const dirs = discoverSkills(fetched.dir, { root: fetched.root });
         if (dirs.length !== 1) throw new Error(`Expected exactly one skill at ${spec.source}, found ${dirs.length}`);
         stagingRoot ??= fs.mkdtempSync(path.join(os.tmpdir(), "skillwharf-stage-"));
         const dir = path.join(stagingRoot, name);
-        installToStore(dirs[0], dir, opts.limits);
+        stageSkill(dirs[0], dir, { root: fetched.root, limits: opts.limits });
         staged.set(name, { dir, resolved: fetched.resolved, integrity: hashDir(dir), version: readSkill(dir).version });
       } finally {
         fetched.cleanup();

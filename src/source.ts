@@ -1,10 +1,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { assertWithinLimits, copyDir, isDir, isInside, type SizeLimits } from "./fs.js";
+import { assertWithinLimits, copyDir, copyResolvingLinks, findSymlinks, isDir, isInside, type SizeLimits } from "./fs.js";
 import { GitError, runGit } from "./git.js";
 import { placeSubmodules } from "./submodules.js";
-import { isSkillDir } from "./skill.js";
+import { isSkillDir, isSkillDirIn } from "./skill.js";
 import {
   assertGitRef,
   assertGithubOwner,
@@ -468,15 +468,17 @@ function resolveSubpath(root: string, sub: string, label: string): string {
  * A fetched directory may itself be a skill, or a folder of skills
  * (e.g. a repo root with skills/<name>/SKILL.md). Returns skill dirs found.
  */
-export function discoverSkills(dir: string, maxDepth = 2): string[] {
-  if (isSkillDir(dir)) return [dir];
+export function discoverSkills(dir: string, opts: { root?: string; maxDepth?: number } = {}): string[] {
+  const maxDepth = opts.maxDepth ?? 2;
+  const isSkill = (d: string) => (opts.root ? isSkillDirIn(d, opts.root) : isSkillDir(d));
+  if (isSkill(dir)) return [dir];
   const found: string[] = [];
   const walk = (d: string, depth: number) => {
     if (depth > maxDepth) return;
     for (const e of fs.readdirSync(d, { withFileTypes: true })) {
       if (!e.isDirectory() || e.name.startsWith(".") || e.name === "node_modules") continue;
       const child = path.join(d, e.name);
-      if (isSkillDir(child)) found.push(child);
+      if (isSkill(child)) found.push(child);
       else walk(child, depth + 1);
     }
   };
@@ -488,4 +490,21 @@ export function discoverSkills(dir: string, maxDepth = 2): string[] {
 export function installToStore(fromDir: string, storeDir: string, limits?: SizeLimits): void {
   assertWithinLimits(fromDir, limits);
   copyDir(fromDir, storeDir);
+}
+
+/**
+ * Copy a skill found in a fetch into a staging folder, checking the size cap
+ * on what is actually written. A skill from a git repository (`root` given)
+ * keeps the content of links that stay inside the repository (see
+ * copyResolvingLinks) and reports the links it dropped; a local folder, or
+ * `legacy` (the 0.1.x rule), drops every link.
+ */
+export function stageSkill(
+  dir: string,
+  dest: string,
+  opts: { root?: string; limits?: SizeLimits; legacy?: boolean } = {},
+): { dropped: string[] } {
+  if (opts.root && !opts.legacy) return copyResolvingLinks(dir, dest, { root: opts.root, limits: opts.limits });
+  installToStore(dir, dest, opts.limits);
+  return { dropped: findSymlinks(dir) };
 }

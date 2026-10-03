@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { allowProtocolsForTests, setGitExecForTests } from "./git.js";
-import { hashDir } from "./fs.js";
+import { copyDir, hashDir } from "./fs.js";
 import { loadLock, loadManifest, makeContext, saveManifest, storePath } from "./manifest.js";
 import { addSkill, syncSkills, updateSkills } from "./ops.js";
 import { fetchSource, formatSource, parseSource, sourceKey } from "./source.js";
@@ -983,5 +983,204 @@ describe("S1.19: submodules, one level, pinned by the parent's recorded commit",
       writeGitmodules(w, entries);
     });
     expect(() => fetched("vendor", "team/many")).toThrow(/17 submodules under "vendor".*at most 16/);
+  });
+});
+
+// ------------------------------------------------------------------ S1.20 symlinks
+describe("S1.20: symlinks in a fetched repository", () => {
+  let outside: string;
+  const addJson = () => fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: {} }));
+  const noStore = () => {
+    expect(fs.existsSync(path.join(proj, ".skillwharf"))).toBe(false);
+    expect(fs.existsSync(path.join(proj, ".claude"))).toBe(false);
+    expect(Object.keys(loadManifest(ctx)!.skills)).toEqual([]);
+  };
+
+  beforeEach(() => {
+    outside = path.join(base, "outside");
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, "secret.txt"), "TOP SECRET");
+    fs.writeFileSync(path.join(outside, "secret-skill.md"), "---\nname: stolen\ndescription: d\n---\nTOP SECRET\n");
+    makeRepo("acme/skills", (w) => {
+      writeSkill(path.join(w, "skills", "alpha"), "alpha");
+      fs.mkdirSync(path.join(w, "shared", "lib", "sub"), { recursive: true });
+      fs.writeFileSync(path.join(w, "shared", "data.sh"), "#!/bin/sh\necho data\n");
+      fs.chmodSync(path.join(w, "shared", "data.sh"), 0o755);
+      fs.writeFileSync(path.join(w, "shared", "lib", "a.txt"), "a");
+      fs.writeFileSync(path.join(w, "shared", "lib", "sub", "b.txt"), "b");
+      const a = path.join(w, "skills", "alpha");
+      fs.symlinkSync("../../shared/data.sh", path.join(a, "data.sh")); // a file link inside the repository
+      fs.symlinkSync("../../shared/lib", path.join(a, "lib")); // a directory link inside the repository
+      fs.symlinkSync(path.join(outside, "secret.txt"), path.join(a, "leak")); // leaves the repository
+      fs.symlinkSync("../../.git/config", path.join(a, "gitconfig")); // into the clone's own .git
+      fs.symlinkSync("skills/alpha", path.join(w, "linkdir")); // a link on the sub-path
+    });
+    routeHosts(ALL_HOSTS);
+    addJson();
+  });
+
+  it("copies a link to a file inside the repository as that file, with its exec bit", () => {
+    addSkill(ctx, "github:acme/skills/skills/alpha");
+    const copy = path.join(storePath(ctx, "alpha"), "data.sh");
+    expect(fs.lstatSync(copy).isFile()).toBe(true);
+    expect(fs.readFileSync(copy, "utf8")).toContain("echo data");
+    expect(fs.statSync(copy).mode & 0o100).not.toBe(0);
+  });
+
+  it("copies a link to a directory inside the repository as that directory", () => {
+    addSkill(ctx, "github:acme/skills/skills/alpha");
+    const lib = path.join(storePath(ctx, "alpha"), "lib");
+    expect(fs.lstatSync(lib).isDirectory()).toBe(true);
+    expect(fs.readFileSync(path.join(lib, "a.txt"), "utf8")).toBe("a");
+    expect(fs.readFileSync(path.join(lib, "sub", "b.txt"), "utf8")).toBe("b");
+    expect(fs.lstatSync(path.join(lib, "sub")).isSymbolicLink()).toBe(false);
+  });
+
+  it("drops a link that leaves the repository or points into .git, and reports both", () => {
+    const [added] = addSkill(ctx, "github:acme/skills/skills/alpha");
+    expect(added.skippedSymlinks.sort()).toEqual(["gitconfig", "leak"]);
+    expect(fs.existsSync(path.join(storePath(ctx, "alpha"), "leak"))).toBe(false);
+    expect(fs.existsSync(path.join(storePath(ctx, "alpha"), "gitconfig"))).toBe(false);
+    expect(fs.readdirSync(storePath(ctx, "alpha")).sort()).toEqual(["SKILL.md", "data.sh", "lib"]);
+  });
+
+  it("the store holds no symlink at all", () => {
+    addSkill(ctx, "github:acme/skills/skills/alpha");
+    const walk = (d: string): string[] =>
+      fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isSymbolicLink() ? [e.name] : e.isDirectory() ? walk(path.join(d, e.name)) : []));
+    expect(walk(storePath(ctx, "alpha"))).toEqual([]);
+  });
+
+  it("a link on the sub-path itself is still refused", () => {
+    expect(() => addSkill(ctx, "github:acme/skills/linkdir")).toThrow(/symlink/);
+    noStore();
+  });
+
+  it("refuses a directory link cycle and writes nothing", () => {
+    makeRepo("acme/cyc", (w) => {
+      writeSkill(path.join(w, "skills", "c"), "c");
+      fs.symlinkSync(".", path.join(w, "skills", "c", "loop"));
+    });
+    expect(() => addSkill(ctx, "github:acme/cyc/skills/c")).toThrow(/symlink cycle at loop/);
+    noStore();
+  });
+
+  it("refuses a cycle that runs through two folders", () => {
+    makeRepo("acme/cyc2", (w) => {
+      writeSkill(path.join(w, "a"), "a");
+      fs.mkdirSync(path.join(w, "b"));
+      fs.symlinkSync("../b", path.join(w, "a", "to-b"));
+      fs.symlinkSync("../a", path.join(w, "b", "to-a"));
+    });
+    expect(() => addSkill(ctx, "github:acme/cyc2/a")).toThrow(/symlink cycle/);
+    noStore();
+  });
+
+  it("a symlinked SKILL.md that resolves inside the repository counts as a skill", () => {
+    makeRepo("acme/mirror", (w) => {
+      writeSkill(path.join(w, "canonical"), "mirrored", "canonical body");
+      fs.mkdirSync(path.join(w, "skills", "m"), { recursive: true });
+      fs.symlinkSync("../../canonical/SKILL.md", path.join(w, "skills", "m", "SKILL.md"));
+    });
+    const [added] = addSkill(ctx, "github:acme/mirror/skills/m");
+    expect(added.name).toBe("mirrored");
+    const copy = path.join(storePath(ctx, "mirrored"), "SKILL.md");
+    expect(fs.lstatSync(copy).isFile()).toBe(true);
+    expect(fs.readFileSync(copy, "utf8")).toContain("canonical body");
+  });
+
+  it("a symlinked SKILL.md that points outside the repository is not a skill", () => {
+    makeRepo("acme/thief", (w) => {
+      fs.mkdirSync(path.join(w, "skills", "t"), { recursive: true });
+      fs.symlinkSync(path.join(outside, "secret-skill.md"), path.join(w, "skills", "t", "SKILL.md"));
+    });
+    expect(() => addSkill(ctx, "github:acme/thief/skills/t")).toThrow(/No SKILL\.md/);
+    noStore();
+  });
+
+  it("the size cap counts resolved content, so links cannot multiply a folder past it", () => {
+    makeRepo("acme/bomb", (w) => {
+      writeSkill(path.join(w, "skills", "big"), "big");
+      fs.mkdirSync(path.join(w, "shared"));
+      fs.writeFileSync(path.join(w, "shared", "blob.bin"), Buffer.alloc(1024 * 1024, 1));
+      for (let i = 0; i < 50; i++) fs.symlinkSync("../../shared", path.join(w, "skills", "big", `l${i}`));
+    });
+    expect(() => addSkill(ctx, "github:acme/bomb/skills/big", { limits: { maxBytes: 10 * 1024 * 1024 } })).toThrow(/more than 10 MB of files/);
+    noStore();
+    expect(() => addSkill(ctx, "github:acme/bomb/skills/big", { limits: { maxFiles: 20 } })).toThrow(/more than 20 files and folders/);
+    noStore();
+  });
+
+  it("add --all stages every skill before writing the first: a cycle in the second leaves nothing", () => {
+    makeRepo("acme/pack", (w) => {
+      writeSkill(path.join(w, "skills", "a-ok"), "a-ok");
+      writeSkill(path.join(w, "skills", "b-bad"), "b-bad");
+      fs.symlinkSync(".", path.join(w, "skills", "b-bad", "loop"));
+    });
+    expect(() => addSkill(ctx, "github:acme/pack/skills", { all: true })).toThrow(/symlink cycle/);
+    noStore();
+  });
+
+  it("path: sources still drop every link, even one that stays inside the folder", () => {
+    writeSkill(path.join(proj, "src", "p"), "p");
+    fs.writeFileSync(path.join(proj, "src", "p", "real.txt"), "real");
+    fs.symlinkSync("real.txt", path.join(proj, "src", "p", "alias.txt"));
+    const [added] = addSkill(ctx, path.join(proj, "src", "p"));
+    expect(added.skippedSymlinks).toEqual(["alias.txt"]);
+    expect(fs.existsSync(path.join(storePath(ctx, "p"), "alias.txt"))).toBe(false);
+    expect(fs.existsSync(path.join(storePath(ctx, "p"), "real.txt"))).toBe(true);
+  });
+
+  describe("a lock made by 0.1.x, which dropped every link", () => {
+    const legacyIntegrity = (): string => {
+      // What 0.1.x hashed: the skill folder with every link left out.
+      const f = fetchSource(parseSource("github:acme/skills/skills/alpha"));
+      try {
+        const copy = path.join(base, "legacy-copy");
+        copyDir(f.dir, copy);
+        return hashDir(copy);
+      } finally {
+        f.cleanup();
+      }
+    };
+    const lockWith = (integrity: string, sha: string): Lockfile => ({
+      version: 1,
+      skills: {
+        alpha: {
+          source: "github:acme/skills/skills/alpha",
+          resolved: `github:acme/skills/skills/alpha@${sha}`,
+          integrity,
+          installedAt: "x",
+        },
+      },
+    });
+    let sha: string;
+    beforeEach(() => {
+      sha = git("-C", path.join(base, "srv", "acme", "skills.git"), "rev-parse", "HEAD");
+      writeManifest({ version: 1, agents: ["claude"], skills: { alpha: { source: "github:acme/skills/skills/alpha" } } });
+    });
+
+    it("still syncs: the pin decides, and the old rule is the stricter one", () => {
+      writeLock(lockWith(legacyIntegrity(), sha));
+      syncSkills(ctx);
+      expect(fs.readdirSync(storePath(ctx, "alpha")).sort()).toEqual(["SKILL.md"]);
+      expect(loadLock(ctx).skills.alpha.integrity).toBe(legacyIntegrity());
+    });
+
+    it("a lock made under the new rule installs the resolved links", () => {
+      addSkill(ctx, "github:acme/skills/skills/alpha");
+      const integrity = loadLock(ctx).skills.alpha.integrity;
+      fs.rmSync(path.join(proj, ".skillwharf"), { recursive: true });
+      fs.rmSync(path.join(proj, ".claude"), { recursive: true });
+      syncSkills(ctx);
+      expect(fs.readdirSync(storePath(ctx, "alpha")).sort()).toEqual(["SKILL.md", "data.sh", "lib"]);
+      expect(loadLock(ctx).skills.alpha.integrity).toBe(integrity);
+    });
+
+    it("an integrity that matches neither rule is still refused", () => {
+      writeLock(lockWith("sha256-nope", sha));
+      expect(() => syncSkills(ctx)).toThrow(/integrity mismatch for "alpha"/);
+      expect(fs.existsSync(storePath(ctx, "alpha"))).toBe(false);
+    });
   });
 });
