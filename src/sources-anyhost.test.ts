@@ -305,7 +305,9 @@ describe("S1.22: lock and manifest are compared on protocol, host, port, reposit
         skills: { x: { source: "gitlab:a/b//x", resolved: `github:a/b/x@${SHA}`, integrity: "sha256-x", installedAt: "x" } },
       }),
     );
+    exec.mockClear();
     expect(() => syncSkills(ctx)).toThrow(/does not match/);
+    expect(exec).not.toHaveBeenCalled(); // refused before any git call
     expect(fs.existsSync(path.join(proj, ".skillwharf"))).toBe(false);
   });
 
@@ -929,7 +931,8 @@ describe("S1.19: submodules, one level, pinned by the parent's recorded commit",
     );
     for (const c of calls) {
       const o = c[2] as Record<string, unknown>;
-      expect((o.env as Record<string, string>).GIT_ALLOW_PROTOCOL).toMatch(/^https:ssh/);
+      // exactly the allowlist (https and ssh, plus the `file` this test run adds): a submodule gets no more than its parent
+      expect((o.env as Record<string, string>).GIT_ALLOW_PROTOCOL).toBe("https:ssh:file");
       expect((o.env as Record<string, string>).GIT_TERMINAL_PROMPT).toBe("0");
       expect((o.stdio as string[])[0]).toBe("ignore");
       expect(o.timeout).toBe(120_000);

@@ -275,14 +275,23 @@ describe("S3.6/S3.7: the README and SECURITY.md name what the code does", () => 
       "GIT_LFS_SKIP_SMUDGE=1",
       "GIT_DIR",
       "full 40 characters",
-      "its own session without your terminal",
+      "without your terminal",
+      "--allow-askpass",
+      "--git-deadline",
+      "* -filter -ident -text -eol",
+      "@refs/tags/<name>",
+      "taskkill /T /F",
+      "Windows is not covered by CI",
+      "UNC",
     ]) {
       expect(security).toContain(s);
     }
   });
 
   it("the README describes the project:<name> rename, the short-sha refusal and the ambiguous bare name", () => {
-    for (const s of ["project:<name>", "full 40-character sha", "ambiguous", "its own session"]) expect(readme).toContain(s);
+    for (const s of ["project:<name>", "full 40-character sha", "ambiguous", "its own session", "--allow-askpass", "--git-deadline", "@refs/tags/<name>", "Windows is not covered by CI"]) {
+      expect(readme).toContain(s);
+    }
   });
 
   it("SECURITY.md no longer claims that symlinks in a fetched repository are never followed", () => {
