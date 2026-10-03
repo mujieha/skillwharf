@@ -1,7 +1,16 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { assertWithinLimits, copyDir, copyResolvingLinks, findSymlinks, isDir, isInside, type SizeLimits } from "./fs.js";
+import {
+  DEFAULT_MAX_FILES,
+  assertWithinLimits,
+  copyDir,
+  copyResolvingLinks,
+  findSymlinks,
+  isDir,
+  isInside,
+  type SizeLimits,
+} from "./fs.js";
 import { GitError, runGit } from "./git.js";
 import { placeSubmodules } from "./submodules.js";
 import { isSkillDir, isSkillDirIn } from "./skill.js";
@@ -468,22 +477,79 @@ function resolveSubpath(root: string, sub: string, label: string): string {
  * A fetched directory may itself be a skill, or a folder of skills
  * (e.g. a repo root with skills/<name>/SKILL.md). Returns skill dirs found.
  */
-export function discoverSkills(dir: string, opts: { root?: string; maxDepth?: number } = {}): string[] {
-  const maxDepth = opts.maxDepth ?? 2;
-  const isSkill = (d: string) => (opts.root ? isSkillDirIn(d, opts.root) : isSkillDir(d));
+export function discoverSkills(dir: string, opts: { root?: string; maxDepth?: number; maxEntries?: number } = {}): string[] {
+  const root = opts.root;
+  const inRepo = root !== undefined;
+  // A repository is searched six folders deep, dot-folders included (skills
+  // live in .agents/skills, .claude/skills, ...); a local folder keeps the old,
+  // narrower search (two deep, no dot-folders), since a project's own store and
+  // agent folders are dot-folders and must never be mistaken for its skills.
+  const maxDepth = opts.maxDepth ?? (inRepo ? 6 : 2);
+  const maxEntries = opts.maxEntries ?? discoveryBound();
+  const isSkill = (d: string) => (root !== undefined ? isSkillDirIn(d, root) : isSkillDir(d));
   if (isSkill(dir)) return [dir];
+
+  const realRoot = root !== undefined ? fs.realpathSync(root) : "";
+  const realWalk = inRepo ? fs.realpathSync(dir) : "";
   const found: string[] = [];
+  const followed = new Set<string>();
+  let entries = 0;
   const walk = (d: string, depth: number) => {
     if (depth > maxDepth) return;
     for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-      if (!e.isDirectory() || e.name.startsWith(".") || e.name === "node_modules") continue;
+      if (e.name === "node_modules" || (inRepo ? e.name === ".git" : e.name.startsWith("."))) continue;
+      entries += 1;
+      if (entries > maxEntries) {
+        throw new Error(
+          `Gave up after more than ${maxEntries} entries while looking for skills in ${path.basename(dir) || dir}. Point at a sub-folder (for example github:owner/repo//skills) or raise --max-skill-files.`,
+        );
+      }
       const child = path.join(d, e.name);
+      if (e.isSymbolicLink()) {
+        // Only in a repository: a folder link counts when it leads somewhere else
+        // inside it. A link into the folder being searched is reached directly
+        // (that is how .claude/skills mirrors .agents/skills), one leading out
+        // of the repository or into .git is never followed, and each target is
+        // followed once.
+        if (!inRepo) continue;
+        let target: string;
+        try {
+          target = fs.realpathSync(child);
+          if (!fs.statSync(target).isDirectory()) continue;
+        } catch {
+          continue;
+        }
+        if (
+          !isInside(realRoot, target) ||
+          path.relative(realRoot, target).split(path.sep).includes(".git") ||
+          isInside(realWalk, target) ||
+          isInside(target, realWalk) ||
+          followed.has(target)
+        ) {
+          continue;
+        }
+        followed.add(target);
+      } else if (!e.isDirectory()) {
+        continue;
+      }
       if (isSkill(child)) found.push(child);
       else walk(child, depth + 1);
     }
   };
   walk(dir, 1);
-  return found.sort();
+  if (!inRepo) return found.sort();
+  // Fewest folders first, dot-folders last: when a repository mirrors one skill
+  // in several places, the plain `skills/<name>` copy is the one that is kept.
+  const rank = (p: string) => {
+    const parts = path.relative(dir, p).split(path.sep);
+    return [parts.length, parts.some((s) => s.startsWith(".")) ? 1 : 0] as const;
+  };
+  return found.sort((a, b) => rank(a)[0] - rank(b)[0] || rank(a)[1] - rank(b)[1] || a.localeCompare(b));
+}
+
+/** How many entries a search for skills examines before it gives up: ten times the per-skill file cap. */
+export function discoveryBound(limits?: SizeLimits): number {
+  return 10 * (limits?.maxFiles ?? DEFAULT_MAX_FILES);
 }
 
 /** Copy a skill folder into the store, after checking it is within the size cap. */

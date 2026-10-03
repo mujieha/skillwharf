@@ -34,6 +34,7 @@ import {
   fetchSource,
   formatSource,
   installToStore,
+  discoveryBound,
   isCommitSha,
   parseSource,
   sourceKey,
@@ -113,6 +114,11 @@ function assertSourceClear(
       );
     }
   }
+}
+
+/** Where `dir` really is inside the fetched repository at `root`, as a `/`-separated path (links resolved). */
+function repoRelative(root: string, dir: string): string {
+  return path.relative(fs.realpathSync(root), fs.realpathSync(dir)).split(path.sep).join("/");
 }
 
 /** True when the lockfile says skillwharf made a copy (not a link) at this location. */
@@ -326,7 +332,7 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
   // what would actually be installed, and before anything is written.
   let stagingRoot: string | undefined;
   try {
-    const dirs = discoverSkills(fetched.dir, { root: fetched.root });
+    const dirs = discoverSkills(fetched.dir, { root: fetched.root, maxEntries: discoveryBound(opts.limits) });
     if (dirs.length === 0) throw new Error(`No SKILL.md found under ${sourceRaw}`);
     if (dirs.length > 1 && !opts.all) {
       const names = dirs
@@ -349,7 +355,7 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
     // so `--all` never leaves earlier skills linked but unrecorded.
     const multi = dirs.length > 1;
     const skipped: SkippedSkill[] = [];
-    const seen = new Set<string>();
+    const seen = new Map<string, { label: string; hash?: string }>();
     const plan = dirs.flatMap((dir, index) => {
       // The source recorded for this skill. In a multi-skill source it is built
       // from the folder name, so it has to pass the same checks as a typed one:
@@ -380,8 +386,10 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
         else sourceForManifest = path.isAbsolute(parsed.raw.replace(/^path:/, "")) ? parsed.raw : `path:${parsed.path}`;
         resolved = sourceForManifest;
       } else if (multi) {
-        const rel = dir.slice(fetched.dir.length).replace(/^[/\\]+/, "").split("\\").join("/");
-        const sub = [parsed.subpath, rel].filter(Boolean).join("/");
+        // Where the folder really is in the repository, not the link it may have
+        // been found through (a source whose sub-path ran through a link would
+        // be refused on the next sync).
+        const sub = repoRelative(fetched.root as string, dir);
         try {
           assertSubpath(sub);
         } catch (e) {
@@ -406,8 +414,16 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
       }
       const meta = readSkill(stagedDir ?? dir);
       const name = normalizeName(opts.name ?? meta.name);
-      if (seen.has(name)) throw new Error(`Two skills in ${sourceRaw} resolve to the name "${name}". Install them one at a time with --name.`);
-      seen.add(name);
+      const earlier = seen.get(name);
+      if (earlier) {
+        // A repository that mirrors one skill into several folders (skills/x,
+        // .claude/skills/x, ...) is one skill: the first, plainest copy is kept.
+        if (stagedDir && earlier.hash !== undefined && hashDir(stagedDir) === earlier.hash) {
+          return skip(repoRelative(fetched.root as string, dir), `same skill as ${earlier.label}`);
+        }
+        throw new Error(`Two skills in ${sourceRaw} resolve to the name "${name}". Install them one at a time with --name.`);
+      }
+      seen.set(name, { label: stagedDir ? repoRelative(fetched.root as string, dir) : dir, hash: stagedDir ? hashDir(stagedDir) : undefined });
       const store = storePath(ctx, name);
       // The agent set is fixed here and used for the check and for the links.
       // `--agents` replaces a skill's own list; without it the list it has

@@ -8,7 +8,7 @@ import { allowProtocolsForTests, setGitExecForTests } from "./git.js";
 import { copyDir, hashDir } from "./fs.js";
 import { loadLock, loadManifest, makeContext, saveManifest, storePath } from "./manifest.js";
 import { addSkill, syncSkills, updateSkills } from "./ops.js";
-import { fetchSource, formatSource, parseSource, sourceKey } from "./source.js";
+import { discoverSkills, discoveryBound, fetchSource, formatSource, parseSource, sourceKey } from "./source.js";
 import { placeSubmodules } from "./submodules.js";
 import type { Context, Lockfile, Manifest } from "./types.js";
 
@@ -1181,6 +1181,161 @@ describe("S1.20: symlinks in a fetched repository", () => {
       writeLock(lockWith("sha256-nope", sha));
       expect(() => syncSkills(ctx)).toThrow(/integrity mismatch for "alpha"/);
       expect(fs.existsSync(storePath(ctx, "alpha"))).toBe(false);
+    });
+  });
+});
+
+// ------------------------------------------------------------------ S1.21 discovery
+describe("S1.21: add --all finds skills in the layouts real repositories use", () => {
+  const names = (dirs: string[], root: string) => dirs.map((d) => path.relative(root, d).split(path.sep).join("/"));
+  let tree: string;
+  beforeEach(() => {
+    tree = path.join(base, "tree");
+    fs.mkdirSync(tree);
+  });
+
+  it("finds skills/<name>", () => {
+    writeSkill(path.join(tree, "skills", "a"), "a");
+    writeSkill(path.join(tree, "skills", "b"), "b");
+    expect(names(discoverSkills(tree, { root: tree }), tree)).toEqual(["skills/a", "skills/b"]);
+  });
+
+  it("finds .agents/skills/<name> and .claude/skills/<name>, dot-folders included", () => {
+    writeSkill(path.join(tree, ".agents", "skills", "a"), "a");
+    writeSkill(path.join(tree, ".claude", "skills", "b"), "b");
+    writeSkill(path.join(tree, ".cursor", "skills", "c"), "c");
+    expect(names(discoverSkills(tree, { root: tree }), tree).sort()).toEqual([".agents/skills/a", ".claude/skills/b", ".cursor/skills/c"]);
+  });
+
+  it("follows a folder link only when it leads out of the folder being searched", () => {
+    writeSkill(path.join(tree, ".agents", "skills", "a"), "a");
+    fs.mkdirSync(path.join(tree, ".claude"));
+    fs.symlinkSync("../.agents/skills", path.join(tree, ".claude", "skills")); // mirrors .agents/skills: no duplicate
+    expect(names(discoverSkills(tree, { root: tree }), tree)).toEqual([".agents/skills/a"]);
+  });
+
+  it("follows a folder link out of the searched folder when it stays inside the repository, once per target", () => {
+    writeSkill(path.join(tree, "skills", "x"), "x");
+    fs.mkdirSync(path.join(tree, ".claude", "skills"), { recursive: true });
+    fs.symlinkSync("../../skills/x", path.join(tree, ".claude", "skills", "x"));
+    fs.symlinkSync("../../skills/x", path.join(tree, ".claude", "skills", "x-again"));
+    const found = discoverSkills(path.join(tree, ".claude", "skills"), { root: tree });
+    expect(names(found, tree)).toEqual([".claude/skills/x"]);
+  });
+
+  it("does not follow a folder link that leaves the repository", () => {
+    const elsewhere = path.join(base, "elsewhere");
+    writeSkill(path.join(elsewhere, "stolen"), "stolen");
+    fs.symlinkSync(elsewhere, path.join(tree, "out"));
+    expect(discoverSkills(tree, { root: tree })).toEqual([]);
+  });
+
+  it("goes six folders deep and no further", () => {
+    writeSkill(path.join(tree, "a", "b", "c", "d"), "d4");
+    writeSkill(path.join(tree, "a1", "b", "c", "d", "e", "f"), "d6");
+    writeSkill(path.join(tree, "x", "y", "z", "w", "v", "u", "t"), "d7");
+    expect(names(discoverSkills(tree, { root: tree }), tree)).toEqual(["a/b/c/d", "a1/b/c/d/e/f"]);
+  });
+
+  it("skips .git and node_modules", () => {
+    writeSkill(path.join(tree, ".git", "skills", "g"), "g");
+    writeSkill(path.join(tree, "node_modules", "pkg"), "pkg");
+    writeSkill(path.join(tree, "real"), "real");
+    expect(names(discoverSkills(tree, { root: tree }), tree)).toEqual(["real"]);
+  });
+
+  it("does not look inside a folder that is itself a skill", () => {
+    writeSkill(path.join(tree, "outer"), "outer");
+    writeSkill(path.join(tree, "outer", "examples", "inner"), "inner");
+    expect(names(discoverSkills(tree, { root: tree }), tree)).toEqual(["outer"]);
+  });
+
+  it("stops at the entry bound and says how to narrow the search", () => {
+    for (let i = 0; i < 60; i++) fs.mkdirSync(path.join(tree, `d${i}`));
+    expect(() => discoverSkills(tree, { root: tree, maxEntries: 50 })).toThrow(
+      /more than 50 entries while looking for skills.*sub-folder.*--max-skill-files/s,
+    );
+    expect(discoverSkills(tree, { root: tree, maxEntries: 500 })).toEqual([]);
+  });
+
+  it("the bound is ten times the per-skill file cap", () => {
+    expect(discoveryBound()).toBe(20_000);
+    expect(discoveryBound({ maxFiles: 300 })).toBe(3_000);
+  });
+
+  it("a local folder keeps the old search: two levels, no dot-folders", () => {
+    writeSkill(path.join(tree, "skills", "a"), "a");
+    writeSkill(path.join(tree, ".hidden", "h"), "h");
+    writeSkill(path.join(tree, "p", "q", "r"), "r");
+    expect(names(discoverSkills(tree), tree)).toEqual(["skills/a"]);
+  });
+
+  describe("through add --all on a git repository", () => {
+    const addJson = () => fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: {} }));
+
+    it("installs one copy of a skill that the repository mirrors, and reports the other", () => {
+      makeRepo("acme/mirrored", (w) => {
+        writeSkill(path.join(w, "skills", "x"), "x", "same");
+        writeSkill(path.join(w, ".claude", "skills", "x"), "x", "same");
+        writeSkill(path.join(w, ".agents", "skills", "x"), "x", "same");
+      });
+      routeHosts(ALL_HOSTS);
+      addJson();
+      const skipped: { dir: string; reason: string }[] = [];
+      const added = addSkill(ctx, "github:acme/mirrored", { all: true, onSkipped: (s) => skipped.push(s) });
+      expect(added.map((a) => a.name)).toEqual(["x"]);
+      expect(loadManifest(ctx)!.skills.x.source).toBe("github:acme/mirrored/skills/x");
+      expect(skipped.map((s) => s.dir).sort()).toEqual([".agents/skills/x", ".claude/skills/x"]);
+      for (const s of skipped) expect(s.reason).toMatch(/same skill as skills\/x/);
+    });
+
+    it("still refuses two different skills with one name", () => {
+      makeRepo("acme/clash", (w) => {
+        writeSkill(path.join(w, "skills", "x"), "x", "one");
+        writeSkill(path.join(w, ".claude", "skills", "x"), "x", "two");
+      });
+      routeHosts(ALL_HOSTS);
+      addJson();
+      expect(() => addSkill(ctx, "github:acme/clash", { all: true })).toThrow(/Two skills in github:acme\/clash resolve to the name "x"/);
+      expect(fs.existsSync(path.join(proj, ".skillwharf"))).toBe(false);
+    });
+
+    it("finds the skills under .agents/skills and a link into the repository from .claude/skills", () => {
+      makeRepo("acme/linked", (w) => {
+        writeSkill(path.join(w, "skills", "x"), "x");
+        fs.mkdirSync(path.join(w, ".claude", "skills"), { recursive: true });
+        fs.symlinkSync("../../skills/x", path.join(w, ".claude", "skills", "x"));
+      });
+      routeHosts(ALL_HOSTS);
+      addJson();
+      const added = addSkill(ctx, "github:acme/linked/.claude/skills", { all: true });
+      expect(added.map((a) => a.name)).toEqual(["x"]);
+      // one skill: the source stays the folder it was typed as, which finds it the same way on sync
+      expect(loadManifest(ctx)!.skills.x.source).toBe("github:acme/linked/.claude/skills");
+      expect(fs.readFileSync(path.join(storePath(ctx, "x"), "SKILL.md"), "utf8")).toContain("name: x");
+      fs.rmSync(path.join(proj, ".skillwharf"), { recursive: true });
+      fs.rmSync(path.join(proj, ".claude"), { recursive: true });
+      expect(syncSkills(ctx).fetched).toEqual(["x"]);
+    });
+
+    it("records where a skill really is, not the link it was found through, so sync can fetch it again", () => {
+      makeRepo("acme/linked2", (w) => {
+        writeSkill(path.join(w, "skills", "x"), "x");
+        writeSkill(path.join(w, "skills", "y"), "y");
+        fs.mkdirSync(path.join(w, ".claude", "skills"), { recursive: true });
+        fs.symlinkSync("../../skills/x", path.join(w, ".claude", "skills", "x"));
+        fs.symlinkSync("../../skills/y", path.join(w, ".claude", "skills", "y"));
+      });
+      routeHosts(ALL_HOSTS);
+      addJson();
+      addSkill(ctx, "github:acme/linked2/.claude/skills", { all: true });
+      const m = loadManifest(ctx)!;
+      expect(m.skills.x.source).toBe("github:acme/linked2/skills/x");
+      expect(m.skills.y.source).toBe("github:acme/linked2/skills/y");
+      expect(loadLock(ctx).skills.x.resolved).toMatch(/^github:acme\/linked2\/skills\/x@[0-9a-f]{40}$/);
+      fs.rmSync(path.join(proj, ".skillwharf"), { recursive: true });
+      fs.rmSync(path.join(proj, ".claude"), { recursive: true });
+      expect(syncSkills(ctx).fetched.sort()).toEqual(["x", "y"]);
     });
   });
 });
