@@ -2455,8 +2455,9 @@ describe("Round B B4/A3: git runs under a supervisor", () => {
     const r = spawnSync(process.execPath, ["-e", SUPERVISOR_SOURCE, "5000", "sh", "-c", "echo out; echo err >&2; exit 3"], { encoding: "utf8" });
     expect(r.status).toBe(3);
     expect(r.stdout).toBe("out\n");
-    expect(r.stderr).toMatch(/^SKILLWHARF-GIT-PID \d+\n/);
-    expect(r.stderr).toContain("err\n");
+    // on its own line wherever git's own output falls around it (git may be quicker than the supervisor)
+    expect(r.stderr).toMatch(/(?:^|\n)SKILLWHARF-GIT-PID \d+\n/);
+    expect(r.stderr.replace(/(?:^|\n)SKILLWHARF-GIT-PID \d+\n/, "")).toBe("err\n");
   });
 
   describe("the backstop after a timeout", () => {

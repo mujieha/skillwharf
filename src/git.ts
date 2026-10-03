@@ -62,7 +62,8 @@ const parent = process.ppid;
 const child = spawn(file, args, { stdio: ["ignore", "inherit", "inherit"], detached: true, windowsHide: true });
 child.on("error", (e) => { process.stderr.write("skillwharf: cannot run git: " + (e && e.message) + "\\n"); process.exit(127); });
 // git's own pid, first on stderr, so a parent whose supervisor hung can end git and not a stale pid.
-process.stderr.write("SKILLWHARF-GIT-PID " + child.pid + "\\n");
+// (git may already have written something, even without a newline: start a line of our own.)
+process.stderr.write("\\nSKILLWHARF-GIT-PID " + child.pid + "\\n");
 const killTree = () => {
   try {
     if (win) {
@@ -309,8 +310,8 @@ export function runGit(args: string[], opts: RunGitOptions): string {
     const err = e as NodeJS.ErrnoException & { stderr?: Buffer | string; signal?: string; pid?: number; status?: number | null };
     // The supervisor's first stderr line is git's own pid; it is not part of git's message.
     const rawStderr = String(err.stderr ?? "");
-    const gitPid = Number(/^SKILLWHARF-GIT-PID (\d+)$/m.exec(rawStderr)?.[1]);
-    const stderr = rawStderr.replace(/^SKILLWHARF-GIT-PID \d+\n/m, "");
+    const gitPid = Number(/(?:^|\n)SKILLWHARF-GIT-PID (\d+)\n/.exec(rawStderr)?.[1]);
+    const stderr = rawStderr.replace(/(?:^|\n)SKILLWHARF-GIT-PID \d+\n/, "").replace(/^\n/, "");
     const first = (stderr || String(err.message ?? "")).split("\n").find((l) => l.trim() !== "") ?? "";
     let reason = sanitizeForTerminal(first.trim() || err.message || "unknown error");
     if (err.status === 130) {
