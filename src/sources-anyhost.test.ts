@@ -1185,6 +1185,29 @@ describe("S1.20: symlinks in a fetched repository", () => {
   });
 });
 
+// ------------------------------------------------------------------ the one network test
+// A real GitLab repository in a nested group, over https. It is skipped when
+// gitlab.com cannot be reached; when it can, a failed install is a real failure.
+// (If that skill is ever moved or renamed, point this at a fixture repository.)
+const online =
+  spawnSync("git", ["ls-remote", "https://gitlab.com/gitlab-org/ai/skills.git", "HEAD"], {
+    timeout: 20_000,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+  }).status === 0;
+
+describe.skipIf(!online)("network: a skill from a public GitLab repository", () => {
+  it("installs gitlab:gitlab-org/ai/skills//skills/glab and pins the full commit", () => {
+    fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: {} }));
+    const [added] = addSkill(ctx, "gitlab:gitlab-org/ai/skills//skills/glab@main");
+    expect(added.name).toBe("glab");
+    expect(fs.existsSync(path.join(storePath(ctx, "glab"), "SKILL.md"))).toBe(true);
+    const entry = loadLock(ctx).skills.glab;
+    expect(entry.resolved).toMatch(/^gitlab:gitlab-org\/ai\/skills\/\/skills\/glab@[0-9a-f]{40}$/);
+    expect(entry.integrity).toMatch(/^sha256-/);
+    expect(loadManifest(ctx)!.skills.glab.source).toBe("gitlab:gitlab-org/ai/skills//skills/glab@main");
+  }, 90_000);
+});
+
 // ------------------------------------------------------------------ S1.21 discovery
 describe("S1.21: add --all finds skills in the layouts real repositories use", () => {
   const names = (dirs: string[], root: string) => dirs.map((d) => path.relative(root, d).split(path.sep).join("/"));

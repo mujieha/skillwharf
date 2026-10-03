@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { HINT, REGISTRY_HELP, SOURCES_BLOCK, afterSearch, showHintOnce, usesDefaultOnly } from "./hints.js";
+import { GUIDE_URL, HINT, REGISTRY_HELP, SOURCES_BLOCK, afterSearch, showHintOnce, usesDefaultOnly } from "./hints.js";
 import type { LoadedRegistry } from "./types.js";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -233,6 +233,50 @@ describe("S3.4: doctor mentions registries once, as information", () => {
     cli(["--quiet", "init", "-a", "claude", "--registry", "team=./team.json"]);
     const r = cli(["doctor", "--stale-days", "36500"]);
     expect(plain(r.stdout)).not.toContain(INFO);
+  });
+});
+
+describe("S3.6/S3.7: the README and SECURITY.md name what the code does", () => {
+  const readme = fs.readFileSync(path.join(repo, "README.md"), "utf8");
+  const security = fs.readFileSync(path.join(repo, "SECURITY.md"), "utf8");
+
+  it("the README has the guide section the hint links to", () => {
+    expect(readme).toContain("## Your own registry");
+    expect(GUIDE_URL.endsWith("#your-own-registry")).toBe(true);
+    expect(readme).toContain("## Sources");
+  });
+
+  it("the README names every spelling and the moved-repository command", () => {
+    for (const s of ["github:", "gitlab:", "bitbucket:", "git+https://", "git+ssh://", "skillwharf update <name> --source <new>", "--git-timeout", "--from"]) {
+      expect(readme).toContain(s);
+    }
+  });
+
+  it.each(["init", "add", "remove", "sync", "update", "list", "usage", "doctor", "search", "registry add", "registry remove", "registry list", "registry help", "publish", "where"])(
+    "the README's command table lists skillwharf %s",
+    (command) => {
+      expect(readme).toContain(`\`skillwharf ${command}`);
+    },
+  );
+
+  it("SECURITY.md states the git guards, the link rule, submodules and the new limits", () => {
+    for (const s of [
+      "GIT_ALLOW_PROTOCOL=https:ssh",
+      "GIT_TERMINAL_PROMPT=0",
+      "credentials",
+      "does not disable certificate or host-key checks, ever",
+      "is copied as that file or folder",
+      "Pins submodules by the parent's commit",
+      "trusted to its schema",
+      "Git's own configuration is honoured",
+      "--git-timeout",
+    ]) {
+      expect(security).toContain(s);
+    }
+  });
+
+  it("SECURITY.md no longer claims that symlinks in a fetched repository are never followed", () => {
+    expect(security).not.toContain("Never follows a symlink in a fetched repository");
   });
 });
 
