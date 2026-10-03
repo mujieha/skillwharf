@@ -138,6 +138,11 @@ function planRegistries(ctx: Context): RegistryPlan[] {
   return plans;
 }
 
+/** The registries this context searches, as listed (nothing is loaded), the implied public one included. */
+export function configuredRegistries(ctx: Context): RegistrySpec[] {
+  return planRegistries(ctx).map((p) => p.spec);
+}
+
 /** A path location as a path: `~/` expands, a relative path is read from `root`. */
 function resolveLocation(location: string, root: string, home: string): string {
   if (location === "default" || classifyLocation(location) !== "path") return location;

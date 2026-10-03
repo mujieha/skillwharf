@@ -20,6 +20,7 @@ import {
 import { addFromRegistry, addSkill, agentsFor, doctor, removeSkill, syncSkills, updateSkills } from "./ops.js";
 import {
   addRegistry,
+  configuredRegistries,
   isRegistryName,
   loadRegistries,
   publishToRegistry,
@@ -31,6 +32,7 @@ import { parseSource } from "./source.js";
 import type { AgentId, Context, Manifest } from "./types.js";
 import { daysAgo, scanClaudeUsage } from "./usage.js";
 import { sanitizeForTerminal, toSafeJson } from "./validate.js";
+import { REGISTRY_HELP, SOURCES_BLOCK, afterSearch, showHintOnce, usesDefaultOnly } from "./hints.js";
 
 const VERSION = "0.1.2";
 
@@ -40,7 +42,14 @@ const program = new Command()
   .version(VERSION)
   .option("-g, --global", "operate on ~/.skillwharf instead of the current project")
   .option("--json", "machine-readable output where supported")
-  .option("--git-timeout <seconds>", "kill a git call that runs longer than this (default 120)");
+  .option("--quiet", "do not print the one-time hint about sources and registries")
+  .option("--git-timeout <seconds>", "kill a git call that runs longer than this (default 120)")
+  .addHelpText("after", `\nWhere skills come from:\n${indent(SOURCES_BLOCK)}\n`);
+
+/** Two spaces in front of every line, for help text. */
+function indent(text: string): string {
+  return text.split("\n").map((l) => `  ${l}`).join("\n");
+}
 
 function ctxFrom(cmd: Command): Context {
   const opts = cmd.optsWithGlobals() as { global?: boolean };
@@ -154,6 +163,7 @@ program
     console.log(pc.green("✔"), `created ${rel(ctx, manifestPath(ctx))}`);
     console.log("  agents:", agents.map((a) => `${a} (${ADAPTERS[a].label})`).join(", "));
     console.log(pc.dim(`  next: skillwharf add github:owner/repo/path-to-skill`));
+    showHintOnce(ctx.home, { quiet: (cmd.optsWithGlobals() as { quiet?: boolean }).quiet });
   });
 
 // ---------------------------------------------------------------- add
@@ -433,11 +443,14 @@ program
     }
     if (issues.length === 0) {
       console.log(pc.green("✔"), "no problems found");
-      return;
     }
     for (const i of issues) {
       const tag = i.level === "error" ? pc.red("✖") : pc.yellow("!");
       console.log(tag, i.skill ? pc.bold(i.skill) : "", i.agents ? pc.dim(`[${groupLabel(i.agents)}]`) : "", clean(i.message), i.fix ? pc.dim(`→ ${clean(i.fix)}`) : "");
+    }
+    // Information, not a problem: it never counts as an issue or changes the exit code.
+    if (usesDefaultOnly(configuredRegistries(ctx))) {
+      console.log(pc.dim("i registries: only the public registry is configured; to use your own, run `skillwharf registry help`"));
     }
     if (issues.some((i) => i.level === "error")) process.exitCode = 1;
   });
@@ -459,20 +472,26 @@ program
       for (const r of registries) if (r.error !== undefined) console.error(pc.yellow("!"), `registry ${clean(r.name)}: ${clean(r.error)}`);
       if (registries.length > 0 && registries.every((r) => r.error !== undefined)) fail("no registry could be loaded");
       const hits = searchRegistries(registries, query.join(" "));
-      if (gopts.json) return console.log(toSafeJson(hits));
-      if (hits.length === 0) return console.log(pc.dim(`no matches in ${registries.filter((r) => r.index).map((r) => clean(r.name)).join(", ") || "any registry"}`));
       const several = registries.length > 1;
-      console.log(
-        table(
-          hits.slice(0, 20).map((h) => [
-            pc.bold(clean(h.name)),
-            ...(several ? [clean(h.registry)] : []),
-            shorten(clean(h.description), 60),
-            pc.dim(clean(h.source)),
-          ]),
-          ["skill", ...(several ? ["registry"] : []), "description", "install with: skillwharf add <source>"],
-        ),
-      );
+      if (gopts.json) {
+        console.log(toSafeJson(hits));
+      } else if (hits.length === 0) {
+        console.log(pc.dim(`no matches in ${registries.filter((r) => r.index).map((r) => clean(r.name)).join(", ") || "any registry"}`));
+      } else {
+        console.log(
+          table(
+            hits.slice(0, 20).map((h) => [
+              pc.bold(clean(h.name)),
+              ...(several ? [clean(h.registry)] : []),
+              shorten(clean(h.description), 60),
+              pc.dim(clean(h.source)),
+            ]),
+            ["skill", ...(several ? ["registry"] : []), "description", "install with: skillwharf add <source>"],
+          ),
+        );
+      }
+      // The first search that used the public registry alone: say once that registries are yours to own.
+      afterSearch(opts.registry ? [] : registries, { quiet: (cmd.optsWithGlobals() as { quiet?: boolean }).quiet, json: gopts.json }, ctx.home);
     } catch (e) {
       fail((e as Error).message);
     }
@@ -481,8 +500,16 @@ program
 // ---------------------------------------------------------------- registry
 const registryCmd = program
   .command("registry")
-  .description("manage the registries this project searches (add, remove, list)")
-  .addHelpCommand(false);
+  .description("manage the registries this project searches (add, remove, list); `registry help` explains how to run your own")
+  .addHelpCommand(false)
+  .addHelpText("after", `\nWhere skills come from:\n${indent(SOURCES_BLOCK)}\n`);
+
+registryCmd
+  .command("help")
+  .description("the walk-through: where skills come from and how to run a registry of your own")
+  .action(() => {
+    console.log(REGISTRY_HELP.trimEnd());
+  });
 
 registryCmd
   .command("add <name> <location>")
