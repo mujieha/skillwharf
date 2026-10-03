@@ -281,8 +281,12 @@ describe("S3.6/S3.7: the README and SECURITY.md name what the code does", () => 
       "* -filter -ident -text -eol",
       "@refs/tags/<name>",
       "taskkill /T /F",
-      "Windows is not covered by CI",
+      "Windows is implemented but not covered by CI",
       "UNC",
+      "2,000,000 seconds",
+      "System32\\taskkill.exe",
+      "`core.autocrlf=true`",
+      "any configured registry failed to load",
     ]) {
       expect(security).toContain(s);
     }
