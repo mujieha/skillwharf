@@ -369,6 +369,41 @@ describe("S2.1: the global list comes first, the project list after", () => {
   });
 });
 
+// ------------------------------------------------------------------ Round C
+describe("Round C C1c: a registry location that names a share is refused before the file system is asked", () => {
+  afterEach(() => vi.restoreAllMocks());
+  const watch = () => {
+    const seen: string[] = [];
+    const stat = fs.statSync;
+    const exists = fs.existsSync;
+    vi.spyOn(fs, "statSync").mockImplementation(((p: string, o?: never) => (seen.push(String(p)), stat(p, o))) as never);
+    vi.spyOn(fs, "existsSync").mockImplementation(((p: string) => (seen.push(String(p)), exists(p))) as never);
+    return seen;
+  };
+
+  it.each(["//attacker/share", "\\\\attacker\\share\\index.json", "C:/registry", "c:\\registry\\index.json"])("loadRegistry refuses %s", async (location) => {
+    const seen = watch();
+    await expect(loadRegistry(location)).rejects.toThrow(/names a network share or a drive/);
+    expect(seen.filter((p) => /attacker|^[A-Za-z]:|^\/\//.test(p))).toEqual([]);
+  });
+
+  it("a relative location in a project manifest that is a link to a share is refused, and never opened", async () => {
+    fs.symlinkSync("//attacker/share/x", path.join(proj, "evil"));
+    writeManifest(proj, { registries: [{ name: "evil", location: "./evil" }, { name: "ok", location: writeIndex(path.join(base, "ok.json"), entry("one")) }] });
+    const seen = watch();
+    const r = await loadRegistries(ctx);
+    expect(r[0].error).toMatch(/leaves the folder of the manifest that lists it/);
+    expect(names(r[1])).toEqual(["one"]);
+    expect(seen.filter((p) => p.endsWith(`${path.sep}evil`))).toEqual([]);
+  });
+
+  it("a location in a project manifest that is a plain relative folder still loads", async () => {
+    writeIndex(path.join(proj, "reg", "index.json"), entry("local-one"));
+    writeManifest(proj, { registries: [{ name: "local", location: "./reg" }] });
+    expect(names((await loadRegistries(ctx))[0])).toEqual(["local-one"]);
+  });
+});
+
 // ------------------------------------------------------------------ Round B
 describe("Round B A1: registry entries pinned to a hex ref are reported, not silently dropped", () => {
   it("names them in a note, keeps the rest, and says what to write", async () => {

@@ -5,11 +5,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { SUPERVISOR_SOURCE, supervisedGit, allowAskpass, allowProtocolsForTests, defaultDeadlineMs, gitEnv, killProcessTree, runGit, setGitExecForTests } from "./git.js";
-import { linkStatus } from "./agents.js";
+import { linkStatus, unlinkSkill } from "./agents.js";
 import { copyDir, copyResolvingLinks, hashDir, inGitDir, isAbsoluteLinkText, isInside, resolveInside } from "./fs.js";
 import { isSkillDirIn } from "./skill.js";
 import { loadLock, loadManifest, makeContext, saveManifest, storePath } from "./manifest.js";
-import { addSkill, syncSkills, updateSkills } from "./ops.js";
+import { addSkill, doctor, removeSkill, syncSkills, updateSkills } from "./ops.js";
 import { discoverSkills, discoveryBound, fetchSource, formatSource, isCommitSha, parseSource, sourceKey } from "./source.js";
 import { innerRepository, placeSubmodules } from "./submodules.js";
 import type { Context, Lockfile, Manifest } from "./types.js";
@@ -2089,6 +2089,159 @@ describe("Round B B1: a link is resolved as text, and the file system is asked o
         spy.mockRestore();
         expect(seen.filter((p) => p === target || p.includes("host"))).toEqual([]);
       }
+    });
+  });
+});
+
+/**
+ * Records every path the code asks the file system about (realpath, stat, exists) that would make the
+ * system follow a link chain out of `roots` or onto an absolute/UNC target. Independent of the product's
+ * own link resolver: it walks the chain itself.
+ */
+function leakSpy(roots: string[]): { leaks: string[]; stop: () => void } {
+  const realRoots = roots.map((r) => fs.realpathSync.native(r));
+  const lstat = fs.lstatSync;
+  const readlink = fs.readlinkSync;
+  const native = fs.realpathSync.native;
+  const plain = fs.realpathSync;
+  const stat = fs.statSync;
+  const exists = fs.existsSync;
+  const leaks: string[] = [];
+  const wouldLeave = (p: string): boolean => {
+    const abs = path.resolve(p);
+    for (const root of [...realRoots, ...roots]) {
+      const rel = path.relative(root, abs);
+      if (rel.startsWith("..") || path.isAbsolute(rel)) continue;
+      const queue = rel.split(path.sep).filter(Boolean);
+      const done: string[] = [];
+      let hops = 0;
+      while (queue.length) {
+        const part = queue.shift() as string;
+        if (part === "..") {
+          if (!done.length) return true;
+          done.pop();
+          continue;
+        }
+        const next = path.join(realRoots[roots.indexOf(root) >= 0 ? roots.indexOf(root) : realRoots.indexOf(root)], ...done, part);
+        let st: fs.Stats;
+        try {
+          st = lstat(next);
+        } catch {
+          return false;
+        }
+        if (st.isSymbolicLink()) {
+          if (++hops > 40) return false;
+          const text = readlink(next);
+          if (isAbsoluteLinkText(text)) return true;
+          queue.unshift(...text.split("/").filter(Boolean));
+          continue;
+        }
+        done.push(part);
+      }
+      return false;
+    }
+    return /^[\\/]{2}/.test(p); // a UNC path given directly
+  };
+  const check = (p: unknown) => {
+    if (typeof p === "string" && wouldLeave(p)) leaks.push(p);
+  };
+  vi.spyOn(fs.realpathSync, "native").mockImplementation(((p: string, o?: never) => (check(p), native(p, o))) as never);
+  vi.spyOn(fs, "statSync").mockImplementation(((p: string, o?: never) => (check(p), stat(p, o))) as never);
+  vi.spyOn(fs, "existsSync").mockImplementation(((p: string) => (check(p), exists(p))) as never);
+  vi.spyOn(fs, "realpathSync").mockImplementation(Object.assign(((p: string, o?: never) => (check(p), plain(p, o))) as never, { native: fs.realpathSync.native }));
+  return { leaks, stop: () => vi.restoreAllMocks() };
+}
+
+describe("Round C C1: nothing on the project side is resolved before it is known to stay inside", () => {
+  afterEach(() => vi.restoreAllMocks());
+  const storeOf = () => {
+    const store = path.join(proj, ".skillwharf", "skills", "alpha");
+    fs.mkdirSync(store, { recursive: true });
+    fs.writeFileSync(path.join(store, "SKILL.md"), "---\nname: alpha\ndescription: d\n---\n");
+    return store;
+  };
+  const manifestFor = (source: string): Manifest => {
+    const m = { version: 1, agents: ["claude"], skills: { alpha: { source } } } as Manifest;
+    fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify(m));
+    return m;
+  };
+
+  describe("(a) agent folder entries", () => {
+    it.each([
+      ["a two-hop chain that ends on a UNC path", "//attacker/share/x"],
+      ["a two-hop chain that ends on an absolute path", "/etc"],
+    ])("linkStatus and unlinkSkill leave %s alone and never open it", (_what, end) => {
+      const store = storeOf();
+      const m = manifestFor("path:./x");
+      const target = path.join(proj, ".claude", "skills", "alpha");
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.symlinkSync(end, path.join(proj, "evil"));
+      fs.symlinkSync("../../evil", target);
+      const spy = leakSpy([proj]);
+      expect(linkStatus(ctx, m, "claude", "alpha", store)).toBe("foreign");
+      expect(unlinkSkill(ctx, m, "claude", "alpha", store)).toBe(false);
+      expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+      const found = [...spy.leaks];
+      spy.stop();
+      expect(found).toEqual([]);
+    });
+
+    it("a link to our own store still reads as ok, and a dangling one as broken", () => {
+      const store = storeOf();
+      const m = manifestFor("path:./x");
+      const target = path.join(proj, ".claude", "skills", "alpha");
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.symlinkSync(path.relative(path.dirname(target), store), target);
+      expect(linkStatus(ctx, m, "claude", "alpha", store)).toBe("ok");
+      fs.rmSync(target);
+      fs.symlinkSync("../../does-not-exist", target);
+      expect(linkStatus(ctx, m, "claude", "alpha", store)).toBe("broken");
+    });
+  });
+
+  describe("(b) stored path: sources", () => {
+    it.each(["path://attacker/share/x", "path:\\\\attacker\\share\\x", "path:C:/Windows", "path:c:\\x"])("%s is refused before anything is resolved", (source) => {
+      storeOf();
+      manifestFor(source);
+      const spy = leakSpy([proj]);
+      expect(() => syncSkills(ctx)).toThrow(/names a network share or a drive/);
+      expect(() => doctor(ctx)).not.toThrow(); // doctor reports it, it does not open it
+      const found = [...spy.leaks];
+      spy.stop();
+      expect(found).toEqual([]);
+    });
+
+    it("doctor and remove report the refusal instead of connecting", () => {
+      storeOf();
+      manifestFor("path://attacker/share/x");
+      expect(doctor(ctx).some((i) => /network share or a drive/.test(i.message))).toBe(true);
+      expect(() => removeSkill(ctx, "alpha")).toThrow(/network share or a drive/);
+    });
+
+    it("path:./evil, where evil is a link to a share, is refused as outside the project without opening it", () => {
+      manifestFor("path:./evil");
+      fs.symlinkSync("//attacker/share/x", path.join(proj, "evil"));
+      const spy = leakSpy([proj]);
+      expect(() => syncSkills(ctx)).toThrow(/outside the project/);
+      const found = [...spy.leaks];
+      spy.stop();
+      expect(found).toEqual([]);
+    });
+
+    it("an absolute path outside the project from a cloned manifest is refused before it is resolved", () => {
+      manifestFor("path:/net/attacker/x");
+      const spy = leakSpy([proj]);
+      expect(() => syncSkills(ctx)).toThrow(/outside the project/);
+      expect(spy.leaks).toEqual([]);
+      const seenNet = (fs.statSync as unknown as { mock: { calls: unknown[][] } }).mock.calls.some((c) => String(c[0]).startsWith("/net/"));
+      spy.stop();
+      expect(seenNet).toBe(false);
+    });
+
+    it("a project-relative folder inside the project still works", () => {
+      writeSkill(path.join(proj, "skills", "alpha"), "alpha");
+      manifestFor("path:./skills/alpha");
+      expect(syncSkills(ctx).fetched).toEqual(["alpha"]);
     });
   });
 });

@@ -9,6 +9,8 @@ import {
   hashDir,
   isDir,
   isInside,
+  isNetworkPathText,
+  resolveInsideDetailed,
   pathsOverlap,
   removePath,
   resolveLink,
@@ -93,16 +95,17 @@ export function parseStoredSource(
     if (e instanceof ShortShaError && skill) throw new Error(`Skill "${skill.name}": ${e.message}`);
     throw e;
   }
-  if (p.kind === "path" && skill) assertSourceClear(ctx, skill.m, skill.name, raw, p.path);
-  if (p.kind === "path" && !ctx.global && !opts.allowOutsidePaths) {
-    const real = resolveLink(p.path);
-    const realRoot = resolveLink(ctx.root) ?? ctx.root;
-    const inside = real ? isInside(realRoot, real) : isInside(ctx.root, p.path);
-    if (!inside) {
+  if (p.kind === "path") {
+    // Containment first, as text and through links followed by hand: only then is the
+    // path resolved (see storedPathMayBeResolved).
+    const confined = !ctx.global && !opts.allowOutsidePaths;
+    const resolvable = storedPathMayBeResolved(ctx, raw, p.path);
+    if (confined && !resolvable) {
       throw new Error(
         `Source "${raw}" is outside the project (${ctx.root}). Re-run with --allow-outside-paths if you trust it.`,
       );
     }
+    if (skill && (resolvable || !confined)) assertSourceClear(ctx, skill.m, skill.name, raw, p.path);
   }
   return p;
 }
@@ -794,7 +797,28 @@ function assertStoredSourceClear(ctx: Context, m: Manifest, name: string, raw: s
   } catch {
     return; // a source that does not parse is refused where it is used
   }
-  if (p.kind === "path") assertSourceClear(ctx, m, name, raw, p.path);
+  if (p.kind === "path" && storedPathMayBeResolved(ctx, raw, p.path)) assertSourceClear(ctx, m, name, raw, p.path);
+}
+
+/**
+ * Whether the file system may be asked about a stored `path:` source at all. Network
+ * share and drive text is refused outright (on every platform, global manifest
+ * included). In a project, a path that is not below the project, or whose links lead
+ * out of it, is not resolved: `sync` refuses it as outside the project (unless
+ * `--allow-outside-paths`), and nothing here may connect to a place a cloned
+ * repository's manifest chose.
+ */
+function storedPathMayBeResolved(ctx: Context, raw: string, abs: string): boolean {
+  const text = raw.trim().replace(/^path:/, "");
+  if (isNetworkPathText(text)) {
+    throw new Error(
+      `Source "${raw}" names a network share or a drive; skillwharf does not read local sources from those. Use a path below the project, or a git source.`,
+    );
+  }
+  if (ctx.global) return true;
+  if (!isInside(ctx.root, abs)) return false;
+  const r = resolveInsideDetailed(ctx.root, abs);
+  return !("fail" in r && r.fail === "outside");
 }
 
 /** A skill fetched and verified in phase 1 of `syncSkills`, waiting to be installed. */

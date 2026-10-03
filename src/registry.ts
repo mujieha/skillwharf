@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { assertNoSymlinks, isInside, readJson, writeJson } from "./fs.js";
+import { assertNoSymlinks, isInside, isNetworkPathText, readJson, resolveInsideDetailed, writeJson } from "./fs.js";
 import {
   DEFAULT_REGISTRY,
   listsRegistries,
@@ -73,6 +73,13 @@ export async function loadRegistry(location: string, opts: LoadRegistryOptions =
     } finally {
       fetched.cleanup();
     }
+  }
+  // A share or drive is never asked about (on Windows that would open a connection to a
+  // host a manifest chose); use a git location, an https URL or a folder path instead.
+  if (isNetworkPathText(location)) {
+    throw new Error(
+      `Registry location "${sanitizeForTerminal(location)}" names a network share or a drive; skillwharf does not read registries from those. Use a git location, an https URL, or a folder path.`,
+    );
   }
   const p = fs.existsSync(location) && fs.statSync(location).isDirectory() ? path.join(location, "index.json") : location;
   return readIndexFile(p);
@@ -188,7 +195,16 @@ export async function loadRegistries(
       const head = { name: p.spec.name, location: p.spec.location, scope: p.scope, ...(p.note ? { note: p.note } : {}) };
       if (p.error) return { ...head, error: sanitizeForTerminal(p.error) };
       try {
-        const index = await loadRegistry(resolveLocation(p.spec.location, p.root, ctx.home), { timeoutMs: opts.timeoutMs, deadline });
+        const where = resolveLocation(p.spec.location, p.root, ctx.home);
+        // A relative location in a manifest is read from the folder of that manifest: a link on the
+        // way (a cloned repository can commit one) must stay inside it, checked before any stat.
+        if (p.scope !== "cli" && where !== "default" && classifyLocation(where) === "path" && !isNetworkPathText(where) && isInside(p.root, where)) {
+          const r = resolveInsideDetailed(p.root, where);
+          if ("fail" in r && r.fail === "outside") {
+            throw new Error(`Registry location "${sanitizeForTerminal(p.spec.location)}" leaves the folder of the manifest that lists it (a link points out of it); refusing it.`);
+          }
+        }
+        const index = await loadRegistry(where, { timeoutMs: opts.timeoutMs, deadline });
         const skipped = index.skippedHexRefs ?? [];
         const hexNote =
           skipped.length > 0

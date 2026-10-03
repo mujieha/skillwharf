@@ -172,12 +172,24 @@ const MAX_LINK_HOPS = 32;
  * whole chain is known to stay inside.
  */
 export function resolveInside(root: string, p: string): string | undefined {
+  const r = resolveInsideDetailed(root, p);
+  return "path" in r ? r.path : undefined;
+}
+
+/**
+ * Like `resolveInside`, but says why it failed: `outside` when the path or a link
+ * on the way leaves `root` (absolute or UNC text, a `..` past it, a path that is
+ * not below it), `broken` when it stays inside but does not resolve (a missing
+ * entry, a loop, too many hops). The file system is asked about the same paths
+ * as in `resolveInside`: only ones inside `root`.
+ */
+export function resolveInsideDetailed(root: string, p: string): { path: string } | { fail: "outside" | "broken" } {
   const realBase = fs.realpathSync.native(root);
   // `p` is written either with the real path of `root` or with `root` as it was given.
   const abs = path.resolve(p);
   let rel = path.relative(realBase, abs);
   if (escapes(rel)) rel = path.relative(path.resolve(root), abs);
-  if (escapes(rel)) return undefined;
+  if (escapes(rel)) return { fail: "outside" };
   const queue = rel.split(path.sep).filter(Boolean);
   const done: string[] = [];
   let hops = 0;
@@ -185,7 +197,7 @@ export function resolveInside(root: string, p: string): string | undefined {
     const part = queue.shift() as string;
     if (part === ".") continue;
     if (part === "..") {
-      if (done.length === 0) return undefined;
+      if (done.length === 0) return { fail: "outside" };
       done.pop();
       continue;
     }
@@ -194,27 +206,33 @@ export function resolveInside(root: string, p: string): string | undefined {
     try {
       st = fs.lstatSync(next);
     } catch {
-      return undefined;
+      return { fail: "broken" };
     }
     if (st.isSymbolicLink()) {
-      if (++hops > MAX_LINK_HOPS) return undefined;
+      if (++hops > MAX_LINK_HOPS) return { fail: "broken" };
       let text: string;
       try {
         text = fs.readlinkSync(next);
       } catch {
-        return undefined;
+        return { fail: "broken" };
       }
-      if (isAbsoluteLinkText(text)) return undefined;
-      queue.unshift(...text.split(/[\\/]+/).filter(Boolean));
+      if (isAbsoluteLinkText(text)) return { fail: "outside" };
+      // Backslash separates components only where it is a separator (Windows); elsewhere it is part of a name.
+      queue.unshift(...text.split(process.platform === "win32" ? /[\\/]+/ : /\/+/).filter(Boolean));
       continue;
     }
     done.push(part);
   }
   try {
-    return fs.realpathSync.native(path.join(realBase, ...done));
+    return { path: fs.realpathSync.native(path.join(realBase, ...done)) };
   } catch {
-    return undefined;
+    return { fail: "broken" };
   }
+}
+
+/** True for path text that names a network share or a drive (`//host/share`, `\\host\share`, `C:\x`): refused for stored `path:` sources on every platform. */
+export function isNetworkPathText(text: string): boolean {
+  return /^[\\/]{2}/.test(text) || /^[A-Za-z]:/.test(text);
 }
 
 /** True for a path component that is `.git` in any letter case (and the look-alike forms a file system folds to it). */
