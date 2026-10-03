@@ -1,10 +1,20 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { readJson, writeJson } from "./fs.js";
-import { DEFAULT_REGISTRY, listsRegistries, loadManifest, makeContext, registriesOf } from "./manifest.js";
+import { isInside, readJson, writeJson } from "./fs.js";
+import {
+  DEFAULT_REGISTRY,
+  listsRegistries,
+  loadManifest,
+  makeContext,
+  manifestPath,
+  registriesOf,
+  requireManifest,
+  saveManifest,
+  validateManifest,
+} from "./manifest.js";
 import { fetchSource, parseSource } from "./source.js";
-import type { Context, LoadedRegistry, RegistryEntry, RegistryIndex, RegistrySpec, SearchHit } from "./types.js";
+import type { Context, LoadedRegistry, Manifest, RegistryEntry, RegistryIndex, RegistrySpec, SearchHit } from "./types.js";
 import { assertSkillName, sanitizeForTerminal } from "./validate.js";
 
 export interface LoadRegistryOptions {
@@ -298,6 +308,58 @@ export function resolveRegistryName(
     `\`${name}\` is not in any registry; for a local folder use \`./${name}\`` +
       (failed.length > 0 ? ` (registries that could not be loaded: ${failed.map((r) => `${r.name}: ${r.error}`).join("; ")})` : ""),
   );
+}
+
+/** The registries a manifest lists, written out as a `registries` list (the implied public one and the old field included). */
+function materialize(m: Manifest): RegistrySpec[] {
+  return registriesOf(m).map((r) => ({ ...r }));
+}
+
+/** A path location as it is written to a manifest: project-relative (`./x`) inside the project, else absolute; other kinds as typed. */
+function locationForManifest(ctx: Context, location: string): string {
+  if (location === "default" || classifyLocation(location) !== "path" || location.startsWith("~/") || location === "~") return location;
+  const abs = path.resolve(process.cwd(), location);
+  if (!ctx.global && isInside(ctx.root, abs)) {
+    const rel = path.relative(ctx.root, abs).split(path.sep).join("/");
+    return rel === "" ? "." : `./${rel}`;
+  }
+  return abs;
+}
+
+/**
+ * `registry add`: check the name, load the index once (a typo fails here and
+ * nothing is written), then append to the manifest's list. A manifest that
+ * listed nothing keeps the public registry in the list; the old `registry`
+ * field becomes a list entry named "registry".
+ */
+export async function addRegistry(
+  ctx: Context,
+  name: string,
+  location: string,
+  opts: LoadRegistryOptions = {},
+): Promise<{ entries: number }> {
+  const m = requireManifest(ctx);
+  const list = materialize(m);
+  if (list.some((r) => r.name === name)) throw new Error(`registry "${name}" is already listed`);
+  const spec: RegistrySpec = { name, location: locationForManifest(ctx, location.trim()) };
+  validateManifest({ ...m, registries: [...list, spec], registry: undefined }, manifestPath(ctx));
+  const index = await loadRegistry(resolveLocation(location.trim(), process.cwd(), ctx.home), opts);
+  const next: Manifest = { ...m, registries: [...list, spec] };
+  delete next.registry;
+  saveManifest(ctx, next);
+  return { entries: index.skills.length };
+}
+
+/** `registry remove`: drop one registry from the manifest's list (the last one leaves an explicit empty list). */
+export function removeRegistry(ctx: Context, name: string): void {
+  const m = requireManifest(ctx);
+  const list = materialize(m);
+  if (!list.some((r) => r.name === name)) {
+    throw new Error(`no registry named "${name}"; known: ${list.map((r) => r.name).join(", ") || "(none)"}`);
+  }
+  const next: Manifest = { ...m, registries: list.filter((r) => r.name !== name) };
+  delete next.registry;
+  saveManifest(ctx, next);
 }
 
 /** Insert or replace an entry in a local registry checkout's index.json. */

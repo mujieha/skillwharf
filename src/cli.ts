@@ -6,7 +6,6 @@ import pc from "picocolors";
 import { ADAPTERS, ALL_AGENTS, DEFAULT_AGENTS, groupLabel, isAgentId, targetGroups } from "./agents.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_FILES, isDir, type SizeLimits } from "./fs.js";
 import {
-  DEFAULT_REGISTRY,
   MANIFEST,
   emptyManifest,
   loadLock,
@@ -16,12 +15,20 @@ import {
   requireManifest,
   saveManifest,
   storePath,
+  validateManifest,
 } from "./manifest.js";
 import { addFromRegistry, addSkill, agentsFor, doctor, removeSkill, syncSkills, updateSkills } from "./ops.js";
-import { isRegistryName, loadRegistries, publishToRegistry, searchRegistries } from "./registry.js";
+import {
+  addRegistry,
+  isRegistryName,
+  loadRegistries,
+  publishToRegistry,
+  removeRegistry,
+  searchRegistries,
+} from "./registry.js";
 import { readSkill } from "./skill.js";
 import { parseSource } from "./source.js";
-import type { AgentId, Context } from "./types.js";
+import type { AgentId, Context, Manifest } from "./types.js";
 import { daysAgo, scanClaudeUsage } from "./usage.js";
 import { sanitizeForTerminal, toSafeJson } from "./validate.js";
 
@@ -98,18 +105,50 @@ function stripAnsi(s: string): string {
   return s.replace(/\u001b\[[0-9;]*m/g, "");
 }
 
+/**
+ * `--registry` values for `init`. One bare location is written as the 0.1.x
+ * `registry` field (so the manifest is the one 0.1.x wrote); anything named, or
+ * more than one, goes into `registries`. `name=` counts only when what comes
+ * before the first `=` is a registry name, so a URL with `?a=b` stays a location.
+ */
+function registriesFromFlags(specs: string[]): Pick<Manifest, "registry" | "registries"> {
+  if (specs.length === 0) return {};
+  const parsed = specs.map((s) => {
+    const eq = s.indexOf("=");
+    if (eq > 0 && /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(s.slice(0, eq)) && s.length > eq + 1) {
+      return { name: s.slice(0, eq) as string | undefined, location: s.slice(eq + 1) };
+    }
+    return { name: undefined as string | undefined, location: s };
+  });
+  if (parsed.length === 1 && parsed[0].name === undefined) return { registry: parsed[0].location };
+  if (parsed.filter((p) => p.name === undefined).length > 1) {
+    fail("with more than one --registry, give each a name: --registry name=location");
+  }
+  return { registries: parsed.map((p) => ({ name: p.name ?? "registry", location: p.location })) };
+}
+
 // ---------------------------------------------------------------- init
 program
   .command("init")
   .description(`create ${MANIFEST} (default agents: ${DEFAULT_AGENTS.join(",")} — covers Claude Code, Codex and Cursor)`)
   .option("-a, --agents <list>", "comma-separated agents: " + ALL_AGENTS.join(","))
-  .option("--registry <url>", "default registry index URL")
-  .action((opts: { agents?: string; registry?: string }, cmd: Command) => {
+  .option(
+    "--registry <spec>",
+    "a registry for this project: <location>, or <name>=<location>; repeat for several. A location is an https index URL, a git source or a local path",
+    (value: string, previous: string[]) => [...previous, value],
+    [] as string[],
+  )
+  .action((opts: { agents?: string; registry: string[] }, cmd: Command) => {
     const ctx = ctxFrom(cmd);
     if (loadManifest(ctx)) fail(`${rel(ctx, manifestPath(ctx))} already exists`);
     const agents = parseAgents(opts.agents) ?? [...DEFAULT_AGENTS];
     const m = emptyManifest(agents);
-    if (opts.registry) m.registry = opts.registry;
+    Object.assign(m, registriesFromFlags(opts.registry));
+    try {
+      validateManifest(m, MANIFEST);
+    } catch (e) {
+      fail((e as Error).message);
+    }
     fs.mkdirSync(ctx.root, { recursive: true });
     saveManifest(ctx, m);
     console.log(pc.green("✔"), `created ${rel(ctx, manifestPath(ctx))}`);
@@ -439,18 +478,93 @@ program
     }
   });
 
+// ---------------------------------------------------------------- registry
+const registryCmd = program
+  .command("registry")
+  .description("manage the registries this project searches (add, remove, list)")
+  .addHelpCommand(false);
+
+registryCmd
+  .command("add <name> <location>")
+  .description("add a registry: an https index URL, a git source whose repository root holds index.json, or a local path")
+  .action(async (name: string, location: string, _opts: unknown, cmd: Command) => {
+    const ctx = ctxFrom(cmd);
+    try {
+      const r = await addRegistry(ctx, name, location, { timeoutMs: gitTimeoutMs(cmd) });
+      console.log(pc.green("✔"), `added registry ${pc.bold(clean(name))}`, pc.dim(`(${r.entries} skills)`));
+    } catch (e) {
+      fail((e as Error).message);
+    }
+  });
+
+registryCmd
+  .command("remove <name>")
+  .alias("rm")
+  .description("remove a registry from the manifest")
+  .action((name: string, _opts: unknown, cmd: Command) => {
+    const ctx = ctxFrom(cmd);
+    try {
+      removeRegistry(ctx, name);
+      console.log(pc.green("✔"), `removed registry ${pc.bold(clean(name))}`);
+    } catch (e) {
+      fail((e as Error).message);
+    }
+  });
+
+registryCmd
+  .command("list")
+  .alias("ls")
+  .description("show each registry with where it is, how many skills it lists, and whether it loaded")
+  .action(async (_opts: unknown, cmd: Command) => {
+    const ctx = ctxFrom(cmd);
+    const gopts = cmd.optsWithGlobals() as { json?: boolean };
+    try {
+      const registries = await loadRegistries(ctx, { timeoutMs: gitTimeoutMs(cmd) });
+      if (gopts.json) {
+        return console.log(
+          toSafeJson(
+            registries.map((r) => ({
+              name: r.name,
+              location: r.location,
+              scope: r.scope,
+              entries: r.index ? r.index.skills.length : null,
+              status: r.index ? "loaded" : "failed",
+              ...(r.error !== undefined ? { error: r.error } : {}),
+            })),
+          ),
+        );
+      }
+      if (registries.length === 0) return console.log(pc.dim("no registries listed; add one with: skillwharf registry add <name> <location>"));
+      console.log(
+        table(
+          registries.map((r) => [
+            pc.bold(clean(r.name)),
+            clean(r.location),
+            r.index ? String(r.index.skills.length) : pc.dim("-"),
+            r.index ? pc.green("loaded") : pc.red(clean(r.error ?? "failed")),
+          ]),
+          ["name", "location", "skills", "status"],
+        ),
+      );
+    } catch (e) {
+      fail((e as Error).message);
+    }
+  });
+
 // ---------------------------------------------------------------- publish
 program
   .command("publish <skillPath>")
   .description("add or update a skill entry in a local registry checkout (then commit and push it)")
   .requiredOption("--registry <dir>", "local checkout of the registry repo")
-  .requiredOption("--source <source>", "public install source, e.g. github:owner/repo/path")
+  .requiredOption("--source <source>", "where the skill is installed from, on any git host: github:owner/repo/path, gitlab:group/repo//path, git+https://host/repo.git//path")
   .option("--tags <list>", "comma-separated tags")
   .action((skillPath: string, opts: { registry: string; source: string; tags?: string }) => {
     try {
       const dir = path.resolve(skillPath);
       const meta = readSkill(dir);
-      parseSource(opts.source); // validate
+      if (parseSource(opts.source).kind !== "git") {
+        throw new Error("a registry entry must be a git source (github:, gitlab:, bitbucket:, git+https:// or git+ssh://), not a local path");
+      }
       const r = publishToRegistry(path.resolve(opts.registry), {
         name: meta.name,
         description: meta.description,

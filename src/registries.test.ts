@@ -7,7 +7,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { allowProtocolsForTests, setGitExecForTests } from "./git.js";
 import { DEFAULT_REGISTRY, makeContext, registriesOf, validateManifest } from "./manifest.js";
 import { addFromRegistry } from "./ops.js";
-import { isRegistryName, loadRegistries, loadRegistry, resolveRegistryName, searchRegistries } from "./registry.js";
+import {
+  addRegistry,
+  isRegistryName,
+  loadRegistries,
+  loadRegistry,
+  removeRegistry,
+  resolveRegistryName,
+  searchRegistries,
+} from "./registry.js";
 import type { Context, LoadedRegistry, Manifest, RegistrySpec } from "./types.js";
 
 const realExec = { fn: execFileSync };
@@ -533,5 +541,191 @@ describe("search and add on the command line", () => {
     const r = cli(["add", "nothing-here"]);
     expect(r.status).toBe(1);
     expect(r.stderr).toContain("`nothing-here` is not in any registry; for a local folder use `./nothing-here`");
+  });
+});
+
+// ------------------------------------------------------------------ S2.5 commands
+describe("S2.5: registry add, remove and list", () => {
+  const manifestText = () => fs.readFileSync(path.join(proj, "skillwharf.json"), "utf8");
+  const manifest = () => JSON.parse(manifestText()) as Manifest;
+  let team: string, other: string;
+  beforeEach(() => {
+    team = writeIndex(path.join(proj, "team.json"), entry("one"), entry("two"));
+    other = writeIndex(path.join(base, "other.json"), entry("three"));
+  });
+
+  it("add loads the index once and appends to the list", async () => {
+    writeManifest(proj, { registries: [{ name: "pub", location: other }] });
+    const r = await addRegistry(ctx, "team", team);
+    expect(r.entries).toBe(2);
+    expect(manifest().registries).toEqual([{ name: "pub", location: other }, { name: "team", location: "./team.json" }]);
+  });
+
+  it("add with a typo fails and leaves the manifest byte-identical", async () => {
+    writeManifest(proj, { registries: [{ name: "pub", location: other }] });
+    const before = manifestText();
+    await expect(addRegistry(ctx, "typo", path.join(base, "no-such.json"))).rejects.toThrow(/Registry index not found/);
+    expect(manifestText()).toBe(before);
+  });
+
+  it("add keeps the public registry when the manifest listed nothing", async () => {
+    writeManifest(proj, {});
+    await addRegistry(ctx, "team", team);
+    expect(manifest().registries).toEqual([{ name: "default", location: "default" }, { name: "team", location: "./team.json" }]);
+    expect("registry" in manifest()).toBe(false);
+  });
+
+  it("add turns the old registry field into the list", async () => {
+    writeManifest(proj, { registry: other });
+    await addRegistry(ctx, "team", team);
+    expect(manifest().registries).toEqual([{ name: "registry", location: other }, { name: "team", location: "./team.json" }]);
+    expect("registry" in manifest()).toBe(false);
+  });
+
+  it("add refuses a name that is already listed, and a name that is not a valid name", async () => {
+    writeManifest(proj, { registries: [{ name: "team", location: other }] });
+    const before = manifestText();
+    await expect(addRegistry(ctx, "team", team)).rejects.toThrow(/registry "team" is already listed/);
+    await expect(addRegistry(ctx, "Bad Name", team)).rejects.toThrow(/invalid registry name/);
+    expect(manifestText()).toBe(before);
+  });
+
+  it("add accepts a git location, loaded through the same guards", async () => {
+    makeRepo("team/registry", (w) => writeIndex(path.join(w, "index.json"), entry("one")));
+    routeHosts(HOSTS);
+    writeManifest(proj, {});
+    await addRegistry(ctx, "git", "git+https://git.acme.test/team/registry.git");
+    expect(manifest().registries?.[1]).toEqual({ name: "git", location: "git+https://git.acme.test/team/registry.git" });
+  });
+
+  it("remove drops the named registry", async () => {
+    writeManifest(proj, { registries: [{ name: "pub", location: other }, { name: "team", location: "./team.json" }] });
+    removeRegistry(ctx, "pub");
+    expect(manifest().registries).toEqual([{ name: "team", location: "./team.json" }]);
+  });
+
+  it("remove of the last registry leaves an explicit empty list", () => {
+    writeManifest(proj, { registries: [{ name: "pub", location: other }] });
+    removeRegistry(ctx, "pub");
+    expect(manifest().registries).toEqual([]);
+    expect(registriesOf(manifest())).toEqual([]);
+  });
+
+  it("remove default drops the public registry that was only implied", () => {
+    writeManifest(proj, {});
+    removeRegistry(ctx, "default");
+    expect(manifest().registries).toEqual([]);
+  });
+
+  it("remove of the old registry field writes the list without it", () => {
+    writeManifest(proj, { registry: other });
+    removeRegistry(ctx, "registry");
+    expect(manifest().registries).toEqual([]);
+    expect("registry" in manifest()).toBe(false);
+  });
+
+  it("remove of an unknown name lists the known ones and changes nothing", () => {
+    writeManifest(proj, { registries: [{ name: "pub", location: other }] });
+    const before = manifestText();
+    expect(() => removeRegistry(ctx, "nope")).toThrow(/no registry named "nope"; known: pub/);
+    expect(manifestText()).toBe(before);
+  });
+});
+
+describe("S2.5: registry commands and init on the command line", () => {
+  const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  function cli(args: string[], cwd = proj) {
+    const r = spawnSync(process.execPath, [path.join(repo, "node_modules/tsx/dist/cli.mjs"), path.join(repo, "src/cli.ts"), ...args], {
+      cwd,
+      env: { ...process.env, SKILLWHARF_HOME: home },
+      encoding: "utf8",
+    });
+    return { stdout: r.stdout, stderr: r.stderr, status: r.status };
+  }
+  // eslint-disable-next-line no-control-regex
+  const plain = (s: string) => s.replace(/\u001b\[[0-9;]*m/g, "");
+  const manifest = () => JSON.parse(fs.readFileSync(path.join(proj, "skillwharf.json"), "utf8")) as Manifest;
+
+  it("registry list shows name, location, entry count and loaded, or the error", () => {
+    const good = writeIndex(path.join(proj, "good.json"), entry("one"), entry("two"));
+    writeManifest(proj, { registries: [{ name: "good", location: good }, { name: "broken", location: path.join(base, "missing.json") }] });
+    const r = cli(["registry", "list"]);
+    expect(r.status).toBe(0);
+    const out = plain(r.stdout);
+    expect(out).toMatch(/name\s+location\s+skills\s+status/);
+    expect(out).toMatch(new RegExp(`good\\s+${good.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s+2\\s+loaded`));
+    expect(out).toMatch(/broken\s+.*missing\.json\s+-\s+Registry index not found/);
+  });
+
+  it("registry list --json is plain JSON", () => {
+    const good = writeIndex(path.join(proj, "good.json"), entry("one"));
+    writeManifest(proj, { registries: [{ name: "good", location: good }] });
+    const rows = JSON.parse(cli(["--json", "registry", "list"]).stdout) as Record<string, unknown>[];
+    expect(rows).toEqual([{ name: "good", location: good, scope: "project", entries: 1, status: "loaded" }]);
+  });
+
+  it("registry add and remove through the command line", () => {
+    writeManifest(proj, {});
+    writeIndex(path.join(proj, "team.json"), entry("one"));
+    const added = cli(["registry", "add", "team", "./team.json"]);
+    expect(added.status).toBe(0);
+    expect(manifest().registries).toEqual([{ name: "default", location: "default" }, { name: "team", location: "./team.json" }]);
+    expect(cli(["registry", "remove", "default"]).status).toBe(0);
+    expect(manifest().registries).toEqual([{ name: "team", location: "./team.json" }]);
+    const bad = cli(["registry", "add", "typo", "./nope.json"]);
+    expect(bad.status).toBe(1);
+    expect(bad.stderr).toMatch(/Registry index not found/);
+  });
+
+  it("registry add -g writes the global manifest", () => {
+    writeManifest(path.join(home, ".skillwharf"), {});
+    const idx = writeIndex(path.join(base, "company.json"), entry("one"));
+    expect(cli(["-g", "registry", "add", "company", idx]).status).toBe(0);
+    const g = JSON.parse(fs.readFileSync(path.join(home, ".skillwharf", "skillwharf.json"), "utf8")) as Manifest;
+    expect(g.registries).toEqual([{ name: "default", location: "default" }, { name: "company", location: idx }]);
+  });
+
+  it("init --registry <location> writes the 0.1.x field, byte for byte", () => {
+    const r = cli(["init", "-a", "claude", "--registry", "https://example.invalid/index.json"]);
+    expect(r.status).toBe(0);
+    expect(fs.readFileSync(path.join(proj, "skillwharf.json"), "utf8")).toBe(
+      JSON.stringify({ version: 1, agents: ["claude"], skills: {}, registry: "https://example.invalid/index.json" }, null, 2) + "\n",
+    );
+  });
+
+  it("init --registry name=location, repeated, writes the list in order", () => {
+    const r = cli(["init", "-a", "claude", "--registry", "pub=https://example.invalid/a.json", "--registry", "team=git+https://git.acme.test/team/registry.git"]);
+    expect(r.status).toBe(0);
+    const m = manifest();
+    expect(m.registries).toEqual([
+      { name: "pub", location: "https://example.invalid/a.json" },
+      { name: "team", location: "git+https://git.acme.test/team/registry.git" },
+    ]);
+    expect("registry" in m).toBe(false);
+  });
+
+  it("init: a URL with = in it is a location, not name=location", () => {
+    cli(["init", "-a", "claude", "--registry", "https://example.invalid/i.json?a=b"]);
+    expect(manifest().registry).toBe("https://example.invalid/i.json?a=b");
+  });
+
+  it("init refuses two bare registries and a duplicate name", () => {
+    expect(cli(["init", "--registry", "https://example.invalid/a.json", "--registry", "https://example.invalid/b.json"]).stderr).toMatch(/name=location/);
+    expect(cli(["init", "--registry", "a=./x", "--registry", "a=./y"]).stderr).toMatch(/more than once/);
+    expect(fs.existsSync(path.join(proj, "skillwharf.json"))).toBe(false);
+  });
+
+  it("publish accepts a source on any git host and refuses a local path", () => {
+    const skill = path.join(base, "skill");
+    fs.mkdirSync(skill);
+    fs.writeFileSync(path.join(skill, "SKILL.md"), "---\nname: mine\ndescription: d\n---\nbody\n");
+    const reg = path.join(base, "registry-checkout");
+    fs.mkdirSync(reg);
+    const ok = cli(["publish", skill, "--registry", reg, "--source", "gitlab:acme/platform/skills//mine"]);
+    expect(ok.status).toBe(0);
+    expect(JSON.parse(fs.readFileSync(path.join(reg, "index.json"), "utf8")).skills[0].source).toBe("gitlab:acme/platform/skills//mine");
+    const bad = cli(["publish", skill, "--registry", reg, "--source", "path:./skill"]);
+    expect(bad.status).toBe(1);
+    expect(bad.stderr).toMatch(/registry entry must be a git source/);
   });
 });
