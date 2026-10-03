@@ -653,6 +653,19 @@ export function syncSkills(ctx: Context, options: SyncOptions = {}): SyncReport 
     }
   }
 
+  // Every lock entry that will be fetched must name the manifest's own source (same
+  // repository, same URL) before any git call is made for any skill. A pin that is
+  // merely unusable (an abbreviated sha) is reported with its skill in phase 1.
+  for (const [name, spec] of Object.entries(m.skills)) {
+    const entry = lock.skills[name];
+    if (!entry || isDir(storePath(ctx, name))) continue;
+    try {
+      lockedSource(ctx, m, name, spec, entry, opts);
+    } catch (e) {
+      if (!(e instanceof UnusablePin)) throw e;
+    }
+  }
+
   // Phase 1: fetch every missing skill into a staging folder and check it
   // against the lockfile. Nothing touches the store, the agent folders or the
   // lockfile here, so a failure for any skill leaves the project as it was and
@@ -721,7 +734,12 @@ export function syncSkills(ctx: Context, options: SyncOptions = {}): SyncReport 
         if (pinnedIntegrity !== undefined && integrity !== pinnedIntegrity) {
           throw new Error(
             `integrity mismatch for "${name}": the pinned content hashes to ${integrity}, the lockfile expects ${pinnedIntegrity}. ` +
-              `Nothing was installed and the lockfile was not changed.`,
+              `Nothing was installed and the lockfile was not changed.` +
+              // skillwharf 0.1.x wrote no `links` record; files are now checked out as committed
+              // (no LFS, eol, ident or autocrlf conversion), which can change what a 0.1.x lock hashed.
+              (entry && !entry.links
+                ? ` If this lock was written by skillwharf 0.1.x, run \`skillwharf update ${name}\` to re-pin the committed bytes.`
+                : ""),
           );
         }
         staged.set(name, { dir, resolved: fetched.resolved, integrity, version: readSkill(dir).version });

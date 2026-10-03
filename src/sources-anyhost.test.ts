@@ -2093,6 +2093,49 @@ describe("Round B B1: a link is resolved as text, and the file system is asked o
   });
 });
 
+describe("Round C C4: every lock entry is checked against the manifest before any git call", () => {
+  it("a mismatch in the second skill stops sync before the first is fetched", () => {
+    const sha = makeRepo("team/skills", (w) => {
+      writeSkill(path.join(w, "a"), "a");
+      writeSkill(path.join(w, "b"), "b");
+    });
+    routeHosts(ALL_HOSTS);
+    const a = "git+https://git.acme.test/team/skills.git//a";
+    const b = "git+https://git.acme.test/team/skills.git//b";
+    fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: { a: { source: a }, b: { source: b } } }));
+    fs.writeFileSync(
+      path.join(proj, "skillwharf.lock.json"),
+      JSON.stringify({
+        version: 1,
+        skills: {
+          a: { source: a, resolved: `${a}@${sha}`, integrity: integrityAt(`${a}@${sha}`), installedAt: "x" },
+          b: { source: b, resolved: `git+https://git.acme.test/team/skills//b@${sha}`, integrity: "sha256-x", installedAt: "x" }, // no .git: another URL
+        },
+      }),
+    );
+    exec.mockClear();
+    expect(() => syncSkills(ctx)).toThrow(/entry for "b".*does not match the manifest source/);
+    expect(exec).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(proj, ".skillwharf"))).toBe(false);
+  });
+});
+
+describe("Round C C5: a 0.1.x lock whose bytes changed says what to run", () => {
+  it("the integrity-mismatch error for a lock with no links record names skillwharf update", () => {
+    const sha = makeRepo("team/skills", (w) => writeSkill(path.join(w, "a"), "a", "committed"));
+    routeHosts(ALL_HOSTS);
+    const a = "git+https://git.acme.test/team/skills.git//a";
+    fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: { a: { source: a } } }));
+    fs.writeFileSync(
+      path.join(proj, "skillwharf.lock.json"),
+      JSON.stringify({ version: 1, skills: { a: { source: a, resolved: `${a}@${sha}`, integrity: "sha256-from-0.1.x", installedAt: "x" } } }),
+    );
+    expect(() => syncSkills(ctx)).toThrow(
+      /integrity mismatch for "a".*If this lock was written by skillwharf 0\.1\.x, run `skillwharf update a` to re-pin the committed bytes/s,
+    );
+  });
+});
+
 describe("Round B B3: the lock is fetched from the manifest's URL, and a lock for another URL is refused before any git call", () => {
   const lockFor = (source: string, resolved: string): void => {
     fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: { a: { source } } }));
