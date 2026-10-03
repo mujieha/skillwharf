@@ -17,8 +17,8 @@ import {
   saveManifest,
   storePath,
 } from "./manifest.js";
-import { addSkill, agentsFor, doctor, removeSkill, syncSkills, updateSkills } from "./ops.js";
-import { loadRegistry, publishToRegistry, searchRegistry } from "./registry.js";
+import { addFromRegistry, addSkill, agentsFor, doctor, removeSkill, syncSkills, updateSkills } from "./ops.js";
+import { isRegistryName, loadRegistries, publishToRegistry, searchRegistries } from "./registry.js";
 import { readSkill } from "./skill.js";
 import { parseSource } from "./source.js";
 import type { AgentId, Context } from "./types.js";
@@ -122,6 +122,7 @@ interface AddCliOptions {
   name?: string;
   agents?: string;
   all?: boolean;
+  from?: string;
   force?: boolean;
   maxSkillSize?: string;
   maxSkillFiles?: string;
@@ -129,26 +130,34 @@ interface AddCliOptions {
 
 program
   .command("add <source>")
-  .description("install a skill from github:owner/repo[/path][@ref], a GitHub URL, or a local path")
+  .description(
+    "install a skill by registry name, or from github:owner/repo[//dir][@ref], gitlab:group/repo//dir, bitbucket:owner/repo//dir, git+https://host/repo.git//dir, git+ssh://git@host/repo.git//dir, a web URL, or a local path",
+  )
   .option("-n, --name <name>", "override the skill name")
   .option("-a, --agents <list>", "only link into these agents")
   .option("--all", "install every skill found in the source")
+  .option("--from <registry>", "with a skill name: take it from this registry (needed when two registries list the name)")
   .option("--force", "replace agent files that skillwharf did not create")
   .option("--max-skill-size <mb>", `refuse a skill folder over this many megabytes (default ${DEFAULT_MAX_BYTES / 1024 / 1024})`)
   .option("--max-skill-files <n>", `refuse a skill folder with more than this many files and folders (default ${DEFAULT_MAX_FILES})`)
-  .action((source: string, opts: AddCliOptions, cmd: Command) => {
+  .action(async (source: string, opts: AddCliOptions, cmd: Command) => {
     const ctx = ctxFrom(cmd);
     const timeout = gitTimeoutMs(cmd);
     try {
-      const added = addSkill(ctx, source, {
+      const byName = isRegistryName(source);
+      if (opts.from !== undefined && !byName) fail("--from is for a skill name (skillwharf add <name> --from <registry>), not a source");
+      const addOpts = {
         name: opts.name,
         agents: parseAgents(opts.agents),
         all: opts.all,
         force: opts.force,
         limits: parseLimits(opts),
         gitTimeoutMs: timeout,
-        onSkipped: (s) => console.log(pc.yellow("!"), `skipped ${clean(s.dir)}: ${clean(s.reason)}`),
-      });
+        onSkipped: (s: { dir: string; reason: string }) => console.log(pc.yellow("!"), `skipped ${clean(s.dir)}: ${clean(s.reason)}`),
+      };
+      const added = byName
+        ? await addFromRegistry(ctx, source, { ...addOpts, from: opts.from, onWarning: (w) => console.error(pc.yellow("!"), clean(w)) })
+        : addSkill(ctx, source, addOpts);
       for (const a of added) {
         console.log(pc.green("✔"), pc.bold(a.name), a.meta.version ? pc.dim(`v${clean(a.meta.version)}`) : "", pc.dim(clean(a.lock.resolved)));
         for (const l of a.links) {
@@ -397,21 +406,32 @@ program
 // ---------------------------------------------------------------- search
 program
   .command("search <query...>")
-  .description("search a registry index (default: manifest.registry or the public index)")
-  .option("--registry <url|path>", "registry index URL, index.json or a directory containing one")
+  .description("search the registries the manifest lists (default: the public index); results name their registry")
+  .option("--registry <url|path>", "search only this registry: an index URL, a git source, an index.json or a directory containing one")
   .action(async (query: string[], opts: { registry?: string }, cmd: Command) => {
     const ctx = ctxFrom(cmd);
     const gopts = cmd.optsWithGlobals() as { json?: boolean };
-    const reg = opts.registry ?? loadManifest(ctx)?.registry ?? DEFAULT_REGISTRY;
+    const timeout = gitTimeoutMs(cmd);
     try {
-      const idx = await loadRegistry(reg);
-      const hits = searchRegistry(idx, query.join(" "));
+      const registries = await loadRegistries(ctx, {
+        only: opts.registry ? [{ name: "registry", location: opts.registry }] : undefined,
+        timeoutMs: timeout,
+      });
+      for (const r of registries) if (r.error !== undefined) console.error(pc.yellow("!"), `registry ${clean(r.name)}: ${clean(r.error)}`);
+      if (registries.length > 0 && registries.every((r) => r.error !== undefined)) fail("no registry could be loaded");
+      const hits = searchRegistries(registries, query.join(" "));
       if (gopts.json) return console.log(toSafeJson(hits));
-      if (hits.length === 0) return console.log(pc.dim(`no matches in ${clean(reg)}`));
+      if (hits.length === 0) return console.log(pc.dim(`no matches in ${registries.filter((r) => r.index).map((r) => clean(r.name)).join(", ") || "any registry"}`));
+      const several = registries.length > 1;
       console.log(
         table(
-          hits.slice(0, 20).map((h) => [pc.bold(clean(h.name)), shorten(clean(h.description), 60), pc.dim(clean(h.source))]),
-          ["skill", "description", "install with: skillwharf add <source>"],
+          hits.slice(0, 20).map((h) => [
+            pc.bold(clean(h.name)),
+            ...(several ? [clean(h.registry)] : []),
+            shorten(clean(h.description), 60),
+            pc.dim(clean(h.source)),
+          ]),
+          ["skill", ...(several ? ["registry"] : []), "description", "install with: skillwharf add <source>"],
         ),
       );
     } catch (e) {

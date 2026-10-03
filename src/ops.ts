@@ -28,6 +28,7 @@ import { LOCKFILE, assertSafeTarget, loadLock, requireManifest, saveLock, saveMa
 import { normalizeName, readSkill } from "./skill.js";
 import { assertSubpath } from "./validate.js";
 import { GitError } from "./git.js";
+import { loadRegistries, resolveRegistryName } from "./registry.js";
 import {
   PinUnavailable,
   discoverSkills,
@@ -496,6 +497,25 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
     fetched.cleanup();
     if (stagingRoot) removePath(stagingRoot);
   }
+}
+
+export interface AddFromRegistryOptions extends AddOptions {
+  /** Take the skill from this registry (needed when two registries list the name). */
+  from?: string;
+  /** Called for each registry that could not be loaded, with a line saying which and why. */
+  onWarning?: (message: string) => void;
+}
+
+/**
+ * `add <name>`: look the name up in the registries (in order), then install the
+ * source the entry gives, exactly as `add <source>` would. The manifest records
+ * that source, not the name.
+ */
+export async function addFromRegistry(ctx: Context, name: string, opts: AddFromRegistryOptions = {}): Promise<AddedSkill[]> {
+  const registries = await loadRegistries(ctx, { timeoutMs: opts.gitTimeoutMs });
+  for (const r of registries) if (r.error !== undefined) opts.onWarning?.(`registry ${r.name}: ${r.error}`);
+  const { entry } = resolveRegistryName(registries, name, opts.from);
+  return addSkill(ctx, entry.source, { ...opts, name: opts.name ?? entry.name });
 }
 
 export interface RemoveResult {

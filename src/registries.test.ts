@@ -1,12 +1,14 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { allowProtocolsForTests, setGitExecForTests } from "./git.js";
 import { DEFAULT_REGISTRY, makeContext, registriesOf, validateManifest } from "./manifest.js";
-import { loadRegistries, loadRegistry } from "./registry.js";
-import type { Context, Manifest, RegistrySpec } from "./types.js";
+import { addFromRegistry } from "./ops.js";
+import { isRegistryName, loadRegistries, loadRegistry, resolveRegistryName, searchRegistries } from "./registry.js";
+import type { Context, LoadedRegistry, Manifest, RegistrySpec } from "./types.js";
 
 const realExec = { fn: execFileSync };
 const exec = vi.fn<typeof execFileSync>(execFileSync);
@@ -329,5 +331,207 @@ describe("S2.1: the global list comes first, the project list after", () => {
     const r = await loadRegistries(ctx);
     expect(r.map((x) => x.name)).toEqual(["registry"]);
     expect(names(r[0])).toEqual(["from-a"]);
+  });
+});
+
+// ------------------------------------------------------------------ S2.3 / S2.4 search and add
+const loaded = (name: string, ...skills: object[]): LoadedRegistry => ({
+  name,
+  location: `./${name}.json`,
+  scope: "project",
+  index: { version: 1, skills: skills as never },
+});
+
+describe("S2.3: search rows carry the registry, and keep each registry's own entry", () => {
+  it("orders by score, then by registry order, and shows a name two registries share as two rows", () => {
+    const a = loaded("a", entry("pdf-extra", "github:a/b/pdf-extra", "extra pdf things"), entry("pdf", "github:a/b/pdf", "pdf tools"));
+    const b = loaded("b", entry("pdf", "gitlab:b/c//pdf", "pdf tools, company copy"));
+    const hits = searchRegistries([a, b], "pdf");
+    expect(hits.map((h) => [h.registry, h.name])).toEqual([["a", "pdf"], ["b", "pdf"], ["a", "pdf-extra"]]);
+    expect(hits[0].source).toBe("github:a/b/pdf");
+    expect(hits[1].source).toBe("gitlab:b/c//pdf");
+  });
+
+  it("a registry that failed to load contributes no rows", () => {
+    const broken: LoadedRegistry = { name: "broken", location: "./x", scope: "project", error: "nope" };
+    expect(searchRegistries([broken, loaded("a", entry("pdf"))], "pdf").map((h) => h.registry)).toEqual(["a"]);
+  });
+});
+
+describe("S2.4: add <name> resolves through the registries, in order", () => {
+  it("takes the only entry with that name", () => {
+    const r = resolveRegistryName([loaded("a", entry("pdf", "github:a/b/pdf")), loaded("b", entry("ocr"))], "ocr");
+    expect(r.registry).toBe("b");
+    expect(r.entry.source).toBe("github:a/b/ocr");
+  });
+
+  it("refuses when two registries list the name, showing both", () => {
+    const regs = [loaded("a", entry("pdf", "github:a/b/pdf")), loaded("b", entry("pdf", "gitlab:g/r//pdf"))];
+    expect(() => resolveRegistryName(regs, "pdf")).toThrow(
+      '"pdf" is listed by a (github:a/b/pdf) and b (gitlab:g/r//pdf); pick one with --from <registry>',
+    );
+  });
+
+  it("--from picks one registry", () => {
+    const regs = [loaded("a", entry("pdf", "github:a/b/pdf")), loaded("b", entry("pdf", "gitlab:g/r//pdf"))];
+    expect(resolveRegistryName(regs, "pdf", "b").entry.source).toBe("gitlab:g/r//pdf");
+  });
+
+  it("--from with an unknown registry lists the known ones", () => {
+    expect(() => resolveRegistryName([loaded("a"), loaded("b")], "pdf", "zzz")).toThrow(/no registry named "zzz"; known: a, b/);
+  });
+
+  it("--from a registry that failed to load says why", () => {
+    const broken: LoadedRegistry = { name: "broken", location: "./x", scope: "project", error: "Registry index not found at ./x" };
+    expect(() => resolveRegistryName([broken], "pdf", "broken")).toThrow(/registry "broken" could not be loaded: Registry index not found/);
+  });
+
+  it("--from a registry that does not list the name says so", () => {
+    expect(() => resolveRegistryName([loaded("a", entry("ocr"))], "pdf", "a")).toThrow(/"pdf" is not in registry "a"/);
+  });
+
+  it("no registry lists it: the error says how to add a local folder", () => {
+    expect(() => resolveRegistryName([loaded("a", entry("ocr"))], "pdf")).toThrow(
+      "`pdf` is not in any registry; for a local folder use `./pdf`",
+    );
+  });
+
+  it("names a registry that could not be loaded, since the skill may be in it", () => {
+    const broken: LoadedRegistry = { name: "broken", location: "./x", scope: "project", error: "boom" };
+    expect(() => resolveRegistryName([broken, loaded("a")], "pdf")).toThrow(/not in any registry.*broken: boom/s);
+  });
+
+  it.each([
+    ["pdf", true],
+    ["release-notes", true],
+    ["github:a/b/x", false],
+    ["git+https://h.example/r.git", false],
+    ["./pdf", false],
+    ["../pdf", false],
+    ["~/pdf", false],
+    ["a/b", false],
+    ["Skills", false],
+    ["my_skill", false],
+    ["C:\\skills", false],
+  ])("isRegistryName(%s) is %s", (arg, want) => {
+    expect(isRegistryName(arg)).toBe(want);
+  });
+});
+
+describe("S2.4: addFromRegistry installs what the registry says", () => {
+  const alphaRepo = (w: string) => {
+    fs.mkdirSync(path.join(w, "alpha"), { recursive: true });
+    fs.writeFileSync(path.join(w, "alpha", "SKILL.md"), "---\nname: alpha\ndescription: d\n---\nbody\n");
+  };
+  beforeEach(() => {
+    makeRepo("team/skills", alphaRepo);
+    makeRepo("acme/skills", alphaRepo);
+    routeHosts(HOSTS);
+  });
+
+  it("records the git source, not the name, in the manifest", async () => {
+    const idx = writeIndex(path.join(base, "team.json"), entry("alpha", "git+https://git.acme.test/team/skills.git//alpha"));
+    writeManifest(proj, { registries: [{ name: "team", location: idx }] });
+    const added = await addFromRegistry(ctx, "alpha", {});
+    expect(added.map((a) => a.name)).toEqual(["alpha"]);
+    const m = JSON.parse(fs.readFileSync(path.join(proj, "skillwharf.json"), "utf8")) as Manifest;
+    expect(m.skills.alpha.source).toBe("git+https://git.acme.test/team/skills.git//alpha");
+  });
+
+  it("takes the first registry's entry when only one lists the name, and warns about one that failed", async () => {
+    const ok = writeIndex(path.join(base, "ok.json"), entry("alpha", "github:acme/skills/alpha"));
+    writeManifest(proj, {
+      registries: [{ name: "broken", location: path.join(base, "missing.json") }, { name: "ok", location: ok }],
+    });
+    const warnings: string[] = [];
+    await addFromRegistry(ctx, "alpha", { onWarning: (w) => warnings.push(w) });
+    expect(warnings).toEqual([expect.stringMatching(/registry broken: .*Registry index not found/)]);
+  });
+
+  it("refuses a name two registries list, and --from picks one", async () => {
+    const one = writeIndex(path.join(base, "one.json"), entry("alpha", "github:acme/skills/alpha"));
+    const two = writeIndex(path.join(base, "two.json"), entry("alpha", "git+https://git.acme.test/team/skills.git//alpha"));
+    writeManifest(proj, { registries: [{ name: "one", location: one }, { name: "two", location: two }] });
+    await expect(addFromRegistry(ctx, "alpha", {})).rejects.toThrow(/"alpha" is listed by one \(github:acme\/skills\/alpha\) and two \(git\+https:\/\/git\.acme\.test\/team\/skills\.git\/\/alpha\); pick one with --from <registry>/);
+    expect(fs.existsSync(path.join(proj, ".skillwharf"))).toBe(false);
+    await addFromRegistry(ctx, "alpha", { from: "two" });
+    const m = JSON.parse(fs.readFileSync(path.join(proj, "skillwharf.json"), "utf8")) as Manifest;
+    expect(m.skills.alpha.source).toBe("git+https://git.acme.test/team/skills.git//alpha");
+  });
+
+  it("does not load a registry when asked for a registry that is not there", async () => {
+    writeManifest(proj, { registries: [{ name: "one", location: writeIndex(path.join(base, "one.json"), entry("alpha")) }] });
+    await expect(addFromRegistry(ctx, "alpha", { from: "nope" })).rejects.toThrow(/no registry named "nope"; known: one/);
+  });
+});
+
+// ------------------------------------------------------------------ the command line
+describe("search and add on the command line", () => {
+  const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  function cli(args: string[]) {
+    const r = spawnSync(process.execPath, [path.join(repo, "node_modules/tsx/dist/cli.mjs"), path.join(repo, "src/cli.ts"), ...args], {
+      cwd: proj,
+      env: { ...process.env, SKILLWHARF_HOME: home },
+      encoding: "utf8",
+    });
+    return { stdout: r.stdout, stderr: r.stderr, status: r.status };
+  }
+  let a: string, b: string;
+  beforeEach(() => {
+    a = writeIndex(path.join(base, "a.json"), entry("pdf", "github:a/b/pdf", "pdf tools"));
+    b = writeIndex(path.join(base, "b.json"), entry("pdf", "gitlab:g/r//pdf", "company pdf"));
+  });
+
+  it("search --registry <path> still works, with the rows named registry", () => {
+    const r = cli(["search", "pdf", "--registry", a, "--json"]);
+    expect(r.status).toBe(0);
+    const rows = JSON.parse(r.stdout) as { registry: string; name: string }[];
+    expect(rows.map((x) => [x.registry, x.name])).toEqual([["registry", "pdf"]]);
+  });
+
+  it("search asks every registry the manifest lists, and the JSON rows carry the registry name", () => {
+    writeManifest(proj, { registries: [{ name: "pub", location: a }, { name: "company", location: b }] });
+    const r = cli(["search", "pdf", "--json"]);
+    expect(r.status).toBe(0);
+    const rows = JSON.parse(r.stdout) as { registry: string; source: string }[];
+    expect(rows.map((x) => [x.registry, x.source])).toEqual([["pub", "github:a/b/pdf"], ["company", "gitlab:g/r//pdf"]]);
+  });
+
+  it("the table has a registry column when there is more than one registry", () => {
+    writeManifest(proj, { registries: [{ name: "pub", location: a }, { name: "company", location: b }] });
+    // eslint-disable-next-line no-control-regex
+    const out = cli(["search", "pdf"]).stdout.replace(/\u001b\[[0-9;]*m/g, "");
+    expect(out).toMatch(/skill\s+registry\s+description/);
+    expect(out).toMatch(/pdf\s+pub\s/);
+    expect(out).toMatch(/pdf\s+company\s/);
+  });
+
+  it("a registry that fails is reported on stderr by name; the others still answer and stdout stays JSON", () => {
+    writeManifest(proj, { registries: [{ name: "broken", location: path.join(base, "missing.json") }, { name: "pub", location: a }] });
+    const r = cli(["search", "pdf", "--json"]);
+    expect(r.status).toBe(0);
+    expect(r.stderr).toMatch(/registry broken: .*Registry index not found/);
+    expect((JSON.parse(r.stdout) as unknown[]).length).toBe(1);
+  });
+
+  it("search fails when every registry fails", () => {
+    writeManifest(proj, { registries: [{ name: "broken", location: path.join(base, "missing.json") }] });
+    const r = cli(["search", "pdf"]);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/registry broken/);
+  });
+
+  it("add --from with a source says --from is for names", () => {
+    writeManifest(proj, {});
+    const r = cli(["add", "github:a/b/x", "--from", "pub"]);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/--from.*skill name/);
+  });
+
+  it("add <name> that no registry lists says how to add a local folder", () => {
+    writeManifest(proj, { registries: [{ name: "pub", location: a }] });
+    const r = cli(["add", "nothing-here"]);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("`nothing-here` is not in any registry; for a local folder use `./nothing-here`");
   });
 });

@@ -4,7 +4,7 @@ import path from "node:path";
 import { readJson, writeJson } from "./fs.js";
 import { DEFAULT_REGISTRY, listsRegistries, loadManifest, makeContext, registriesOf } from "./manifest.js";
 import { fetchSource, parseSource } from "./source.js";
-import type { Context, LoadedRegistry, RegistryEntry, RegistryIndex, RegistrySpec } from "./types.js";
+import type { Context, LoadedRegistry, RegistryEntry, RegistryIndex, RegistrySpec, SearchHit } from "./types.js";
 import { assertSkillName, sanitizeForTerminal } from "./validate.js";
 
 export interface LoadRegistryOptions {
@@ -228,20 +228,76 @@ function isGitSource(s: string): boolean {
 
 const SKILL_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 
+function scoreEntry(e: RegistryEntry, terms: string[]): number {
+  const hay = `${e.name} ${e.description} ${(e.tags ?? []).join(" ")}`.toLowerCase();
+  let score = 0;
+  for (const t of terms) {
+    if (e.name.toLowerCase() === t) score += 10;
+    else if (e.name.toLowerCase().includes(t)) score += 5;
+    if ((e.tags ?? []).some((tag) => tag.toLowerCase() === t)) score += 4;
+    if (hay.includes(t)) score += 1;
+  }
+  return score;
+}
+
 export function searchRegistry(idx: RegistryIndex, query: string): (RegistryEntry & { score: number })[] {
   const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
-  const scored = idx.skills.map((e) => {
-    const hay = `${e.name} ${e.description} ${(e.tags ?? []).join(" ")}`.toLowerCase();
-    let score = 0;
-    for (const t of terms) {
-      if (e.name.toLowerCase() === t) score += 10;
-      else if (e.name.toLowerCase().includes(t)) score += 5;
-      if ((e.tags ?? []).some((tag) => tag.toLowerCase() === t)) score += 4;
-      if (hay.includes(t)) score += 1;
-    }
-    return { ...e, score };
-  });
+  const scored = idx.skills.map((e) => ({ ...e, score: scoreEntry(e, terms) }));
   return scored.filter((s) => s.score > 0).sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
+}
+
+/**
+ * Search every registry that loaded. Each row names its registry; the same
+ * skill name in two registries is two rows. Order: score, then the order the
+ * registries are listed in, then name.
+ */
+export function searchRegistries(registries: LoadedRegistry[], query: string): SearchHit[] {
+  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const rows: (SearchHit & { order: number })[] = [];
+  registries.forEach((r, order) => {
+    for (const e of r.index?.skills ?? []) {
+      const score = scoreEntry(e, terms);
+      if (score > 0) rows.push({ ...e, registry: r.name, score, order });
+    }
+  });
+  rows.sort((a, b) => b.score - a.score || a.order - b.order || a.name.localeCompare(b.name));
+  return rows.map(({ order: _order, ...hit }) => hit);
+}
+
+/** True for an argument of `add` that names a registry skill: a plain skill-style name, not a path, URL or source. */
+export function isRegistryName(arg: string): boolean {
+  return SKILL_NAME_RE.test(arg);
+}
+
+/**
+ * The entry `add <name>` installs. Registries are tried in order; a name two of
+ * them list is refused (showing both) unless `from` names the registry.
+ */
+export function resolveRegistryName(
+  registries: LoadedRegistry[],
+  name: string,
+  from?: string,
+): { registry: string; entry: RegistryEntry } {
+  if (from !== undefined) {
+    const r = registries.find((x) => x.name === from);
+    if (!r) throw new Error(`no registry named "${from}"; known: ${registries.map((x) => x.name).join(", ") || "(none)"}`);
+    if (!r.index) throw new Error(`registry "${r.name}" could not be loaded: ${r.error ?? "unknown error"}`);
+    const entry = r.index.skills.find((e) => e.name === name);
+    if (!entry) throw new Error(`"${name}" is not in registry "${r.name}"`);
+    return { registry: r.name, entry };
+  }
+  const hits = registries.flatMap((r) => (r.index?.skills ?? []).filter((e) => e.name === name).map((entry) => ({ registry: r.name, entry })));
+  if (hits.length === 1) return hits[0];
+  if (hits.length > 1) {
+    const listed = hits.map((h) => `${h.registry} (${h.entry.source})`);
+    const who = listed.length === 2 ? `${listed[0]} and ${listed[1]}` : `${listed.slice(0, -1).join(", ")} and ${listed[listed.length - 1]}`;
+    throw new Error(`"${name}" is listed by ${who}; pick one with --from <registry>`);
+  }
+  const failed = registries.filter((r) => r.error !== undefined);
+  throw new Error(
+    `\`${name}\` is not in any registry; for a local folder use \`./${name}\`` +
+      (failed.length > 0 ? ` (registries that could not be loaded: ${failed.map((r) => `${r.name}: ${r.error}`).join("; ")})` : ""),
+  );
 }
 
 /** Insert or replace an entry in a local registry checkout's index.json. */
