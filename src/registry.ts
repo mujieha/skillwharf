@@ -13,6 +13,7 @@ import {
   saveManifest,
   validateManifest,
 } from "./manifest.js";
+import { DEFAULT_GIT_TIMEOUT_MS } from "./git.js";
 import { fetchSource, parseSource } from "./source.js";
 import type { Context, LoadedRegistry, Manifest, RegistryEntry, RegistryIndex, RegistrySpec, SearchHit } from "./types.js";
 import { assertSkillName, sanitizeForTerminal } from "./validate.js";
@@ -20,6 +21,8 @@ import { assertSkillName, sanitizeForTerminal } from "./validate.js";
 export interface LoadRegistryOptions {
   /** Longest one git call may run, in milliseconds (git locations only). */
   timeoutMs?: number;
+  /** An overall limit (epoch milliseconds) for all the git calls of one search (git locations only). */
+  deadline?: number;
 }
 
 /** What a registry location is: the words `default`, an https index URL, a git source, or a local path. */
@@ -62,8 +65,9 @@ export async function loadRegistry(location: string, opts: LoadRegistryOptions =
     const src = parseSource(location);
     if (src.kind !== "git") throw new Error(`Registry location ${location} is not a git source`);
     // The same fetch as a skill: protocol allowlist, no prompts, timeout, sub-path
-    // and link checks. The clone is read once and removed.
-    const fetched = fetchSource(src, { timeoutMs: opts.timeoutMs });
+    // and link checks. The clone is read once and removed. A registry is only an
+    // index: its submodules are never opened (they could name any host).
+    const fetched = fetchSource(src, { timeoutMs: opts.timeoutMs, deadline: opts.deadline, submodules: false });
     try {
       return readIndexFile(path.join(fetched.dir, "index.json"));
     } finally {
@@ -96,13 +100,16 @@ interface RegistryPlan {
   root: string;
   /** Set when the entry could not even be planned (an unreadable global manifest). */
   error?: string;
+  /** A line to show the user about this entry (it was renamed). */
+  note?: string;
 }
 
 /**
  * The registries to search for this context, in order: the global manifest's,
  * then the project's. A project entry with the name and location of a global one
  * is the same registry (kept at the global position); with another location the
- * project keeps the name and the global one is shown as `global:<name>`. When
+ * global registry keeps the name and the project's is shown as `project:<name>`
+ * (with a note, so the user is told). When
  * neither manifest lists any, the public registry.
  */
 function planRegistries(ctx: Context): RegistryPlan[] {
@@ -129,7 +136,18 @@ function planRegistries(ctx: Context): RegistryPlan[] {
       for (const spec of registriesOf(pm!)) {
         const clash = plans.find((p) => p.scope === "global" && p.spec.name === spec.name);
         if (clash && clash.spec.location === spec.location) continue;
-        if (clash) clash.spec = { ...clash.spec, name: `global:${clash.spec.name}` };
+        if (clash) {
+          // The user's own (global) registry keeps its name: a project manifest, which
+          // may come from a cloned repository, cannot take it over. Names cannot hold a
+          // colon, so the new name cannot collide with another entry.
+          plans.push({
+            spec: { ...spec, name: `project:${spec.name}` },
+            scope: "project",
+            root: ctx.root,
+            note: `registry "${spec.name}" in this project is at another location than your global registry of that name; it is shown as project:${spec.name}`,
+          });
+          continue;
+        }
         plans.push({ spec, scope: "project", root: ctx.root });
       }
     }
@@ -162,12 +180,15 @@ export async function loadRegistries(
   const plans: RegistryPlan[] = opts.only
     ? opts.only.map((spec) => ({ spec, scope: "cli" as const, root: process.cwd() }))
     : planRegistries(ctx);
+  // One time limit for the whole search: git calls block, so several slow
+  // registries would otherwise each take the full timeout in turn.
+  const deadline = Date.now() + (opts.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS);
   return Promise.all(
     plans.map(async (p): Promise<LoadedRegistry> => {
-      const head = { name: p.spec.name, location: p.spec.location, scope: p.scope };
+      const head = { name: p.spec.name, location: p.spec.location, scope: p.scope, ...(p.note ? { note: p.note } : {}) };
       if (p.error) return { ...head, error: sanitizeForTerminal(p.error) };
       try {
-        const index = await loadRegistry(resolveLocation(p.spec.location, p.root, ctx.home), { timeoutMs: opts.timeoutMs });
+        const index = await loadRegistry(resolveLocation(p.spec.location, p.root, ctx.home), { timeoutMs: opts.timeoutMs, deadline });
         return { ...head, index };
       } catch (e) {
         return { ...head, error: sanitizeForTerminal((e as Error).message) };

@@ -469,7 +469,10 @@ program
         only: opts.registry ? [{ name: "registry", location: opts.registry }] : undefined,
         timeoutMs: timeout,
       });
-      for (const r of registries) if (r.error !== undefined) console.error(pc.yellow("!"), `registry ${clean(r.name)}: ${clean(r.error)}`);
+      for (const r of registries) {
+        if (r.note !== undefined) console.error(pc.yellow("!"), clean(r.note));
+        if (r.error !== undefined) console.error(pc.yellow("!"), `registry ${clean(r.name)}: ${clean(r.error)}`);
+      }
       if (registries.length > 0 && registries.every((r) => r.error !== undefined)) fail("no registry could be loaded");
       const hits = searchRegistries(registries, query.join(" "));
       const several = registries.length > 1;
@@ -547,6 +550,7 @@ registryCmd
     const gopts = cmd.optsWithGlobals() as { json?: boolean };
     try {
       const registries = await loadRegistries(ctx, { timeoutMs: gitTimeoutMs(cmd) });
+      for (const r of registries) if (r.note !== undefined) console.error(pc.yellow("!"), clean(r.note));
       if (gopts.json) {
         return console.log(
           toSafeJson(

@@ -514,8 +514,10 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
 export interface AddFromRegistryOptions extends AddOptions {
   /** Take the skill from this registry (needed when two registries list the name). */
   from?: string;
-  /** Called for each registry that could not be loaded, with a line saying which and why. */
+  /** Called for each registry that could not be loaded, or was renamed, with a line saying which and why. */
   onWarning?: (message: string) => void;
+  /** The folder a bare name is checked against (default: the working directory). */
+  cwd?: string;
 }
 
 /**
@@ -524,8 +526,18 @@ export interface AddFromRegistryOptions extends AddOptions {
  * that source, not the name.
  */
 export async function addFromRegistry(ctx: Context, name: string, opts: AddFromRegistryOptions = {}): Promise<AddedSkill[]> {
+  // 0.1.x read a bare `add pdf` as the folder ./pdf. A name that is also a folder
+  // here is ambiguous, so say so instead of choosing (`--from` settles it).
+  if (opts.from === undefined && isDir(path.resolve(opts.cwd ?? process.cwd(), name))) {
+    throw new Error(
+      `ambiguous: \`${name}\` is a folder here and a registry lookup; use \`./${name}\` for the folder or \`--from <registry> ${name}\``,
+    );
+  }
   const registries = await loadRegistries(ctx, { timeoutMs: opts.gitTimeoutMs });
-  for (const r of registries) if (r.error !== undefined) opts.onWarning?.(`registry ${r.name}: ${r.error}`);
+  for (const r of registries) {
+    if (r.note !== undefined) opts.onWarning?.(r.note);
+    if (r.error !== undefined) opts.onWarning?.(`registry ${r.name}: ${r.error}`);
+  }
   const { entry } = resolveRegistryName(registries, name, opts.from);
   return addSkill(ctx, entry.source, { ...opts, name: opts.name ?? entry.name });
 }

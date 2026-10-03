@@ -75,6 +75,8 @@ export interface LoadedRegistry {
   scope: "global" | "project" | "cli";
   index?: RegistryIndex;
   error?: string;
+  /** Something to tell the user about this registry (it was renamed because a global one has the name). */
+  note?: string;
 }
 
 /** A search result: the entry, the registry it came from and its score. */

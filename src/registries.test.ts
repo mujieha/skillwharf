@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { allowProtocolsForTests, setGitExecForTests } from "./git.js";
+import { fetchSource, parseSource } from "./source.js";
 import { DEFAULT_REGISTRY, makeContext, registriesOf, validateManifest } from "./manifest.js";
 import { addFromRegistry } from "./ops.js";
 import {
@@ -18,6 +19,7 @@ import {
 } from "./registry.js";
 import type { Context, LoadedRegistry, Manifest, RegistrySpec } from "./types.js";
 
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const realExec = { fn: execFileSync };
 const exec = vi.fn<typeof execFileSync>(execFileSync);
 const savedEnv = { ...process.env };
@@ -313,12 +315,36 @@ describe("S2.1: the global list comes first, the project list after", () => {
     expect((await loadRegistries(ctx)).map((x) => [x.name, x.scope])).toEqual([["company", "global"], ["x", "global"], ["team", "project"]]);
   });
 
-  it("the same name at another location: the project keeps the name, the global one becomes global:<name>", async () => {
+  it("the same name at another location: the global registry keeps the name, the project's becomes project:<name>", async () => {
+    // A cloned repository's manifest must not be able to take over a name the user chose for their own registry.
     writeManifest(globalRoot(), { registries: [{ name: "company", location: a }] });
     writeManifest(proj, { registries: [{ name: "company", location: b }] });
     const r = await loadRegistries(ctx);
-    expect(r.map((x) => [x.name, x.scope])).toEqual([["global:company", "global"], ["company", "project"]]);
+    expect(r.map((x) => [x.name, x.scope])).toEqual([["company", "global"], ["project:company", "project"]]);
     expect(r.flatMap(names)).toEqual(["from-a", "from-b"]);
+    expect(r[0].note).toBeUndefined();
+    expect(r[1].note).toMatch(/registry "company" in this project is at another location than your global registry of that name; it is shown as project:company/);
+  });
+
+  it("add <name> from the renamed registry works with --from project:<name>", async () => {
+    writeManifest(globalRoot(), { registries: [{ name: "company", location: a }] });
+    writeManifest(proj, { registries: [{ name: "company", location: b }] });
+    const r = await loadRegistries(ctx);
+    expect(resolveRegistryName(r, "from-b", "project:company").registry).toBe("project:company");
+    expect(() => resolveRegistryName(r, "from-b", "company")).toThrow(/"from-b" is not in registry "company"/);
+  });
+
+  it("the command line says it once per run, on stderr", () => {
+    writeManifest(globalRoot(), { registries: [{ name: "company", location: a }] });
+    writeManifest(proj, { registries: [{ name: "company", location: b }] });
+    const r = spawnSync(process.execPath, [path.join(repoRoot, "node_modules/tsx/dist/cli.mjs"), path.join(repoRoot, "src/cli.ts"), "--json", "search", "from"], {
+      cwd: proj,
+      env: { ...process.env, SKILLWHARF_HOME: home },
+      encoding: "utf8",
+    });
+    expect(r.status).toBe(0);
+    expect(r.stderr.match(/is shown as project:company/g)).toHaveLength(1);
+    expect((JSON.parse(r.stdout) as { registry: string }[]).map((x) => x.registry)).toEqual(["company", "project:company"]);
   });
 
   it("a relative path location is read from the folder of the manifest that lists it", async () => {
@@ -341,6 +367,59 @@ describe("S2.1: the global list comes first, the project list after", () => {
     expect(r.map((x) => x.name)).toEqual(["registry"]);
     expect(names(r[0])).toEqual(["from-a"]);
   });
+});
+
+// ------------------------------------------------------------------ Round A D5
+describe("Round A D5: a registry in a git repository never opens submodules, and one search has one time limit", () => {
+  const FAKE = "1234567890abcdef1234567890abcdef12345678";
+
+  it("loads the index and contacts none of the repository's submodules", async () => {
+    makeRepo("team/registry", (w) => {
+      writeIndex(path.join(w, "index.json"), entry("one"));
+      fs.mkdirSync(path.join(w, "vendor", "x"), { recursive: true });
+      git("-C", w, "update-index", "--add", "--cacheinfo", `160000,${FAKE},vendor/x`);
+      fs.writeFileSync(path.join(w, ".gitmodules"), '[submodule "vendor/x"]\n\tpath = vendor/x\n\turl = https://git.acme.test/other/x.git\n');
+    });
+    routeHosts(HOSTS);
+    exec.mockClear();
+    const idx = await loadRegistry("git+https://git.acme.test/team/registry.git");
+    expect(idx.skills.map((s) => s.name)).toEqual(["one"]);
+    const argvs = exec.mock.calls.filter((c) => c[0] === "git").map((c) => (c[1] as string[]).join(" "));
+    expect(argvs.some((a) => a.includes("ls-tree") || a.includes("other/x.git") || a.includes(FAKE))).toBe(false);
+  });
+
+  it("the same repository installed as a skill source still opens its submodules (the registry flag is the only difference)", () => {
+    // control for the test above: fetchSource without the flag does list the gitlinks
+    makeRepo("team/skillrepo", (w) => {
+      fs.writeFileSync(path.join(w, "SKILL.md"), "---\nname: s\ndescription: d\n---\nbody\n");
+      fs.mkdirSync(path.join(w, "vendor", "x"), { recursive: true });
+      git("-C", w, "update-index", "--add", "--cacheinfo", `160000,${FAKE},vendor/x`);
+      fs.writeFileSync(path.join(w, ".gitmodules"), '[submodule "vendor/x"]\n\tpath = vendor/x\n\turl = https://git.acme.test/other/x.git\n');
+    });
+    routeHosts(HOSTS);
+    exec.mockClear();
+    expect(() => fetchSource(parseSource("git+https://git.acme.test/team/skillrepo.git"))).toThrow();
+    expect(exec.mock.calls.some((c) => (c[1] as string[]).includes("ls-tree"))).toBe(true);
+  });
+
+  it.skipIf(process.platform === "win32")("several git registries share one time limit, not one each", async () => {
+    const bin = path.join(base, "bin");
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, "git"), "#!/bin/sh\nexec sleep 30\n", { mode: 0o755 });
+    process.env.PATH = `${bin}${path.delimiter}${process.env.PATH}`;
+    const specs: RegistrySpec[] = [
+      { name: "a", location: "git+https://git.acme.test/a/registry.git" },
+      { name: "b", location: "git+https://git.acme.test/b/registry.git" },
+      { name: "c", location: "git+https://git.acme.test/c/registry.git" },
+    ];
+    const started = Date.now();
+    const r = await loadRegistries(ctx, { only: specs, timeoutMs: 1500 });
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeLessThan(3000); // three registries at 1.5 s each would be 4.5 s
+    expect(r.every((x) => x.error !== undefined)).toBe(true);
+    expect(r[0].error).toMatch(/timed out/);
+    expect(r[2].error).toMatch(/time limit/);
+  }, 20_000);
 });
 
 // ------------------------------------------------------------------ S2.3 / S2.4 search and add
@@ -466,6 +545,45 @@ describe("S2.4: addFromRegistry installs what the registry says", () => {
     await addFromRegistry(ctx, "alpha", { from: "two" });
     const m = JSON.parse(fs.readFileSync(path.join(proj, "skillwharf.json"), "utf8")) as Manifest;
     expect(m.skills.alpha.source).toBe("git+https://git.acme.test/team/skills.git//alpha");
+  });
+
+  describe("Round A D7: a name that is also a folder here is ambiguous", () => {
+    const AMBIGUOUS = "ambiguous: `alpha` is a folder here and a registry lookup; use `./alpha` for the folder or `--from <registry> alpha`";
+
+    beforeEach(() => {
+      const idx = writeIndex(path.join(base, "team.json"), entry("alpha", "git+https://git.acme.test/team/skills.git//alpha"));
+      writeManifest(proj, { registries: [{ name: "team", location: idx }] });
+      fs.mkdirSync(path.join(proj, "alpha"));
+    });
+
+    it("refuses, before loading any registry, and installs nothing", async () => {
+      const fetchSpy = vi.fn(async () => new Response("{}"));
+      vi.stubGlobal("fetch", fetchSpy);
+      await expect(addFromRegistry(ctx, "alpha", { cwd: proj })).rejects.toThrow(AMBIGUOUS);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(proj, ".skillwharf"))).toBe(false);
+    });
+
+    it("--from says which one is meant, so it goes ahead", async () => {
+      const added = await addFromRegistry(ctx, "alpha", { cwd: proj, from: "team" });
+      expect(added.map((a) => a.name)).toEqual(["alpha"]);
+    });
+
+    it("a file with that name is not a folder: no ambiguity", async () => {
+      fs.rmSync(path.join(proj, "alpha"), { recursive: true });
+      fs.writeFileSync(path.join(proj, "alpha"), "a file");
+      await expect(addFromRegistry(ctx, "alpha", { cwd: proj })).resolves.toHaveLength(1);
+    });
+
+    it("on the command line too", () => {
+      const r = spawnSync(process.execPath, [path.join(repoRoot, "node_modules/tsx/dist/cli.mjs"), path.join(repoRoot, "src/cli.ts"), "add", "alpha"], {
+        cwd: proj,
+        env: { ...process.env, SKILLWHARF_HOME: home },
+        encoding: "utf8",
+      });
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain(AMBIGUOUS);
+    });
   });
 
   it("does not load a registry when asked for a registry that is not there", async () => {
