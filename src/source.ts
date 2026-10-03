@@ -11,6 +11,7 @@ import {
   isDir,
   isGitName,
   isInside,
+  resolveInside,
   type SizeLimits,
 } from "./fs.js";
 import { GitError, runGit, writeSafeAttributes } from "./git.js";
@@ -568,9 +569,12 @@ export function discoverSkills(dir: string, opts: { root?: string; maxDepth?: nu
         // of the repository or into .git is never followed, and each target is
         // followed once.
         if (!inRepo) continue;
-        let target: string;
+        // Resolved by hand: the target of a link that leaves the repository (or names a
+        // network share) is never opened.
+        const resolved = resolveInside(root as string, child);
+        if (resolved === undefined) continue;
+        const target: string = resolved;
         try {
-          target = fs.realpathSync.native(child);
           if (!fs.statSync(target).isDirectory()) continue;
         } catch {
           continue;

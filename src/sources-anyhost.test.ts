@@ -5,7 +5,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { SUPERVISOR_SOURCE, supervisedGit, allowAskpass, allowProtocolsForTests, defaultDeadlineMs, gitEnv, killProcessTree, runGit, setGitExecForTests } from "./git.js";
-import { copyDir, copyResolvingLinks, hashDir, inGitDir } from "./fs.js";
+import { linkStatus } from "./agents.js";
+import { copyDir, copyResolvingLinks, hashDir, inGitDir, isAbsoluteLinkText, isInside, resolveInside } from "./fs.js";
 import { isSkillDirIn } from "./skill.js";
 import { loadLock, loadManifest, makeContext, saveManifest, storePath } from "./manifest.js";
 import { addSkill, syncSkills, updateSkills } from "./ops.js";
@@ -1942,6 +1943,153 @@ describe("Round A: the built command line runs git the way SECURITY.md says", ()
 });
 
 // ------------------------------------------------------------------ Round B
+describe("Round B B1: a link is resolved as text, and the file system is asked only about paths inside the clone", () => {
+  let root: string;
+  const link = (name: string, text: string) => fs.symlinkSync(text, path.join(root, name));
+
+  beforeEach(() => {
+    root = path.join(base, "clone");
+    fs.mkdirSync(path.join(root, "a", "b"), { recursive: true });
+    fs.writeFileSync(path.join(root, "a", "b", "file.txt"), "inside");
+    link("ok", "a/b");
+    link("hop1", "hop2");
+    link("hop2", "a/b/file.txt");
+    link("up", "../outside");
+    link("deep-up", "a/../../outside");
+    link("abs", "/etc/hostname");
+    link("unc", "//host/share/x");
+    link("backslash-unc", "\\\\host\\share\\x");
+    link("drive", "C:/Windows/win.ini");
+    link("loop1", "loop2");
+    link("loop2", "loop1");
+    link("through-dir", "ok/file.txt");
+    link("dotdot-after-link", "ok/../b/file.txt"); // ok -> a/b, so ok/.. is a, as the file system reads it
+  });
+
+  it.each([
+    ["ok", path.join("a", "b")],
+    ["hop1", path.join("a", "b", "file.txt")],
+    ["through-dir", path.join("a", "b", "file.txt")],
+    ["dotdot-after-link", path.join("a", "b", "file.txt")],
+  ])("resolveInside follows %s to %s", (name, want) => {
+    expect(resolveInside(root, path.join(root, name))).toBe(fs.realpathSync.native(path.join(root, want)));
+  });
+
+  it.each(["up", "deep-up", "abs", "unc", "backslash-unc", "drive", "loop1"])("resolveInside refuses %s without touching the file system outside", (name) => {
+    expect(resolveInside(root, path.join(root, name))).toBeUndefined();
+  });
+
+  it("resolveInside refuses a chain longer than its bound", () => {
+    for (let i = 0; i < 40; i++) link(`c${i}`, `c${i + 1}`);
+    link("c40", "a/b");
+    expect(resolveInside(root, path.join(root, "c0"))).toBeUndefined();
+    expect(resolveInside(root, path.join(root, "c20"))).toBe(fs.realpathSync.native(path.join(root, "a", "b")));
+  });
+
+  describe("no call that would open a path outside the clone", () => {
+    const outsideCalls: string[] = [];
+    let realRoot: string;
+    const watch = () => {
+      realRoot = fs.realpathSync.native(root);
+      // What may be asked about: the clone (as given or as it really is) and the folder the copy goes to.
+      // `//host/share/x`, `/etc/x` and `../../outside` (next to the clone) must never appear.
+      const lstat = fs.lstatSync;
+      const readlink = fs.readlinkSync;
+      // Would asking the file system about `p` make it follow a link that names an absolute or UNC
+      // path, or leaves the clone? (The path passed in is inside the clone either way: it is the
+      // link on the way that does the damage.)
+      const leaks = (p: string): boolean => {
+        const abs = path.resolve(p);
+        const rel = [realRoot, root].map((r) => path.relative(r, abs)).find((r) => !r.startsWith("..") && !path.isAbsolute(r));
+        if (rel === undefined) return !(isInside(path.join(base, "out"), abs) || abs === path.dirname(root) || abs === fs.realpathSync.native(path.dirname(root)));
+        let cur = realRoot;
+        for (const part of rel.split(path.sep).filter(Boolean)) {
+          cur = path.join(cur, part);
+          let st: fs.Stats;
+          try {
+            st = lstat(cur);
+          } catch {
+            return false;
+          }
+          if (st.isSymbolicLink()) {
+            const text = readlink(cur);
+            if (isAbsoluteLinkText(text) || !isInside(realRoot, path.resolve(path.dirname(cur), text))) return true;
+          }
+        }
+        return false;
+      };
+      const check = (p: unknown) => {
+        if (typeof p === "string" && leaks(p)) outsideCalls.push(p);
+      };
+      const native = fs.realpathSync.native;
+      const plain = fs.realpathSync;
+      const stat = fs.statSync;
+      vi.spyOn(fs.realpathSync, "native").mockImplementation(((p: string, o?: never) => (check(p), native(p, o))) as never);
+      vi.spyOn(fs, "statSync").mockImplementation(((p: string, o?: never) => (check(p), stat(p, o))) as never);
+      vi.spyOn(fs, "realpathSync").mockImplementation(Object.assign(((p: string, o?: never) => (check(p), plain(p, o))) as never, { native: fs.realpathSync.native }));
+    };
+    beforeEach(() => {
+      outsideCalls.length = 0;
+      writeSkill(path.join(root, "skill"), "s");
+      for (const [name, text] of [
+        ["l-abs", "/etc/hostname"],
+        ["l-unc", "//host/share/x"],
+        ["l-up", "../../outside"],
+        ["l-ok", "../a/b/file.txt"],
+      ]) {
+        fs.symlinkSync(text, path.join(root, "skill", name));
+      }
+      watch();
+    });
+    afterEach(() => vi.restoreAllMocks());
+
+    it("copyResolvingLinks drops the links that leave and copies the one that stays", () => {
+      const { dropped } = copyResolvingLinks(path.join(root, "skill"), path.join(base, "out"), { root });
+      expect(dropped).toEqual(["l-abs", "l-unc", "l-up"]);
+      expect(fs.readFileSync(path.join(base, "out", "l-ok"), "utf8")).toBe("inside");
+      expect(outsideCalls).toEqual([]);
+    });
+
+    it("discoverSkills does not follow a folder link out of the clone, or open it", () => {
+      for (const [name, text] of [["d-unc", "//host/share/dir"], ["d-abs", "/etc"], ["d-up", "../../outside"]]) fs.symlinkSync(text, path.join(root, name));
+      expect(discoverSkills(root, { root }).map((d) => path.relative(root, d))).toEqual(["skill"]);
+      expect(outsideCalls).toEqual([]);
+    });
+
+    it("isSkillDirIn does not open the target of a SKILL.md link that leaves the clone", () => {
+      for (const text of ["//host/share/SKILL.md", "/etc/SKILL.md", "../../outside/SKILL.md"]) {
+        const dir = path.join(root, `s-${text.length}`);
+        fs.mkdirSync(dir);
+        fs.symlinkSync(text, path.join(dir, "SKILL.md"));
+        expect(isSkillDirIn(dir, root)).toBe(false);
+      }
+      expect(outsideCalls).toEqual([]);
+    });
+  });
+
+  describe("the project side: an agent folder entry that is a link is not opened when its text names another machine or an absolute path", () => {
+    it("linkStatus says foreign for an absolute or UNC link without resolving it", () => {
+      const store = path.join(proj, ".skillwharf", "skills", "alpha");
+      fs.mkdirSync(store, { recursive: true });
+      fs.writeFileSync(path.join(store, "SKILL.md"), "---\nname: alpha\ndescription: d\n---\n");
+      fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: { alpha: { source: "path:./x" } } }));
+      const target = path.join(proj, ".claude", "skills", "alpha");
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      const m = JSON.parse(read(path.join(proj, "skillwharf.json"))) as Manifest;
+      for (const text of ["//host/share/alpha", "/etc", "\\\\host\\share\\alpha"]) {
+        fs.rmSync(target, { force: true });
+        fs.symlinkSync(text, target);
+        const seen: string[] = [];
+        const plain = fs.realpathSync;
+        const spy = vi.spyOn(fs, "realpathSync").mockImplementation(Object.assign(((p: string, o?: never) => (seen.push(String(p)), plain(p, o))) as never, { native: plain.native }));
+        expect(linkStatus(ctx, m, "claude", "alpha", store)).toBe("foreign");
+        spy.mockRestore();
+        expect(seen.filter((p) => p === target || p.includes("host"))).toEqual([]);
+      }
+    });
+  });
+});
+
 describe("Round B B3: the lock is fetched from the manifest's URL, and a lock for another URL is refused before any git call", () => {
   const lockFor = (source: string, resolved: string): void => {
     fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: { a: { source } } }));

@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { exists, isDir, isPlainCopyOf, isSymlink, linkOrCopy, removePath, resolveLink } from "./fs.js";
+import { exists, isAbsoluteLinkText, isDir, isPlainCopyOf, isSymlink, linkOrCopy, removePath, resolveLink } from "./fs.js";
 import { assertSafeTarget } from "./manifest.js";
 import type { AgentId, Context, Manifest } from "./types.js";
 
@@ -190,9 +190,12 @@ export function unlinkSkill(
   // (even if the store is gone), a symlink resolving to our real store dir, or
   // a copied dir whose store twin exists.
   if (isSymlink(target)) {
+    const text = readLinkText(target);
+    // A link whose text is absolute or names a network share is never resolved (that would
+    // open a place its author chose); only the exact link we would have written is ours then.
     const ours =
-      readLinkText(target) === expectedLinkText(target, storeDir) ||
-      (!isSymlink(storeDir) && isDir(storeDir) && resolveLink(target) === realStoreDir(storeDir));
+      text === expectedLinkText(target, storeDir) ||
+      (text !== undefined && !isAbsoluteLinkText(text) && !isSymlink(storeDir) && isDir(storeDir) && resolveLink(target) === realStoreDir(storeDir));
     if (!ours) return false;
   } else {
     // A real directory: only remove it if the lockfile says skillwharf made a
@@ -223,6 +226,9 @@ export function linkStatus(
   // put it; nothing linked to it counts as installed.
   const storeIsLink = isSymlink(storeDir);
   if (isSymlink(target)) {
+    // Absolute or UNC link text is not ours and is not resolved: skillwharf writes relative links.
+    const text = readLinkText(target);
+    if (text !== undefined && isAbsoluteLinkText(text) && text !== expectedLinkText(target, storeDir)) return "foreign";
     const real = resolveLink(target);
     if (!real) return "broken";
     return !storeIsLink && real === realStoreDir(storeDir) ? "ok" : "foreign";

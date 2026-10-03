@@ -148,6 +148,75 @@ function tooManyBytes(dir: string, maxBytes: number): Error {
   );
 }
 
+/**
+ * True for link text that is an absolute path, a UNC path (`//host/share`,
+ * `\\host\share`) or carries a drive letter. Such text names a place of the
+ * link author's choosing, possibly another machine; asking the file system
+ * about it can make this machine open a network share.
+ */
+export function isAbsoluteLinkText(text: string): boolean {
+  return path.isAbsolute(text) || /^[\\/]/.test(text) || /^[A-Za-z]:/.test(text);
+}
+
+/** Longest chain of links `resolveInside` follows. */
+const MAX_LINK_HOPS = 32;
+
+/**
+ * Where `p` (a path below `root`) really is, with every symlink on the way
+ * followed by hand: each hop's link text is read and refused outright if it is
+ * absolute or UNC; otherwise it is resolved as text against the folder the link
+ * is in, and the walk goes on from there. A path that would leave `root` (a
+ * `..` past it), a loop, a chain over 32 hops or a missing entry gives
+ * undefined. The file system is only ever asked about paths inside `root`
+ * (`lstat`, `readlink`), and `realpath` is called once, on the result, when the
+ * whole chain is known to stay inside.
+ */
+export function resolveInside(root: string, p: string): string | undefined {
+  const realBase = fs.realpathSync.native(root);
+  // `p` is written either with the real path of `root` or with `root` as it was given.
+  const abs = path.resolve(p);
+  let rel = path.relative(realBase, abs);
+  if (escapes(rel)) rel = path.relative(path.resolve(root), abs);
+  if (escapes(rel)) return undefined;
+  const queue = rel.split(path.sep).filter(Boolean);
+  const done: string[] = [];
+  let hops = 0;
+  while (queue.length > 0) {
+    const part = queue.shift() as string;
+    if (part === ".") continue;
+    if (part === "..") {
+      if (done.length === 0) return undefined;
+      done.pop();
+      continue;
+    }
+    const next = path.join(realBase, ...done, part);
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(next);
+    } catch {
+      return undefined;
+    }
+    if (st.isSymbolicLink()) {
+      if (++hops > MAX_LINK_HOPS) return undefined;
+      let text: string;
+      try {
+        text = fs.readlinkSync(next);
+      } catch {
+        return undefined;
+      }
+      if (isAbsoluteLinkText(text)) return undefined;
+      queue.unshift(...text.split(/[\\/]+/).filter(Boolean));
+      continue;
+    }
+    done.push(part);
+  }
+  try {
+    return fs.realpathSync.native(path.join(realBase, ...done));
+  } catch {
+    return undefined;
+  }
+}
+
 /** True for a path component that is `.git` in any letter case (and the look-alike forms a file system folds to it). */
 export function isGitName(name: string): boolean {
   return name.normalize("NFKC").toLowerCase() === ".git";
@@ -177,8 +246,8 @@ export function copyResolvingLinks(src: string, dest: string, opts: { root: stri
   const maxFiles = opts.limits?.maxFiles ?? DEFAULT_MAX_FILES;
   const maxBytes = opts.limits?.maxBytes ?? DEFAULT_MAX_BYTES;
   const realRoot = fs.realpathSync.native(opts.root);
-  const realSrc = fs.realpathSync.native(src);
-  if (!isInside(realRoot, realSrc) || inGitDir(path.relative(realRoot, realSrc))) {
+  const realSrc = resolveInside(opts.root, src);
+  if (realSrc === undefined || !isInside(realRoot, realSrc) || inGitDir(path.relative(realRoot, realSrc))) {
     throw new Error(`${path.basename(src)} resolves outside the fetched repository; refusing it.`);
   }
   if (pathsOverlap(realSrc, dest)) {
@@ -213,13 +282,15 @@ export function copyResolvingLinks(src: string, dest: string, opts: { root: stri
       const childTo = path.join(to, e.name);
       const childRel = rel ? `${rel}/${e.name}` : e.name;
       if (e.isSymbolicLink()) {
-        let target: string;
+        // Resolved by hand: a link to `//host/share` or `/etc` is dropped without the
+        // file system being asked about it (see resolveInside).
+        const target = resolveInside(opts.root, childFrom);
         let st: fs.Stats;
         try {
-          target = fs.realpathSync.native(childFrom);
+          if (target === undefined) throw new Error("outside, absolute, looping or broken");
           st = fs.statSync(target);
         } catch {
-          dropped.push(childRel); // a broken link
+          dropped.push(childRel); // leaves the clone, or is broken
           continue;
         }
         if (!isInside(realRoot, target) || inGitDir(path.relative(realRoot, target))) {
