@@ -183,8 +183,17 @@ export function resolveInside(root: string, p: string): string | undefined {
  * that cannot be examined), `broken` only when it stays inside and something is simply
  * missing (the entry, or one above it, does not exist). The file system is asked about
  * the same paths as in `resolveInside`: only ones inside `root`.
+ *
+ * With `loose`, a missing entry is not a failure: the result is the real path of what
+ * exists followed by the missing rest as written (a place that is not there yet, such as
+ * an agent folder that is about to be created). A path that is not inside is still
+ * `outside`.
  */
-export function resolveInsideDetailed(root: string, p: string): { path: string } | { fail: "outside" | "broken" } {
+export function resolveInsideDetailed(
+  root: string,
+  p: string,
+  opts: { loose?: boolean } = {},
+): { path: string } | { fail: "outside" | "broken" } {
   const realBase = fs.realpathSync.native(root);
   // `p` is written either with the real path of `root` or with `root` as it was given.
   const abs = path.resolve(p);
@@ -212,7 +221,10 @@ export function resolveInsideDetailed(root: string, p: string): { path: string }
     try {
       st = fs.lstatSync(next);
     } catch (e) {
-      return { fail: missing(e) ? "broken" : "outside" };
+      if (!missing(e)) return { fail: "outside" };
+      if (!opts.loose) return { fail: "broken" };
+      const rest = path.join(realBase, ...done, part, ...queue);
+      return escapes(path.relative(realBase, rest)) ? { fail: "outside" } : { path: rest };
     }
     if (st.isSymbolicLink()) {
       if (++hops > MAX_LINK_HOPS) return { fail: "outside" };

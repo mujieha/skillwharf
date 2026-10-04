@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { assertNoSymlinks, isDriveText, isInside, isShareText, readJson, resolveInsideDetailed, writeJson } from "./fs.js";
+import { assertNoSymlinks, isDriveText, isInside, isShareText, readJson, realPathLoose, resolveInsideDetailed, writeJson } from "./fs.js";
 import {
   DEFAULT_REGISTRY,
   listsRegistries,
@@ -221,7 +221,16 @@ export async function loadRegistries(
           const relative = !path.isAbsolute(p.spec.location) && p.spec.location !== "~" && !p.spec.location.startsWith("~/");
           const leaves = () =>
             new Error(`Registry location "${sanitizeForTerminal(p.spec.location)}" leaves the folder of the manifest that lists it (a path or a link points out of it); refusing it.`);
-          if (p.scope === "project" && relative && !isInside(p.root, where)) throw leaves();
+          // A project's manifest may have been written by a cloned repository: a local registry in it
+          // is a relative path inside its folder, never an absolute one (`/net/host/x`, `~/x`).
+          // Absolute local paths come from the user's global manifest or the command line only.
+          if (p.scope === "project" && !relative) {
+            throw new Error(
+              `Registry location "${sanitizeForTerminal(p.spec.location)}" is an absolute path in a project's manifest; a project may list a local registry only as a path below it (./registry). ` +
+                `Use a git location or an https URL, or list the folder in your global manifest (skillwharf registry add -g) or pass --registry.`,
+            );
+          }
+          if (p.scope === "project" && !isInside(p.root, where)) throw leaves();
           if (isInside(p.root, where)) {
             const r = resolveInsideDetailed(p.root, where);
             if ("fail" in r && r.fail === "outside") throw leaves();
@@ -407,9 +416,14 @@ function materialize(m: Manifest): RegistrySpec[] {
 function locationForManifest(ctx: Context, location: string): string {
   if (location === "default" || classifyLocation(location) !== "path" || location.startsWith("~/") || location === "~") return location;
   const abs = path.resolve(process.cwd(), location);
-  if (!ctx.global && isInside(ctx.root, abs)) {
-    const rel = path.relative(ctx.root, abs).split(path.sep).join("/");
-    return rel === "" ? "." : `./${rel}`;
+  if (!ctx.global) {
+    // The folder is the user's own argument, so it may be spelled through a link (/var -> /private/var).
+    const root = realPathLoose(ctx.root);
+    const real = realPathLoose(abs);
+    if (isInside(root, real)) {
+      const rel = path.relative(root, real).split(path.sep).join("/");
+      return rel === "" ? "." : `./${rel}`;
+    }
   }
   return abs;
 }
@@ -433,6 +447,12 @@ export async function addRegistry(
   }
   if (list.some((r) => r.name === name)) throw new Error(`registry "${name}" is already listed`);
   const spec: RegistrySpec = { name, location: locationForManifest(ctx, location.trim()) };
+  // Nothing is written that would be refused when it is read back (see loadRegistries).
+  if (!ctx.global && classifyLocation(spec.location) === "path" && spec.location !== "default" && (path.isAbsolute(spec.location) || spec.location.startsWith("~"))) {
+    throw new Error(
+      `a project's manifest may list a local registry only as a path below the project; ${sanitizeForTerminal(location.trim())} is not. Use a git location or an https URL, put the folder inside the project, or add it to your global manifest with \`skillwharf registry add -g\`.`,
+    );
+  }
   validateManifest({ ...m, registries: [...list, spec], registry: undefined }, manifestPath(ctx));
   const index = await loadRegistry(resolveLocation(location.trim(), process.cwd(), ctx.home), opts);
   const next: Manifest = { ...m, registries: [...list, spec] };

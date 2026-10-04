@@ -11,7 +11,7 @@ import {
   isInside,
   pathTextRefusal,
   resolveInsideDetailed,
-  pathsOverlap,
+  realPathLoose,
   removePath,
   resolveLink,
   type SizeLimits,
@@ -26,7 +26,7 @@ import {
   type LinkStatus,
   type TargetGroup,
 } from "./agents.js";
-import { LOCKFILE, assertSafeTarget, loadLock, requireManifest, saveLock, saveManifest, storePath } from "./manifest.js";
+import { LOCKFILE, assertSafeTarget, loadLock, requireManifest, saveLock, saveManifest, storePath, writeRoot } from "./manifest.js";
 import { normalizeName, readSkill } from "./skill.js";
 import { assertSubpath } from "./validate.js";
 import { GitError, defaultDeadlineMs, interruptedBy } from "./git.js";
@@ -129,8 +129,19 @@ function assertSourceClear(
     ["the skill store", storePath(ctx)],
     ...targetGroups(ctx, m, agents, name).map((g): [string, string] => ["an agent folder", g.target]),
   ];
+  const here = realPathLoose(folder);
   for (const [what, place] of places) {
-    if (pathsOverlap(folder, place)) {
+    // The store and the agent targets are inside the project, and a repository can commit a link
+    // at any of them: they are followed by hand, as text, and only inside the project, and never
+    // handed to the file system to resolve. One that cannot be shown to stay inside is refused.
+    const there = resolveInsideDetailed(writeRoot(ctx), place, { loose: true });
+    if (!("path" in there)) {
+      throw new Error(
+        `Source "${shown}" cannot be checked against ${what} (${place}): it is, or passes through, a link that leaves the project. ` +
+          `Remove that link, or move the folder elsewhere in the project (for example skills/${name}) and use that path.`,
+      );
+    }
+    if (isInside(here, there.path) || isInside(there.path, here)) {
       throw new Error(
         `Source "${shown}" overlaps ${what} (${place}). A skill's source may not be, contain or lie inside its own store or agent folder, ` +
           `or skillwharf would replace or delete it. Move the folder elsewhere in the project (for example skills/${name}) and use that path.`,
@@ -644,7 +655,9 @@ export function syncSkills(ctx: Context, options: SyncOptions = {}): SyncReport 
   // A committed store can be a link (`.skillwharf`, or one skill's folder) to a share or any
   // absolute path. Every store path is checked with lstat only, before anything asks the file
   // system about it (`isDir` follows links) or about a source that is compared with it.
-  for (const name of Object.keys(m.skills)) assertSafeTarget(ctx, storePath(ctx, name));
+  // The same goes for the agent folders a skill is linked into (their parents; the entry itself
+  // may be our link, and is followed by hand where it matters).
+  for (const name of Object.keys(m.skills)) assertSafeInstall(ctx, m, name, storePath(ctx, name), agentsFor(m, name));
 
   // Check every committed store folder before linking any of them. Freshly
   // fetched ones cannot contain symlinks: installToStore leaves them out.
