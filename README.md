@@ -7,7 +7,7 @@ installs; `usage` shows which skills Claude Code actually fires. skillwharf inst
 default.
 
 <p align="center">
-  <a href="https://github.com/mujieha/skillwharf/blob/main/docs/media/skillwharf-intro.mp4"><img src="https://raw.githubusercontent.com/mujieha/skillwharf/main/docs/media/skillwharf-intro.gif" width="720" alt="skillwharf in 28 seconds: why copied skills drift, then init, add pinned to a full commit sha, sync, doctor and usage in a terminal, and who it is for: one developer, a small team, a company"></a>
+  <a href="https://github.com/mujieha/skillwharf/blob/main/docs/media/skillwharf-intro.mp4"><img src="https://raw.githubusercontent.com/mujieha/skillwharf/main/docs/media/skillwharf-intro.gif" width="720" alt="skillwharf in 36 seconds: why copied skills drift and go unpinned; then init with its one-time hint, a team registry next to the public one, add from GitHub and from GitLab pinned to full commit shas, sync after a clone, and list; skills from any git host; who it is for; and the install command, npm i -g skillwharf"></a>
 </p>
 
 ```
