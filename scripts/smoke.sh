@@ -43,10 +43,18 @@ if grep -q "Skills come from any git host" <<< "$init_again"; then
 fi
 
 echo "== registries you own: add, list, search, publish"
-reg="$tmp/registry-checkout"
+# a project's manifest lists a local registry only as a path below the project
+reg="$proj/registry-checkout"
 mkdir -p "$reg"
 (cd "$proj" && $bin publish "$src" --registry "$reg" --source "gitlab:acme/platform/skills//demo" > /dev/null)
 grep -q '"source": "gitlab:acme/platform/skills//demo"' "$reg/index.json"
+outside_reg="$tmp/outside-registry"
+mkdir -p "$outside_reg"
+cp "$reg/index.json" "$outside_reg/index.json"
+if (cd "$proj" && $bin registry add elsewhere "$outside_reg" > /dev/null 2>&1); then
+  echo "expected registry add to refuse a folder outside the project" >&2
+  exit 1
+fi
 (cd "$proj" && $bin registry add mine "$reg" > /dev/null)
 reg_list="$(cd "$proj" && $bin --json registry list)"
 grep -q '"name": "mine"' <<< "$reg_list"

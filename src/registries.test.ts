@@ -90,9 +90,31 @@ function writeIndex(file: string, ...skills: object[]): string {
   fs.writeFileSync(file, index(...skills));
   return file;
 }
-function writeManifest(root: string, m: object): void {
+let fixtureCount = 0;
+/**
+ * A project manifest may list a local registry only as a path below the project (Round E E2), while these
+ * tests keep their fixtures beside it. So for the project's manifest an absolute fixture path is copied
+ * into the project and listed by its relative path; `raw` writes the manifest exactly as given.
+ */
+function inProject(location: string): string {
+  if (!path.isAbsolute(location) || location.startsWith(proj + path.sep)) return location;
+  if (!fs.existsSync(location)) return `./fx-missing/${path.basename(location)}`;
+  const into = path.join(proj, `fx-${fixtureCount++}`);
+  fs.mkdirSync(into, { recursive: true });
+  const copy = path.join(into, path.basename(location));
+  fs.cpSync(location, copy, { recursive: true });
+  return `./${path.relative(proj, copy).split(path.sep).join("/")}`;
+}
+function writeManifest(root: string, m: object, raw = false): void {
   fs.mkdirSync(root, { recursive: true });
-  fs.writeFileSync(path.join(root, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: {}, ...m }));
+  const body: Record<string, unknown> = { version: 1, agents: ["claude"], skills: {}, ...m };
+  if (root === proj && !raw) {
+    if (typeof body.registry === "string") body.registry = inProject(body.registry);
+    if (Array.isArray(body.registries)) {
+      body.registries = body.registries.map((r: { location?: unknown }) => (typeof r.location === "string" ? { ...r, location: inProject(r.location) } : r));
+    }
+  }
+  fs.writeFileSync(path.join(root, "skillwharf.json"), JSON.stringify(body));
 }
 const names = (r: { index?: { skills: { name: string }[] } }) => (r.index?.skills ?? []).map((s) => s.name);
 
@@ -310,8 +332,9 @@ describe("S2.1: the global list comes first, the project list after", () => {
   });
 
   it("the same name at the same location is one registry, at the global position", async () => {
-    writeManifest(globalRoot(), { registries: [{ name: "company", location: a }, { name: "x", location: c }] });
-    writeManifest(proj, { registries: [{ name: "company", location: a }, { name: "team", location: b }] });
+    // the same text in both manifests is the same registry (a project may not write an absolute path)
+    writeManifest(globalRoot(), { registries: [{ name: "company", location: "./a.json" }, { name: "x", location: c }] });
+    writeManifest(proj, { registries: [{ name: "company", location: "./a.json" }, { name: "team", location: b }] });
     expect((await loadRegistries(ctx)).map((x) => [x.name, x.scope])).toEqual([["company", "global"], ["x", "global"], ["team", "project"]]);
   });
 
@@ -486,7 +509,7 @@ describe("Round D D5/D4/D2: where a registry location may point", () => {
   it("D2: a drive-letter location is refused for a project manifest, not for the global one or for --registry", async () => {
     const asked = async (spec: RegistrySpec, scope: "project" | "global" | "cli") => {
       for (const root of [proj, path.join(home, ".skillwharf")]) fs.rmSync(path.join(root, "skillwharf.json"), { force: true });
-      if (scope === "project") writeManifest(proj, { registries: [spec] });
+      if (scope === "project") writeManifest(proj, { registries: [spec] }, true);
       if (scope === "global") writeManifest(path.join(home, ".skillwharf"), { registries: [spec] });
       const r = scope === "cli" ? await loadRegistries(ctx, { only: [spec] }) : await loadRegistries(scope === "global" ? makeContext({ global: true, home }) : ctx);
       return r[0].error ?? "";
@@ -498,6 +521,58 @@ describe("Round D D5/D4/D2: where a registry location may point", () => {
     // a share is refused in all three
     const share = { name: "net", location: "//attacker/share/index.json" };
     for (const scope of ["project", "global", "cli"] as const) expect(await asked(share, scope)).toMatch(/names a network share or a drive/);
+  });
+});
+
+// ------------------------------------------------------------------ Round E
+describe("Round E E2: a project manifest lists a local registry only as a path below it", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("an absolute location (or ~/x) is refused before any stat, even when it names a real registry", async () => {
+    const real = path.join(base, "somewhere", "reg");
+    writeIndex(path.join(real, "index.json"), entry("real-one"));
+    writeManifest(
+      proj,
+      {
+        registries: [
+          { name: "net", location: "/net/host/x" },
+          { name: "real", location: real },
+          { name: "home", location: "~/regs" },
+        ],
+      },
+      true,
+    );
+    const seen: string[] = [];
+    const stat = fs.statSync;
+    const exists = fs.existsSync;
+    vi.spyOn(fs, "statSync").mockImplementation(((p: string, o?: never) => (seen.push(String(p)), stat(p, o))) as never);
+    vi.spyOn(fs, "existsSync").mockImplementation(((p: string) => (seen.push(String(p)), exists(p))) as never);
+    const r = await loadRegistries(ctx);
+    vi.restoreAllMocks();
+    for (const one of r) {
+      expect(one.error).toMatch(/absolute path in a project's manifest/);
+      expect(one.index).toBeUndefined();
+    }
+    expect(seen.filter((p) => p.startsWith("/net") || p.startsWith(real) || p.includes(`${path.sep}regs`))).toEqual([]);
+  });
+
+  it("the global manifest and --registry may use an absolute path", async () => {
+    const real = path.join(base, "somewhere", "reg");
+    writeIndex(path.join(real, "index.json"), entry("real-one"));
+    writeManifest(path.join(home, ".skillwharf"), { registries: [{ name: "mine", location: real }] });
+    expect(names((await loadRegistries(makeContext({ global: true, home })))[0])).toEqual(["real-one"]);
+    expect(names((await loadRegistries(ctx, { only: [{ name: "cli", location: real }] }))[0])).toEqual(["real-one"]);
+  });
+
+  it("registry add refuses, before writing, a folder the manifest could not list; -g accepts it", async () => {
+    const real = path.join(base, "somewhere", "reg");
+    writeIndex(path.join(real, "index.json"), entry("real-one"));
+    writeManifest(proj, { registries: [] });
+    const before = fs.readFileSync(path.join(proj, "skillwharf.json"), "utf8");
+    await expect(addRegistry(ctx, "outside", real)).rejects.toThrow(/only as a path below the project/);
+    expect(fs.readFileSync(path.join(proj, "skillwharf.json"), "utf8")).toBe(before);
+    writeManifest(path.join(home, ".skillwharf"), { registries: [] });
+    await expect(addRegistry(makeContext({ global: true, home }), "outside", real)).resolves.toEqual({ entries: 1 });
   });
 });
 
@@ -890,7 +965,8 @@ describe("S2.5: registry add, remove and list", () => {
   let team: string, other: string;
   beforeEach(() => {
     team = writeIndex(path.join(proj, "team.json"), entry("one"), entry("two"));
-    other = writeIndex(path.join(base, "other.json"), entry("three"));
+    writeIndex(path.join(proj, "other.json"), entry("three"));
+    other = "./other.json"; // a project lists a local registry as a path below it
   });
 
   it("add loads the index once and appends to the list", async () => {
@@ -903,7 +979,7 @@ describe("S2.5: registry add, remove and list", () => {
   it("add with a typo fails and leaves the manifest byte-identical", async () => {
     writeManifest(proj, { registries: [{ name: "pub", location: other }] });
     const before = manifestText();
-    await expect(addRegistry(ctx, "typo", path.join(base, "no-such.json"))).rejects.toThrow(/Registry index not found/);
+    await expect(addRegistry(ctx, "typo", path.join(proj, "no-such.json"))).rejects.toThrow(/Registry index not found/);
     expect(manifestText()).toBe(before);
   });
 
@@ -986,21 +1062,21 @@ describe("S2.5: registry commands and init on the command line", () => {
   const manifest = () => JSON.parse(fs.readFileSync(path.join(proj, "skillwharf.json"), "utf8")) as Manifest;
 
   it("registry list shows name, location, entry count and loaded, or the error", () => {
-    const good = writeIndex(path.join(proj, "good.json"), entry("one"), entry("two"));
-    writeManifest(proj, { registries: [{ name: "good", location: good }, { name: "broken", location: path.join(base, "missing.json") }] });
+    writeIndex(path.join(proj, "good.json"), entry("one"), entry("two"));
+    writeManifest(proj, { registries: [{ name: "good", location: "./good.json" }, { name: "broken", location: "./missing.json" }] });
     const r = cli(["registry", "list"]);
     expect(r.status).toBe(0);
     const out = plain(r.stdout);
     expect(out).toMatch(/name\s+location\s+skills\s+status/);
-    expect(out).toMatch(new RegExp(`good\\s+${good.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s+2\\s+loaded`));
+    expect(out).toMatch(/good\s+\.\/good\.json\s+2\s+loaded/);
     expect(out).toMatch(/broken\s+.*missing\.json\s+-\s+Registry index not found/);
   });
 
   it("registry list --json is plain JSON", () => {
-    const good = writeIndex(path.join(proj, "good.json"), entry("one"));
-    writeManifest(proj, { registries: [{ name: "good", location: good }] });
+    writeIndex(path.join(proj, "good.json"), entry("one"));
+    writeManifest(proj, { registries: [{ name: "good", location: "./good.json" }] });
     const rows = JSON.parse(cli(["--json", "registry", "list"]).stdout) as Record<string, unknown>[];
-    expect(rows).toEqual([{ name: "good", location: good, scope: "project", entries: 1, status: "loaded" }]);
+    expect(rows).toEqual([{ name: "good", location: "./good.json", scope: "project", entries: 1, status: "loaded" }]);
   });
 
   it("registry add and remove through the command line", () => {

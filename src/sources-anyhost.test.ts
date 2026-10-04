@@ -2909,3 +2909,69 @@ describe("Round D D7: the 0.1.x hint shows only for a lock entry that has no lin
     expect(loadLock(ctx).skills.alpha.links).toEqual({});
   });
 });
+
+// ------------------------------------------------------------------ Round E
+describe("Round E E1: a committed link at an agent target is never resolved by the overlap check", () => {
+  afterEach(() => vi.restoreAllMocks());
+  const links: [string, (end: string) => void][] = [
+    [
+      "the agent target .claude/skills/x is a link",
+      (end) => {
+        fs.mkdirSync(path.join(proj, ".claude", "skills"), { recursive: true });
+        fs.symlinkSync(end, path.join(proj, ".claude", "skills", "x"));
+      },
+    ],
+    ["the agent folder .claude is a link", (end) => fs.symlinkSync(end, path.join(proj, ".claude"))],
+    [
+      "the target is a two-hop chain",
+      (end) => {
+        fs.mkdirSync(path.join(proj, ".claude", "skills"), { recursive: true });
+        fs.symlinkSync(end, path.join(proj, "hop"));
+        fs.symlinkSync("../../hop", path.join(proj, ".claude", "skills", "x"));
+      },
+    ],
+  ];
+
+  describe.each(["//attacker/share/x", "/etc"])("a link to %s", (end) => {
+    describe.each(links)("when %s", (_what, setup) => {
+      beforeEach(() => {
+        writeSkill(path.join(proj, "skills", "x"), "x");
+        writeManifest({ version: 1, agents: ["claude"], skills: { x: { source: "path:./skills/x" } } });
+        setup(end);
+      });
+      const quiet = (run: () => unknown) => {
+        const spy = leakSpy([proj]);
+        let thrown: unknown;
+        let result: unknown;
+        try {
+          result = run();
+        } catch (e) {
+          thrown = e;
+        }
+        const found = [...spy.leaks];
+        spy.stop();
+        expect(found).toEqual([]);
+        return { thrown, result };
+      };
+
+      it("sync refuses it", () => expect(quiet(() => syncSkills(ctx)).thrown).toBeInstanceOf(Error));
+      it("update refuses it", () => expect(quiet(() => updateSkills(ctx)).thrown).toBeInstanceOf(Error));
+      it("remove refuses it", () => expect(quiet(() => removeSkill(ctx, "x")).thrown).toBeInstanceOf(Error));
+      it("doctor reports it", () => {
+        const { result } = quiet(() => doctor(ctx));
+        expect((result as { level: string }[]).some((i) => i.level === "error" || i.level === "warn")).toBe(true);
+      });
+    });
+  });
+
+  it("the overlap check still finds a source that is its own agent folder, and a not-yet-existing target is fine", () => {
+    writeSkill(path.join(proj, ".claude", "skills", "x"), "x");
+    writeManifest({ version: 1, agents: ["claude"], skills: { x: { source: "path:./.claude/skills/x" } } });
+    expect(() => syncSkills(ctx)).toThrow(/overlaps an agent folder/);
+    fs.rmSync(path.join(proj, ".claude"), { recursive: true });
+    writeSkill(path.join(proj, "skills", "x"), "x");
+    writeManifest({ version: 1, agents: ["claude"], skills: { x: { source: "path:./skills/x" } } });
+    expect(syncSkills(ctx).fetched).toEqual(["x"]);
+    expect(fs.lstatSync(path.join(proj, ".claude", "skills", "x")).isSymbolicLink()).toBe(true);
+  });
+});
