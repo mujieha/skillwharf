@@ -432,6 +432,75 @@ describe("Round C C1c: a registry location that names a share is refused before 
   });
 });
 
+// ------------------------------------------------------------------ Round D
+describe("Round D D5/D4/D2: where a registry location may point", () => {
+  afterEach(() => vi.restoreAllMocks());
+  const watch = () => {
+    const seen: string[] = [];
+    const stat = fs.statSync;
+    const exists = fs.existsSync;
+    const lstat = fs.lstatSync;
+    vi.spyOn(fs, "statSync").mockImplementation(((p: string, o?: never) => (seen.push(String(p)), stat(p, o))) as never);
+    vi.spyOn(fs, "existsSync").mockImplementation(((p: string) => (seen.push(String(p)), exists(p))) as never);
+    vi.spyOn(fs, "lstatSync").mockImplementation(((p: string, o?: never) => (seen.push(String(p)), lstat(p, o))) as never);
+    return seen;
+  };
+
+  it("D5: a relative location in a project manifest that leaves the manifest's folder is refused before any stat, even when it is not a link", async () => {
+    const outside = path.join(base, "outside-reg");
+    writeIndex(path.join(outside, "index.json"), entry("outside-one"));
+    writeManifest(proj, { registries: [{ name: "up", location: "../outside-reg" }, { name: "deep", location: "../../../../net/attacker/x" }] });
+    const seen = watch();
+    const r = await loadRegistries(ctx);
+    vi.restoreAllMocks();
+    expect(r[0].error).toMatch(/leaves the folder of the manifest that lists it/);
+    expect(r[0].index).toBeUndefined();
+    expect(r[1].error).toMatch(/leaves the folder of the manifest that lists it/);
+    expect(seen.filter((p) => p.includes("outside-reg") || p.includes(`${path.sep}net${path.sep}`))).toEqual([]);
+  });
+
+  it("D5: a relative location that stays inside still loads, and so does an absolute one the user typed with --registry", async () => {
+    writeIndex(path.join(proj, "reg", "index.json"), entry("in-one"));
+    writeManifest(proj, { registries: [{ name: "in", location: "./reg/../reg" }] });
+    expect(names((await loadRegistries(ctx))[0])).toEqual(["in-one"]);
+    const abs = writeIndex(path.join(base, "abs", "index.json"), entry("abs-one"));
+    expect(names((await loadRegistries(ctx, { only: [{ name: "abs", location: abs }] }))[0])).toEqual(["abs-one"]);
+  });
+
+  it("D4: a 33-hop chain ending in share text is refused as leaving the folder, and nothing is asked about the share", async () => {
+    for (let i = 1; i < 33; i++) fs.symlinkSync(`l${i + 1}`, path.join(proj, `l${i}`));
+    fs.symlinkSync("//attacker/share/x", path.join(proj, "l33"));
+    writeManifest(proj, { registries: [{ name: "chain", location: "./l1" }] });
+    const followed: string[] = [];
+    const stat = fs.statSync;
+    const exists = fs.existsSync;
+    vi.spyOn(fs, "statSync").mockImplementation(((p: string, o?: never) => (followed.push(String(p)), stat(p, o))) as never);
+    vi.spyOn(fs, "existsSync").mockImplementation(((p: string) => (followed.push(String(p)), exists(p))) as never);
+    const r = await loadRegistries(ctx);
+    vi.restoreAllMocks();
+    expect(r[0].error).toMatch(/leaves the folder of the manifest that lists it/);
+    // the chain is walked by hand (lstat); stat and exists would follow it to the share
+    expect(followed.filter((p) => p.endsWith(`${path.sep}l1`))).toEqual([]);
+  });
+
+  it("D2: a drive-letter location is refused for a project manifest, not for the global one or for --registry", async () => {
+    const asked = async (spec: RegistrySpec, scope: "project" | "global" | "cli") => {
+      for (const root of [proj, path.join(home, ".skillwharf")]) fs.rmSync(path.join(root, "skillwharf.json"), { force: true });
+      if (scope === "project") writeManifest(proj, { registries: [spec] });
+      if (scope === "global") writeManifest(path.join(home, ".skillwharf"), { registries: [spec] });
+      const r = scope === "cli" ? await loadRegistries(ctx, { only: [spec] }) : await loadRegistries(scope === "global" ? makeContext({ global: true, home }) : ctx);
+      return r[0].error ?? "";
+    };
+    const spec = { name: "win", location: "C:\\registry\\index.json" };
+    expect(await asked(spec, "project")).toMatch(/names a network share or a drive/);
+    expect(await asked(spec, "global")).not.toMatch(/names a network share or a drive/);
+    expect(await asked(spec, "cli")).not.toMatch(/names a network share or a drive/);
+    // a share is refused in all three
+    const share = { name: "net", location: "//attacker/share/index.json" };
+    for (const scope of ["project", "global", "cli"] as const) expect(await asked(share, scope)).toMatch(/names a network share or a drive/);
+  });
+});
+
 // ------------------------------------------------------------------ Round B
 describe("Round B A1: registry entries pinned to a hex ref are reported, not silently dropped", () => {
   it("names them in a note, keeps the rest, and says what to write", async () => {

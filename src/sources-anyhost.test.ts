@@ -6,10 +6,10 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { SUPERVISOR_SOURCE, isGitProcess, supervisedGit, allowAskpass, allowProtocolsForTests, defaultDeadlineMs, gitEnv, killProcessTree, runGit, setGitExecForTests } from "./git.js";
 import { linkStatus, unlinkSkill } from "./agents.js";
-import { copyDir, copyResolvingLinks, hashDir, inGitDir, isAbsoluteLinkText, isInside, resolveInside } from "./fs.js";
+import { copyDir, copyResolvingLinks, hashDir, inGitDir, isAbsoluteLinkText, isInside, pathTextRefusal, resolveInside, resolveInsideDetailed } from "./fs.js";
 import { isSkillDirIn } from "./skill.js";
 import { loadLock, loadManifest, makeContext, saveManifest, storePath } from "./manifest.js";
-import { addSkill, doctor, removeSkill, syncSkills, updateSkills } from "./ops.js";
+import { addSkill, doctor, inspectStore, removeSkill, syncSkills, updateSkills } from "./ops.js";
 import { discoverSkills, discoveryBound, fetchSource, formatSource, isCommitSha, parseSource, sourceKey } from "./source.js";
 import { innerRepository, placeSubmodules } from "./submodules.js";
 import type { Context, Lockfile, Manifest } from "./types.js";
@@ -2621,5 +2621,291 @@ describe("Round B B4/A3: git runs under a supervisor", () => {
     expect(defaultDeadlineMs(120_000)).toBe(480_000);
     expect(defaultDeadlineMs(1000)).toBe(4000);
     expect(defaultDeadlineMs(undefined)).toBe(480_000);
+  });
+});
+
+// ------------------------------------------------------------------ Round D
+describe("Round D D1: an interrupt during the fallback clone ends the command", () => {
+  const interrupted = () => Object.assign(new Error("Command failed"), { status: 130, stderr: Buffer.from("") });
+
+  it("sync --allow-unpinned installs nothing and makes no further git call after Ctrl-C in the fallback clone", () => {
+    const sha = makeRepo("acme/skills", (w) => alphaRepo(w));
+    routeHosts(ALL_HOSTS);
+    const source = "github:acme/skills/alpha";
+    writeManifest({ version: 1, agents: ["claude"], skills: { alpha: { source } } });
+    writeLock({ version: 1, skills: { alpha: { source, resolved: `${source}@${sha}`, integrity: integrityAt(`${source}@${sha}`), installedAt: "x" } } });
+    exec.mockClear();
+    exec.mockImplementation(((file: string, args: string[], options: never) => {
+      if (args.includes("fetch") && args.includes(sha)) {
+        throw Object.assign(new Error("Command failed: git fetch"), { stderr: Buffer.from(`fatal: remote error: upload-pack: not our ref ${sha}\n`), status: 128 });
+      }
+      if (args.includes("clone")) throw interrupted();
+      return realExec.fn(file, args, options);
+    }) as never);
+    expect(() => syncSkills(ctx, { allowUnpinned: true })).toThrow(expect.objectContaining({ kind: "interrupted" }));
+    const calls = gitCalls();
+    expect(calls.filter((c) => c[0] === "clone").length).toBe(1);
+    expect(calls[calls.length - 1][0]).toBe("clone"); // nothing ran after the interrupt
+    expect(fs.existsSync(path.join(proj, ".skillwharf"))).toBe(false);
+    expect(fs.existsSync(path.join(proj, ".claude"))).toBe(false);
+  });
+
+  it("the fallback clone leaves no temp folder behind when it is interrupted", () => {
+    const sha = makeRepo("acme/skills", (w) => alphaRepo(w));
+    routeHosts(ALL_HOSTS);
+    const tmp = privateTmp();
+    const source = "github:acme/skills/alpha";
+    writeManifest({ version: 1, agents: ["claude"], skills: { alpha: { source } } });
+    writeLock({ version: 1, skills: { alpha: { source, resolved: `${source}@${sha}`, integrity: "sha256-x", installedAt: "x" } } });
+    exec.mockImplementation(((file: string, args: string[], options: never) => {
+      if (args.includes("fetch") && args.includes(sha)) {
+        throw Object.assign(new Error("Command failed: git fetch"), { stderr: Buffer.from(`fatal: remote error: upload-pack: not our ref ${sha}\n`), status: 128 });
+      }
+      if (args.includes("clone")) throw interrupted();
+      return realExec.fn(file, args, options);
+    }) as never);
+    expect(() => syncSkills(ctx, { allowUnpinned: true })).toThrow(/interrupted/);
+    expect(fs.readdirSync(tmp)).toEqual([]);
+  });
+
+  it("runGit does not start another git once one was interrupted", () => {
+    exec.mockImplementation((() => {
+      throw interrupted();
+    }) as never);
+    expect(() => runGit(["status"], { url: "https://git.acme.test/a/b.git" })).toThrow(expect.objectContaining({ kind: "interrupted" }));
+    exec.mockClear();
+    expect(() => runGit(["status"], { url: "https://git.acme.test/a/b.git" })).toThrow(expect.objectContaining({ kind: "interrupted" }));
+    expect(exec).not.toHaveBeenCalled();
+  });
+});
+
+describe("Round D D2: share text is refused everywhere, drive text only where a cloned manifest could have chosen it", () => {
+  const states = [
+    { global: false, allowOutsidePaths: false },
+    { global: false, allowOutsidePaths: true },
+    { global: true, allowOutsidePaths: false },
+  ];
+
+  it.each(["//attacker/share/x", "\\\\attacker\\share\\x"])("pathTextRefusal: %s is a share in every case", (text) => {
+    for (const s of states) expect(pathTextRefusal(text, s)).toBe("share");
+  });
+
+  it.each(["C:\\Users\\me\\skills\\x", "c:/skills/x", "D:rel"])("pathTextRefusal: %s is a drive in a project without --allow-outside-paths, and fine otherwise", (text) => {
+    expect(pathTextRefusal(text, states[0])).toBe("drive");
+    expect(pathTextRefusal(text, states[1])).toBeUndefined();
+    expect(pathTextRefusal(text, states[2])).toBeUndefined();
+  });
+
+  it.each(["skills/x", "./skills/x", "/home/me/x", "../x"])("pathTextRefusal: %s is neither", (text) => {
+    for (const s of states) expect(pathTextRefusal(text, s)).toBeUndefined();
+  });
+
+  const messageOf = (fn: () => unknown): string => {
+    try {
+      fn();
+    } catch (e) {
+      return (e as Error).message;
+    }
+    return "";
+  };
+
+  it("a global manifest's drive-letter path: source is not refused as a drive (sync gets past the text check)", () => {
+    const g = makeContext({ global: true, home });
+    fs.mkdirSync(g.root, { recursive: true });
+    fs.writeFileSync(path.join(g.root, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: { alpha: { source: "path:C:/skills/alpha" } } }));
+    expect(messageOf(() => syncSkills(g))).not.toMatch(/network share or a drive/);
+    expect(messageOf(() => doctor(g))).not.toMatch(/network share or a drive/);
+  });
+
+  it("a project's drive-letter path: source is refused, unless --allow-outside-paths is given", () => {
+    writeManifest({ version: 1, agents: ["claude"], skills: { alpha: { source: "path:C:/skills/alpha" } } });
+    expect(messageOf(() => syncSkills(ctx))).toMatch(/network share or a drive/);
+    expect(messageOf(() => syncSkills(ctx, { allowOutsidePaths: true }))).not.toMatch(/network share or a drive/);
+  });
+
+  it("a share is refused even with --allow-outside-paths and in a global manifest", () => {
+    writeManifest({ version: 1, agents: ["claude"], skills: { alpha: { source: "path://attacker/share/x" } } });
+    expect(messageOf(() => syncSkills(ctx, { allowOutsidePaths: true }))).toMatch(/network share or a drive/);
+    const g = makeContext({ global: true, home });
+    fs.mkdirSync(g.root, { recursive: true });
+    fs.writeFileSync(path.join(g.root, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: { alpha: { source: "path:\\\\attacker\\share\\x" } } }));
+    expect(messageOf(() => syncSkills(g))).toMatch(/network share or a drive/);
+  });
+});
+
+describe("Round D D3: the store is never statted before it is known not to be a link", () => {
+  afterEach(() => vi.restoreAllMocks());
+  const manifest = () => writeManifest({ version: 1, agents: ["claude"], skills: { alpha: { source: "path:./skills/alpha" } } });
+  const setups: [string, (end: string) => void][] = [
+    ["the committed .skillwharf is a link", (end) => fs.symlinkSync(end, path.join(proj, ".skillwharf"))],
+    [
+      "the committed .skillwharf/skills/alpha is a link",
+      (end) => {
+        fs.mkdirSync(path.join(proj, ".skillwharf", "skills"), { recursive: true });
+        fs.symlinkSync(end, path.join(proj, ".skillwharf", "skills", "alpha"));
+      },
+    ],
+  ];
+
+  describe.each(["//attacker/share/x", "/etc"])("a link to %s", (end) => {
+    describe.each(setups)("when %s", (_what, setup) => {
+      beforeEach(() => {
+        writeSkill(path.join(proj, "skills", "alpha"), "alpha");
+        manifest();
+        setup(end);
+      });
+      const clean = (run: () => unknown, check: (r: unknown) => void) => {
+        const spy = leakSpy([proj]);
+        let result: unknown;
+        let thrown: unknown;
+        try {
+          result = run();
+        } catch (e) {
+          thrown = e;
+        }
+        const found = [...spy.leaks];
+        spy.stop();
+        expect(found).toEqual([]);
+        check(thrown ?? result);
+      };
+
+      it("sync refuses it", () => clean(() => syncSkills(ctx), (r) => expect((r as Error).message).toMatch(/symlink/)));
+      it("update refuses it", () => clean(() => updateSkills(ctx), (r) => expect((r as Error).message).toMatch(/symlink/)));
+      it("remove refuses it", () => clean(() => removeSkill(ctx, "alpha"), (r) => expect((r as Error).message).toMatch(/symlink/)));
+      it("doctor reports it", () =>
+        clean(() => doctor(ctx), (r) => expect((r as { message: string }[]).some((i) => /symlink/.test(i.message))).toBe(true)));
+      it("inspectStore calls it foreign and reads nothing", () =>
+        clean(() => inspectStore(ctx, "alpha"), (r) => expect(r).toEqual({ state: "foreign" })));
+    });
+  });
+
+  it("inspectStore: an ordinary store folder is installed and read, an absent one is missing", () => {
+    expect(inspectStore(ctx, "alpha")).toEqual({ state: "missing" });
+    const store = path.join(proj, ".skillwharf", "skills", "alpha");
+    writeSkill(store, "alpha");
+    expect(inspectStore(ctx, "alpha")).toMatchObject({ state: "installed", meta: { name: "alpha", description: "d" } });
+  });
+});
+
+describe("Round D D4: a chain of links over the hop limit is outside, and only a missing entry is broken", () => {
+  afterEach(() => vi.restoreAllMocks());
+  const chain = (hops: number, end: string): void => {
+    for (let i = 1; i < hops; i++) fs.symlinkSync(`l${i + 1}`, path.join(proj, `l${i}`));
+    fs.symlinkSync(end, path.join(proj, `l${hops}`));
+  };
+
+  it("resolveInsideDetailed: 33 hops ending in share text is outside; so is 40; a loop is outside", () => {
+    chain(33, "//attacker/share/x");
+    expect(resolveInsideDetailed(proj, path.join(proj, "l1"))).toEqual({ fail: "outside" });
+    fs.symlinkSync("loop-b", path.join(proj, "loop-a"));
+    fs.symlinkSync("loop-a", path.join(proj, "loop-b"));
+    expect(resolveInsideDetailed(proj, path.join(proj, "loop-a"))).toEqual({ fail: "outside" });
+  });
+
+  it("resolveInsideDetailed: a link to a missing entry inside is broken, a missing path is broken", () => {
+    fs.symlinkSync("not-there", path.join(proj, "dangling"));
+    expect(resolveInsideDetailed(proj, path.join(proj, "dangling"))).toEqual({ fail: "broken" });
+    expect(resolveInsideDetailed(proj, path.join(proj, "nothing"))).toEqual({ fail: "broken" });
+  });
+
+  it("a stored path: source that is a 33-hop chain ending in share text is refused as outside, and the spy sees nothing", () => {
+    chain(33, "//attacker/share/x");
+    writeManifest({ version: 1, agents: ["claude"], skills: { alpha: { source: "path:./l1" } } });
+    const spy = leakSpy([proj]);
+    expect(() => syncSkills(ctx)).toThrow(/outside the project/);
+    expect(() => doctor(ctx)).not.toThrow();
+    const found = [...spy.leaks];
+    spy.stop();
+    expect(found).toEqual([]);
+  });
+});
+
+describe("Round D D6: doctor does not resolve a path: source outside the project", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("reports it as outside the project and never asks the file system about it", () => {
+    const outside = path.join(base, "elsewhere", "alpha");
+    writeSkill(outside, "alpha");
+    const source = `path:${outside}`;
+    writeManifest({ version: 1, agents: ["claude"], skills: { alpha: { source } } });
+    const store = path.join(proj, ".skillwharf", "skills", "alpha");
+    writeSkill(store, "alpha");
+    writeLock({ version: 1, skills: { alpha: { source, resolved: source, integrity: hashDir(store), installedAt: "x" } } });
+    const seen: string[] = [];
+    const wrap = <K extends "statSync" | "existsSync" | "lstatSync">(k: K) => {
+      const real = fs[k] as unknown as (p: unknown, o?: unknown) => unknown;
+      vi.spyOn(fs, k).mockImplementation(((p: unknown, o?: unknown) => (seen.push(String(p)), real(p, o))) as never);
+    };
+    wrap("statSync");
+    wrap("existsSync");
+    const native = fs.realpathSync.native;
+    vi.spyOn(fs.realpathSync, "native").mockImplementation(((p: string, o?: never) => (seen.push(String(p)), native(p, o))) as never);
+    const issues = doctor(ctx);
+    vi.restoreAllMocks();
+    expect(issues.some((i) => /outside the project/.test(i.message))).toBe(true);
+    expect(seen.filter((p) => p.startsWith(path.join(base, "elsewhere")))).toEqual([]);
+  });
+
+  it("with allowOutsidePaths the outside source is looked at, as sync --allow-outside-paths would", () => {
+    const outside = path.join(base, "elsewhere", "alpha");
+    writeSkill(outside, "alpha");
+    const source = `path:${outside}`;
+    writeManifest({ version: 1, agents: ["claude"], skills: { alpha: { source } } });
+    const store = path.join(proj, ".skillwharf", "skills", "alpha");
+    writeSkill(store, "alpha");
+    writeLock({ version: 1, skills: { alpha: { source, resolved: source, integrity: hashDir(store), installedAt: "x" } } });
+    expect(doctor(ctx, { allowOutsidePaths: true }).some((i) => /outside the project/.test(i.message))).toBe(false);
+  });
+});
+
+describe("Round D D7: the 0.1.x hint shows only for a lock entry that has no links record", () => {
+  const sourceOf = "git+https://git.acme.test/team/skills.git//a";
+  const lockWith = (sha: string, links?: Record<string, never>): void => {
+    fs.writeFileSync(path.join(proj, "skillwharf.json"), JSON.stringify({ version: 1, agents: ["claude"], skills: { a: { source: sourceOf } } }));
+    fs.writeFileSync(
+      path.join(proj, "skillwharf.lock.json"),
+      JSON.stringify({ version: 1, skills: { a: { source: sourceOf, resolved: `${sourceOf}@${sha}`, integrity: "sha256-changed", installedAt: "x", ...(links ? { links } : {}) } } }),
+    );
+  };
+
+  it("an entry with links: {} that no longer matches gets the plain mismatch, without the 0.1.x sentence", () => {
+    const sha = makeRepo("team/skills", (w) => writeSkill(path.join(w, "a"), "a", "committed"));
+    routeHosts(ALL_HOSTS);
+    lockWith(sha, {});
+    let message = "";
+    try {
+      syncSkills(ctx);
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    expect(message).toMatch(/integrity mismatch for "a"/);
+    expect(message).not.toMatch(/0\.1\.x/);
+  });
+
+  it("an entry with no links record still gets it", () => {
+    const sha = makeRepo("team/skills", (w) => writeSkill(path.join(w, "a"), "a", "committed"));
+    routeHosts(ALL_HOSTS);
+    lockWith(sha);
+    expect(() => syncSkills(ctx)).toThrow(/If this lock was written by skillwharf 0\.1\.x/);
+  });
+
+  it("add, sync and update write links: {}, and a lock with no links record loads", () => {
+    makeRepo("acme/skills", (w) => alphaRepo(w));
+    routeHosts(ALL_HOSTS);
+    writeManifest({ version: 1, agents: ["claude"], skills: {} });
+    addSkill(ctx, "github:acme/skills/alpha");
+    expect(loadLock(ctx).skills.alpha.links).toEqual({});
+    // sync of a fresh clone: the store is gone, the lock stays
+    fs.rmSync(path.join(proj, ".skillwharf"), { recursive: true, force: true });
+    const lock = loadLock(ctx);
+    delete lock.skills.alpha.links;
+    writeLock(lock);
+    expect(syncSkills(ctx).fetched).toEqual(["alpha"]);
+    expect(loadLock(ctx).skills.alpha.links).toEqual({});
+    const again = loadLock(ctx);
+    delete again.skills.alpha.links;
+    writeLock(again);
+    updateSkills(ctx, ["alpha"]);
+    expect(loadLock(ctx).skills.alpha.links).toEqual({});
   });
 });
