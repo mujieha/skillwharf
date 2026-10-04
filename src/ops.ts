@@ -9,6 +9,8 @@ import {
   hashDir,
   isDir,
   isInside,
+  pathTextRefusal,
+  resolveInsideDetailed,
   pathsOverlap,
   removePath,
   resolveLink,
@@ -27,7 +29,25 @@ import {
 import { LOCKFILE, assertSafeTarget, loadLock, requireManifest, saveLock, saveManifest, storePath } from "./manifest.js";
 import { normalizeName, readSkill } from "./skill.js";
 import { assertSubpath } from "./validate.js";
-import { discoverSkills, fetchSource, installToStore, parseSource, type ParsedSource } from "./source.js";
+import { GitError, defaultDeadlineMs, interruptedBy } from "./git.js";
+import { loadRegistries, resolveRegistryName } from "./registry.js";
+import {
+  PinUnavailable,
+  ShortShaError,
+  cloneUrl,
+  discoverSkills,
+  fetchSource,
+  formatSource,
+  installToStore,
+  discoveryBound,
+  isCommitSha,
+  parseSource,
+  sourceKey,
+  stageSkill,
+  type FetchOptions,
+  type Fetched,
+  type ParsedSource,
+} from "./source.js";
 import type { AgentId, Context, LockEntry, Lockfile, Manifest, SkillMeta, SkillSpec } from "./types.js";
 
 export interface SourceOptions {
@@ -39,6 +59,18 @@ export interface SourceOptions {
   allowOutsidePaths?: boolean;
   /** Override the default size cap for one skill folder. */
   limits?: SizeLimits;
+  /** Longest one git call may run, in milliseconds (default 120 s). */
+  gitTimeoutMs?: number;
+  /** Longest all the git calls of one command may take together, in milliseconds (default four times the timeout). */
+  gitDeadlineMs?: number;
+  /** @internal The moment that limit runs out (epoch milliseconds), set when a command starts. */
+  gitDeadlineAt?: number;
+}
+
+/** The options of a command with its overall git deadline fixed at the moment it starts. */
+function withDeadline<T extends { gitTimeoutMs?: number; gitDeadlineMs?: number; gitDeadlineAt?: number }>(opts: T): T {
+  if (opts.gitDeadlineAt !== undefined) return opts;
+  return { ...opts, gitDeadlineAt: Date.now() + (opts.gitDeadlineMs ?? defaultDeadlineMs(opts.gitTimeoutMs)) };
 }
 
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
@@ -55,17 +87,25 @@ export function parseStoredSource(
   /** When given, a `path:` source may not overlap this skill's store or agent folders. */
   skill?: { m: Manifest; name: string },
 ): ParsedSource {
-  const p = parseSource(raw, ctx.root);
-  if (p.kind === "path" && skill) assertSourceClear(ctx, skill.m, skill.name, raw, p.path);
-  if (p.kind === "path" && !ctx.global && !opts.allowOutsidePaths) {
-    const real = resolveLink(p.path);
-    const realRoot = resolveLink(ctx.root) ?? ctx.root;
-    const inside = real ? isInside(realRoot, real) : isInside(ctx.root, p.path);
-    if (!inside) {
+  let p: ParsedSource;
+  try {
+    p = parseSource(raw, ctx.root);
+  } catch (e) {
+    // A 0.1.x manifest may pin a tag that is called like a short sha: say which skill, and what to write now.
+    if (e instanceof ShortShaError && skill) throw new Error(`Skill "${skill.name}": ${e.message}`);
+    throw e;
+  }
+  if (p.kind === "path") {
+    // Containment first, as text and through links followed by hand: only then is the
+    // path resolved (see storedPathMayBeResolved).
+    const confined = !ctx.global && !opts.allowOutsidePaths;
+    const resolvable = storedPathMayBeResolved(ctx, raw, p.path, opts.allowOutsidePaths);
+    if (confined && !resolvable) {
       throw new Error(
         `Source "${raw}" is outside the project (${ctx.root}). Re-run with --allow-outside-paths if you trust it.`,
       );
     }
+    if (skill && (resolvable || !confined)) assertSourceClear(ctx, skill.m, skill.name, raw, p.path);
   }
   return p;
 }
@@ -99,6 +139,11 @@ function assertSourceClear(
   }
 }
 
+/** Where `dir` really is inside the fetched repository at `root`, as a `/`-separated path (links resolved). */
+function repoRelative(root: string, dir: string): string {
+  return path.relative(fs.realpathSync(root), fs.realpathSync(dir)).split(path.sep).join("/");
+}
+
 /** True when the lockfile says skillwharf made a copy (not a link) at this location. */
 function copyRecorded(lock: Lockfile, name: string, g: TargetGroup): boolean {
   const links = lock.skills[name]?.links;
@@ -117,8 +162,9 @@ function recordLinks(lock: Lockfile, name: string, results: LinkResult[]): boole
       else if (r.mode === "symlink") delete links[a];
     }
   }
-  if (Object.keys(links).length > 0) entry.links = links;
-  else delete entry.links;
+  // Always present from 0.2.0 on (empty when every agent got a link): an entry without the
+  // record is the one a 0.1.x skillwharf wrote, which is what the integrity-mismatch hint keys on.
+  entry.links = links;
   return JSON.stringify(entry.links ?? null) !== before;
 }
 
@@ -127,7 +173,7 @@ function sameSource(ctx: Context, a: string, b: string): boolean {
   const key = (raw: string) => {
     try {
       const p = parseSource(raw, ctx.root);
-      return p.kind === "path" ? `path:${p.path}` : `github:${p.owner}/${p.repo}/${p.subpath}@${p.ref ?? ""}`;
+      return p.kind === "path" ? sourceKey(p) : `${sourceKey(p)}@${p.ref ?? ""}`;
     } catch {
       return raw;
     }
@@ -144,6 +190,33 @@ function hasIntegrity(entry: LockEntry): boolean {
 class UnusablePin extends Error {}
 
 /**
+ * Fetch a source; an unreachable repository is reported in the words that tell
+ * the user what to do. `name` is the managed skill when there is one (it makes
+ * the moved-repository hint a command that can be pasted).
+ */
+function fetchFor(src: ParsedSource, opts: SourceOptions, name?: string, extra: FetchOptions = {}): Fetched {
+  try {
+    return fetchSource(src, { timeoutMs: opts.gitTimeoutMs, deadline: opts.gitDeadlineAt, ...extra });
+  } catch (e) {
+    throw explainFetchError(e, name);
+  }
+}
+
+function explainFetchError(e: unknown, name?: string): unknown {
+  if (!(e instanceof GitError) || e.kind !== "unreachable") return e;
+  const detail = e.message.replace(/^git fetch failed for \S+: /, "");
+  const hint = name ? `; if it moved, run \`skillwharf update ${name} --source <new>\`` : "";
+  return new Error(`repository not found or no access at ${e.url}${hint} (git said: ${detail})`);
+}
+
+/** What a pinned fetch may fall back to: the manifest's branch or tag, or the default branch; nothing when the manifest names a commit. */
+function fallbackFor(src: ParsedSource): FetchOptions["fallback"] {
+  if (src.kind !== "git") return undefined;
+  if (src.ref && isCommitSha(src.ref)) return undefined;
+  return { ref: src.ref };
+}
+
+/**
  * The exact source the lockfile pins for `name`, after checking that it is the
  * manifest's source at a full commit. Anything else is refused: a lockfile is
  * as editable by a teammate (or a pull request) as the manifest is.
@@ -152,25 +225,31 @@ function lockedSource(ctx: Context, m: Manifest, name: string, spec: SkillSpec, 
   const want = parseStoredSource(ctx, spec.source, opts, { m, name });
   const mismatch = () =>
     new Error(
-      `${LOCKFILE}: the entry for "${name}" (${String(entry.resolved)}) does not match the manifest source ${spec.source}. Run \`skillwharf update ${name}\` to re-pin it.`,
+      `${LOCKFILE}: the entry for "${name}" (${String(entry.resolved)}) does not match the manifest source ${spec.source}. Run \`skillwharf update ${name}\` to re-pin it; if the repository moved, run \`skillwharf update ${name} --source <new>\`.`,
     );
   if (entry.source !== spec.source || typeof entry.resolved !== "string") throw mismatch();
   let got: ParsedSource;
   try {
     got = parseSource(entry.resolved, ctx.root);
-  } catch {
+  } catch (e) {
+    // A 0.1.x lock may pin an abbreviated sha: that is an unusable pin, not a different source.
+    if (e instanceof ShortShaError) {
+      throw new UnusablePin(`${LOCKFILE}: "${name}" is pinned to an abbreviated sha, not a full 40-character commit sha.`);
+    }
     throw mismatch();
   }
-  if (want.kind === "github") {
-    if (got.kind !== "github" || got.owner !== want.owner || got.repo !== want.repo || got.subpath !== want.subpath) {
-      throw mismatch();
-    }
+  if (want.kind === "git") {
+    // Same repository path, host and port, and also the same URL: sourceKey leaves out the
+    // `.git` suffix and the ssh user, which can reach a different repository or identity.
+    if (got.kind !== "git" || sourceKey(got) !== sourceKey(want) || cloneUrl(got) !== cloneUrl(want)) throw mismatch();
     if (!got.ref || !FULL_SHA_RE.test(got.ref)) {
       throw new UnusablePin(
         `${LOCKFILE}: "${name}" is pinned to "${String(got.ref)}", not a full 40-character commit sha.`,
       );
     }
-    return got;
+    // Fetch the manifest's own spelling of the URL (the one a reviewer saw in the pull
+    // request) at the commit the lock pins; never the lock's spelling.
+    return { ...want, ref: got.ref };
   }
   if (got.kind !== "path" || got.path !== want.path) throw mismatch();
   return want;
@@ -225,6 +304,12 @@ export interface AddOptions {
   force?: boolean;
   /** Override the default size cap for one skill folder */
   limits?: SizeLimits;
+  /** Longest one git call may run, in milliseconds (default 120 s). */
+  gitTimeoutMs?: number;
+  /** Longest all the git calls of this command may take together, in milliseconds (default four times the timeout). */
+  gitDeadlineMs?: number;
+  /** @internal */
+  gitDeadlineAt?: number;
   /** Called for each folder of a multi-skill source that was left out, with the reason. */
   onSkipped?: (skipped: SkippedSkill) => void;
 }
@@ -273,16 +358,29 @@ export function agentsFor(m: Manifest, name: string): AgentId[] {
   return m.skills[name]?.agents ?? m.agents;
 }
 
-export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {}): AddedSkill[] {
+export function addSkill(ctx: Context, sourceRaw: string, options: AddOptions = {}): AddedSkill[] {
+  const opts = withDeadline(options);
   const m = requireManifest(ctx);
   const lock = loadLock(ctx);
   const parsed = parseSource(sourceRaw);
-  const fetched = fetchSource(parsed);
+  const fetched = fetchFor(parsed, opts);
+  // Skills from a git repository are copied into a staging folder first (see
+  // stageSkill), so the size cap, the link rule and the metadata all apply to
+  // what would actually be installed, and before anything is written.
+  let stagingRoot: string | undefined;
   try {
-    let dirs = discoverSkills(fetched.dir);
+    const dirs = discoverSkills(fetched.dir, { root: fetched.root, maxEntries: discoveryBound(opts.limits) });
     if (dirs.length === 0) throw new Error(`No SKILL.md found under ${sourceRaw}`);
     if (dirs.length > 1 && !opts.all) {
-      const names = dirs.map((d) => readSkill(d).name).join(", ");
+      const names = dirs
+        .map((d) => {
+          try {
+            return readSkill(d).name;
+          } catch {
+            return path.basename(d); // e.g. a SKILL.md that is a link inside the repository
+          }
+        })
+        .join(", ");
       throw new Error(
         `Source contains ${dirs.length} skills (${names}). Point at one sub-folder, or pass --all to install every skill.`,
       );
@@ -294,8 +392,8 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
     // so `--all` never leaves earlier skills linked but unrecorded.
     const multi = dirs.length > 1;
     const skipped: SkippedSkill[] = [];
-    const seen = new Set<string>();
-    const plan = dirs.flatMap((dir) => {
+    const seen = new Map<string, { label: string; hash?: string }>();
+    const plan = dirs.flatMap((dir, index) => {
       // The source recorded for this skill. In a multi-skill source it is built
       // from the folder name, so it has to pass the same checks as a typed one:
       // `skills/x@y` would re-parse as branch `y`, and `skills/my skill` would
@@ -325,24 +423,51 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
         else sourceForManifest = path.isAbsolute(parsed.raw.replace(/^path:/, "")) ? parsed.raw : `path:${parsed.path}`;
         resolved = sourceForManifest;
       } else if (multi) {
-        const rel = dir.slice(fetched.dir.length).replace(/^[/\\]+/, "").split("\\").join("/");
-        const sub = [parsed.subpath, rel].filter(Boolean).join("/");
+        // Where the folder really is in the repository, not the link it may have
+        // been found through (a source whose sub-path ran through a link would
+        // be refused on the next sync).
+        const sub = repoRelative(fetched.root as string, dir);
         try {
           assertSubpath(sub);
         } catch (e) {
           return skip(sub, (e as Error).message);
         }
-        const refPart = parsed.ref ? `@${parsed.ref}` : "";
-        sourceForManifest = `github:${parsed.owner}/${parsed.repo}/${sub}${refPart}`;
-        resolved = resolved.replace(/^github:[^@]+/, `github:${parsed.owner}/${parsed.repo}/${sub}`);
+        const folder: ParsedSource = { ...parsed, subpath: sub };
+        sourceForManifest = formatSource(folder);
+        resolved = formatSource(folder, fetched.sha);
       } else {
         sourceForManifest = parsed.raw;
       }
 
-      const meta = readSkill(dir);
+      // A git skill is read from its staged copy (the folder as it would be
+      // installed); the staged folder keeps the original's name for the
+      // metadata fallback. A local folder is read in place.
+      let stagedDir: string | undefined;
+      let dropped: string[] | undefined;
+      if (fetched.root) {
+        stagingRoot ??= fs.mkdtempSync(path.join(os.tmpdir(), "skillwharf-stage-"));
+        stagedDir = path.join(stagingRoot, String(index), path.basename(dir));
+        dropped = stageSkill(dir, stagedDir, { root: fetched.root, limits: opts.limits }).dropped;
+        // Links a submodule had that left it were dropped when it was placed; they are
+        // reported with the skill whose folder they were in.
+        const here = repoRelative(fetched.root, dir);
+        for (const d of fetched.droppedInSubmodules ?? []) {
+          if (here === "" || d.startsWith(`${here}/`)) dropped.push(here === "" ? d : d.slice(here.length + 1));
+        }
+        dropped.sort();
+      }
+      const meta = readSkill(stagedDir ?? dir);
       const name = normalizeName(opts.name ?? meta.name);
-      if (seen.has(name)) throw new Error(`Two skills in ${sourceRaw} resolve to the name "${name}". Install them one at a time with --name.`);
-      seen.add(name);
+      const earlier = seen.get(name);
+      if (earlier) {
+        // A repository that mirrors one skill into several folders (skills/x,
+        // .claude/skills/x, ...) is one skill: the first, plainest copy is kept.
+        if (stagedDir && earlier.hash !== undefined && hashDir(stagedDir) === earlier.hash) {
+          return skip(repoRelative(fetched.root as string, dir), `same skill as ${earlier.label}`);
+        }
+        throw new Error(`Two skills in ${sourceRaw} resolve to the name "${name}". Install them one at a time with --name.`);
+      }
+      seen.set(name, { label: stagedDir ? repoRelative(fetched.root as string, dir) : dir, hash: stagedDir ? hashDir(stagedDir) : undefined });
       const store = storePath(ctx, name);
       // The agent set is fixed here and used for the check and for the links.
       // `--agents` replaces a skill's own list; without it the list it has
@@ -367,8 +492,20 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
           throw new Error(`${g.target} already exists and is not managed by skillwharf. Move it away, or re-run with --force.`);
         }
       }
-      assertWithinLimits(dir, opts.limits);
-      return [{ dir, meta, name, store, agentList, targets, sourceForManifest, resolved, skippedSymlinks: findSymlinks(dir) }];
+      if (!stagedDir) assertWithinLimits(dir, opts.limits);
+      return [
+        {
+          dir: stagedDir ?? dir,
+          meta,
+          name,
+          store,
+          agentList,
+          targets,
+          sourceForManifest,
+          resolved,
+          skippedSymlinks: dropped ?? findSymlinks(dir),
+        },
+      ];
     });
     if (plan.length === 0) {
       throw new Error(
@@ -387,7 +524,7 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
         integrity: hashDir(store),
         version: meta.version,
         installedAt: new Date().toISOString(),
-        ...(lock.skills[name]?.links ? { links: lock.skills[name].links } : {}),
+        links: lock.skills[name]?.links ?? {},
       };
       lock.skills[name] = entry;
       // Record each skill as soon as its store folder is in place, before the
@@ -401,7 +538,50 @@ export function addSkill(ctx: Context, sourceRaw: string, opts: AddOptions = {})
     return results;
   } finally {
     fetched.cleanup();
+    if (stagingRoot) removePath(stagingRoot);
   }
+}
+
+export interface AddFromRegistryOptions extends AddOptions {
+  /** Take the skill from this registry (needed when two registries list the name). */
+  from?: string;
+  /** Called for each registry that could not be loaded, or was renamed, with a line saying which and why. */
+  onWarning?: (message: string) => void;
+  /** The folder a bare name is checked against (default: the working directory). */
+  cwd?: string;
+}
+
+/**
+ * `add <name>`: look the name up in the registries (in order), then install the
+ * source the entry gives, exactly as `add <source>` would. The manifest records
+ * that source, not the name.
+ */
+export async function addFromRegistry(ctx: Context, name: string, opts: AddFromRegistryOptions = {}): Promise<AddedSkill[]> {
+  // 0.1.x read a bare `add pdf` as the folder ./pdf. A name that is also a folder
+  // here is ambiguous, so say so instead of choosing (`--from` settles it).
+  if (opts.from === undefined && isDir(path.resolve(opts.cwd ?? process.cwd(), name))) {
+    throw new Error(
+      `ambiguous: \`${name}\` is a folder here and a registry lookup; use \`./${name}\` for the folder or \`--from <registry> ${name}\``,
+    );
+  }
+  const registries = await loadRegistries(ctx, { timeoutMs: opts.gitTimeoutMs });
+  // Ctrl-C ends the command: nothing is resolved or installed after it.
+  if (interruptedBy()) throw new GitError("interrupted", "interrupted", name);
+  for (const r of registries) {
+    if (r.note !== undefined) opts.onWarning?.(r.note);
+    if (r.error !== undefined) opts.onWarning?.(`registry ${r.name}: ${r.error}`);
+  }
+  // A registry that failed to load might list this name too (a second entry would make it
+  // ambiguous): picking from the others would let an unreachable registry be bypassed.
+  const failed = registries.find((r) => r.error !== undefined);
+  if (failed && opts.from === undefined) {
+    throw new Error(
+      `registry "${failed.name}" could not be loaded (${failed.error}), so "${name}" might be listed there too. ` +
+        `Fix it, remove it (skillwharf registry remove ${failed.name}), or choose a registry with --from <registry>.`,
+    );
+  }
+  const { entry } = resolveRegistryName(registries, name, opts.from);
+  return addSkill(ctx, entry.source, { ...opts, name: opts.name ?? entry.name });
 }
 
 export interface RemoveResult {
@@ -412,7 +592,7 @@ export interface RemoveResult {
   existed: boolean;
 }
 
-export function removeSkill(ctx: Context, name: string): RemoveResult {
+export function removeSkill(ctx: Context, name: string, options: { allowOutsidePaths?: boolean } = {}): RemoveResult {
   const m = requireManifest(ctx);
   const lock = loadLock(ctx);
   const existed = name in m.skills;
@@ -423,7 +603,7 @@ export function removeSkill(ctx: Context, name: string): RemoveResult {
   // touching anything, as add, sync, update and doctor do.
   const entry = lock.skills[name];
   for (const raw of [m.skills[name]?.source, entry?.source, entry?.resolved]) {
-    if (typeof raw === "string") assertStoredSourceClear(ctx, m, name, raw);
+    if (typeof raw === "string") assertStoredSourceClear(ctx, m, name, raw, options);
   }
   const removed: TargetGroup[] = [];
   for (const g of targetGroups(ctx, m, agentsFor(m, name), name)) {
@@ -455,20 +635,23 @@ export interface SyncOptions extends SourceOptions {
 }
 
 /** Bring store + agent dirs in line with the manifest. Fetches skills missing from the store. */
-export function syncSkills(ctx: Context, opts: SyncOptions = {}): SyncReport {
+export function syncSkills(ctx: Context, options: SyncOptions = {}): SyncReport {
+  const opts = withDeadline(options);
   const m = requireManifest(ctx);
   const lock = loadLock(ctx);
   const report: SyncReport = { fetched: [], linked: [], unchanged: [] };
+
+  // A committed store can be a link (`.skillwharf`, or one skill's folder) to a share or any
+  // absolute path. Every store path is checked with lstat only, before anything asks the file
+  // system about it (`isDir` follows links) or about a source that is compared with it.
+  for (const name of Object.keys(m.skills)) assertSafeTarget(ctx, storePath(ctx, name));
 
   // Check every committed store folder before linking any of them. Freshly
   // fetched ones cannot contain symlinks: installToStore leaves them out.
   for (const [name, spec] of Object.entries(m.skills)) {
     const store = storePath(ctx, name);
-    if (isDir(store)) {
-      assertSafeTarget(ctx, store);
-      assertStoreHasNoSymlinks(name, store);
-    }
-    assertStoredSourceClear(ctx, m, name, spec.source);
+    if (isDir(store)) assertStoreHasNoSymlinks(name, store);
+    assertStoredSourceClear(ctx, m, name, spec.source, opts);
   }
 
   // A lock entry with no integrity hash pins a commit but cannot verify what
@@ -484,6 +667,19 @@ export function syncSkills(ctx: Context, opts: SyncOptions = {}): SyncReport {
         `${LOCKFILE}: no integrity hash for ${unverifiable.map((n) => `"${n}"`).join(", ")}, so the content cannot be verified. ` +
           `Nothing was installed and the lockfile was not changed. Run \`skillwharf update ${unverifiable.join(" ")}\` to pin it, or re-run sync with --allow-unpinned to install it unchecked.`,
       );
+    }
+  }
+
+  // Every lock entry that will be fetched must name the manifest's own source (same
+  // repository, same URL) before any git call is made for any skill. A pin that is
+  // merely unusable (an abbreviated sha) is reported with its skill in phase 1.
+  for (const [name, spec] of Object.entries(m.skills)) {
+    const entry = lock.skills[name];
+    if (!entry || isDir(storePath(ctx, name))) continue;
+    try {
+      lockedSource(ctx, m, name, spec, entry, opts);
+    } catch (e) {
+      if (!(e instanceof UnusablePin)) throw e;
     }
   }
 
@@ -506,33 +702,61 @@ export function syncSkills(ctx: Context, opts: SyncOptions = {}): SyncReport {
       let pinnedIntegrity: string | undefined;
       if (entry) {
         try {
-          fetched = fetchSource(lockedSource(ctx, m, name, spec, entry, opts));
+          fetched = fetchSource(lockedSource(ctx, m, name, spec, entry, opts), {
+            timeoutMs: opts.gitTimeoutMs,
+            deadline: opts.gitDeadlineAt,
+            fallback: fallbackFor(source),
+          });
           pinnedIntegrity = hasIntegrity(entry) ? entry.integrity : undefined;
         } catch (e) {
-          const pinProblem = e instanceof UnusablePin || /^git fetch failed/.test((e as Error).message);
-          if (!pinProblem) throw e;
+          // The pin itself is the problem: an abbreviated sha, a commit the host
+          // will not serve (and the recorded ref is no longer at it), a ref that
+          // is gone. An unreachable repository or a timeout is not a pin problem.
+          const pinProblem =
+            e instanceof UnusablePin || e instanceof PinUnavailable || (e instanceof GitError && (e.kind === "object" || e.kind === "ref"));
+          if (!pinProblem) throw explainFetchError(e, name);
           if (!opts.allowUnpinned) {
             throw new Error(
               `Cannot install the pinned commit for "${name}": ${(e as Error).message} ` +
                 `Nothing was installed and the lockfile was not changed. Run \`skillwharf update ${name}\` to re-pin, or re-run sync with --allow-unpinned to install the manifest source as it is now.`,
             );
           }
-          fetched = fetchSource(source);
+          fetched = fetchFor(source, opts, name);
         }
       } else {
-        fetched = fetchSource(source);
+        fetched = fetchFor(source, opts, name);
       }
       try {
-        const dirs = discoverSkills(fetched.dir);
+        const dirs = discoverSkills(fetched.dir, { root: fetched.root });
         if (dirs.length !== 1) throw new Error(`Expected exactly one skill at ${spec.source}, found ${dirs.length}`);
         stagingRoot ??= fs.mkdtempSync(path.join(os.tmpdir(), "skillwharf-stage-"));
-        const dir = path.join(stagingRoot, name);
-        installToStore(dirs[0], dir, opts.limits);
-        const integrity = hashDir(dir);
+        let dir = path.join(stagingRoot, name);
+        stageSkill(dirs[0], dir, { root: fetched.root, limits: opts.limits });
+        let integrity = hashDir(dir);
+        if (pinnedIntegrity !== undefined && integrity !== pinnedIntegrity && fetched.root) {
+          // A lockfile written by 0.1.x hashed the folder with every link left
+          // out. The pin decides: if that older rule reproduces it exactly, that
+          // is what was pinned, and it is the stricter of the two rules.
+          const old = path.join(stagingRoot, `${name}.0.1`);
+          try {
+            stageSkill(dirs[0], old, { root: fetched.root, limits: opts.limits, legacy: true });
+            if (hashDir(old) === pinnedIntegrity) {
+              dir = old;
+              integrity = pinnedIntegrity;
+            }
+          } catch {
+            /* the old rule does not fit either: report the mismatch below */
+          }
+        }
         if (pinnedIntegrity !== undefined && integrity !== pinnedIntegrity) {
           throw new Error(
             `integrity mismatch for "${name}": the pinned content hashes to ${integrity}, the lockfile expects ${pinnedIntegrity}. ` +
-              `Nothing was installed and the lockfile was not changed.`,
+              `Nothing was installed and the lockfile was not changed.` +
+              // skillwharf 0.1.x wrote no `links` record; files are now checked out as committed
+              // (no LFS, eol, ident or autocrlf conversion), which can change what a 0.1.x lock hashed.
+              (entry && entry.links === undefined
+                ? ` If this lock was written by skillwharf 0.1.x, run \`skillwharf update ${name}\` to re-pin the committed bytes.`
+                : ""),
           );
         }
         staged.set(name, { dir, resolved: fetched.resolved, integrity, version: readSkill(dir).version });
@@ -554,7 +778,7 @@ export function syncSkills(ctx: Context, opts: SyncOptions = {}): SyncReport {
         integrity: s.integrity,
         version: s.version,
         installedAt: new Date().toISOString(),
-        ...(lock.skills[name]?.links ? { links: lock.skills[name].links } : {}),
+        links: lock.skills[name]?.links ?? {},
       };
       report.fetched.push(name);
     }
@@ -580,14 +804,39 @@ export function syncSkills(ctx: Context, opts: SyncOptions = {}): SyncReport {
 }
 
 /** The overlap check alone, for a source read back from the manifest (a local path only). */
-function assertStoredSourceClear(ctx: Context, m: Manifest, name: string, raw: string): void {
+function assertStoredSourceClear(ctx: Context, m: Manifest, name: string, raw: string, opts: { allowOutsidePaths?: boolean } = {}): void {
   let p: ParsedSource;
   try {
     p = parseSource(raw, ctx.root);
   } catch {
     return; // a source that does not parse is refused where it is used
   }
-  if (p.kind === "path") assertSourceClear(ctx, m, name, raw, p.path);
+  if (p.kind === "path" && storedPathMayBeResolved(ctx, raw, p.path, opts.allowOutsidePaths)) assertSourceClear(ctx, m, name, raw, p.path);
+}
+
+/**
+ * Whether the file system may be asked about a stored `path:` source at all. Share
+ * text (`//host/share`) is refused outright, on every platform and in every manifest;
+ * drive text (`C:\x`) is refused in a project unless `--allow-outside-paths` is given
+ * (see `pathTextRefusal`). In a project, a path that is not below the project, or whose
+ * links lead out of it, is not resolved: `sync` refuses it as outside the project
+ * (unless `--allow-outside-paths`), and nothing here may connect to a place a cloned
+ * repository's manifest chose.
+ */
+function storedPathMayBeResolved(ctx: Context, raw: string, abs: string, allowOutsidePaths = false): boolean {
+  const text = raw.trim().replace(/^path:/, "");
+  const refusal = pathTextRefusal(text, { global: ctx.global, allowOutsidePaths });
+  if (refusal) {
+    throw new Error(
+      `Source "${raw}" names a network share or a drive; skillwharf does not read local sources from those` +
+        (refusal === "drive" ? " in a project unless --allow-outside-paths is given" : "") +
+        `. Use a path below the project, or a git source.`,
+    );
+  }
+  if (ctx.global) return true;
+  if (!isInside(ctx.root, abs)) return false;
+  const r = resolveInsideDetailed(ctx.root, abs);
+  return !("fail" in r && r.fail === "outside");
 }
 
 /** A skill fetched and verified in phase 1 of `syncSkills`, waiting to be installed. */
@@ -605,20 +854,46 @@ export interface UpdateResult {
   changed: boolean;
 }
 
-export function updateSkills(ctx: Context, only?: string[], opts: SourceOptions = {}): UpdateResult[] {
+export interface UpdateOptions extends SourceOptions {
+  /**
+   * Replace the source of the one named skill with this one (a repository that
+   * moved) and re-pin it. Read like an `add` argument; the manifest and the
+   * lockfile change together, and only after the new source was fetched.
+   */
+  source?: string;
+}
+
+export function updateSkills(ctx: Context, only?: string[], options: UpdateOptions = {}): UpdateResult[] {
+  const opts = withDeadline(options);
   const m = requireManifest(ctx);
   const lock = loadLock(ctx);
   const names = only && only.length ? only : Object.keys(m.skills);
+  if (opts.source !== undefined && (only?.length ?? 0) !== 1) {
+    throw new Error("--source replaces the source of exactly one skill: name it, as in `skillwharf update <name> --source <new>`");
+  }
 
   // Phase 0: check every skill before touching anything: its place in the
   // manifest, its paths, its source, and that no agent folder holds something
   // skillwharf did not put there (update never replaces such a folder).
   const plan = names.map((name) => {
-    const spec = m.skills[name];
+    let spec = m.skills[name];
     if (!spec) throw new Error(`Skill "${name}" is not in the manifest`);
     const store = storePath(ctx, name);
     assertSafeInstall(ctx, m, name, store, agentsFor(m, name));
-    const parsed = parseStoredSource(ctx, spec.source, opts, { m, name });
+    let parsed: ParsedSource;
+    if (opts.source !== undefined) {
+      // The new source is what the user just typed, so it is read like an `add`
+      // argument (relative to the working directory) and recorded like one.
+      parsed = parseSource(opts.source);
+      let recorded = parsed.raw;
+      if (parsed.kind === "path") {
+        assertSourceClear(ctx, m, name, opts.source, parsed.path);
+        recorded = pathSourceFor(ctx, parsed.path) ?? `path:${parsed.path}`;
+      }
+      spec = { ...spec, source: recorded };
+    } else {
+      parsed = parseStoredSource(ctx, spec.source, opts, { m, name });
+    }
     const groups = targetGroups(ctx, m, agentsFor(m, name), name);
     for (const g of groups) {
       if (linkStatus(ctx, m, g.agents[0], name, store, { copyRecorded: copyRecorded(lock, name, g) }) === "foreign") {
@@ -635,13 +910,13 @@ export function updateSkills(ctx: Context, only?: string[], opts: SourceOptions 
   let stagingRoot: string | undefined;
   try {
     for (const { name, spec, parsed } of plan) {
-      const fetched = fetchSource(parsed);
+      const fetched = fetchFor(parsed, opts, name);
       try {
-        const dirs = discoverSkills(fetched.dir);
+        const dirs = discoverSkills(fetched.dir, { root: fetched.root });
         if (dirs.length !== 1) throw new Error(`Expected exactly one skill at ${spec.source}, found ${dirs.length}`);
         stagingRoot ??= fs.mkdtempSync(path.join(os.tmpdir(), "skillwharf-stage-"));
         const dir = path.join(stagingRoot, name);
-        installToStore(dirs[0], dir, opts.limits);
+        stageSkill(dirs[0], dir, { root: fetched.root, limits: opts.limits });
         staged.set(name, { dir, resolved: fetched.resolved, integrity: hashDir(dir), version: readSkill(dir).version });
       } finally {
         fetched.cleanup();
@@ -656,13 +931,17 @@ export function updateSkills(ctx: Context, only?: string[], opts: SourceOptions 
       const s = staged.get(name) as StagedSkill;
       const before = lock.skills[name]?.integrity;
       copyDir(s.dir, store);
+      if (opts.source !== undefined) {
+        m.skills[name] = { ...m.skills[name], source: spec.source };
+        saveManifest(ctx, m);
+      }
       lock.skills[name] = {
         source: spec.source,
         resolved: s.resolved,
         integrity: s.integrity,
         version: s.version,
         installedAt: new Date().toISOString(),
-        ...(lock.skills[name]?.links ? { links: lock.skills[name].links } : {}),
+        links: lock.skills[name]?.links ?? {},
       };
       saveLock(ctx, lock);
       for (const g of groups) linkGroup(ctx, m, lock, g, name, store, true);
@@ -687,7 +966,27 @@ export interface DoctorIssue {
   fix?: string;
 }
 
-export function doctor(ctx: Context): DoctorIssue[] {
+/**
+ * What `list` may say about a skill's store folder. The path is examined with lstat only
+ * first: a store reached through a link (a committed `.skillwharf`, say, pointing at a share)
+ * is `foreign` and nothing is read through it.
+ */
+export function inspectStore(ctx: Context, name: string): { state: "installed" | "missing" | "foreign"; meta?: SkillMeta } {
+  const store = storePath(ctx, name);
+  try {
+    assertSafeTarget(ctx, store);
+  } catch {
+    return { state: "foreign" };
+  }
+  if (!isDir(store)) return { state: "missing" };
+  try {
+    return { state: "installed", meta: readSkill(store) };
+  } catch {
+    return { state: "installed" };
+  }
+}
+
+export function doctor(ctx: Context, options: { allowOutsidePaths?: boolean } = {}): DoctorIssue[] {
   const m = requireManifest(ctx);
   const lock = loadLock(ctx);
   const issues: DoctorIssue[] = [];
@@ -701,7 +1000,7 @@ export function doctor(ctx: Context): DoctorIssue[] {
       continue;
     }
     try {
-      assertStoredSourceClear(ctx, m, name, m.skills[name].source);
+      assertStoredSourceClear(ctx, m, name, m.skills[name].source, options);
     } catch (e) {
       issues.push({ level: "error", skill: name, message: (e as Error).message });
       continue;
@@ -720,7 +1019,8 @@ export function doctor(ctx: Context): DoctorIssue[] {
     const entry = lock.skills[name];
     if (entry) {
       try {
-        lockedSource(ctx, m, name, m.skills[name], entry, { allowOutsidePaths: true });
+        // An outside path is reported, not resolved, unless the user opted in (as for sync and update).
+        lockedSource(ctx, m, name, m.skills[name], entry, { allowOutsidePaths: options.allowOutsidePaths });
       } catch (e) {
         issues.push({ level: "error", skill: name, message: (e as Error).message, fix: "skillwharf update " + name });
       }

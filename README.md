@@ -58,12 +58,13 @@ Claude Code's local session logs to show which skills actually fire.
 - **A small team.** Commit `skillwharf.json` and `skillwharf.lock.json` next to your code.
   Everyone who clones the repository runs `skillwharf sync` and gets the same skills at the
   same commits, and `skillwharf doctor` tells each person when their copy has drifted.
-- **A company with several teams.** Keep shared skills in repositories of your own. Private
-  ones work too, as long as each person's `git` can already clone them (for example after
-  `gh auth setup-git`). Each team's projects pin the skills they use, so one team can move
-  to a new version with `skillwharf update` while another stays where it is. To make skills
-  easy to find, keep an `index.json` registry (`skillwharf publish` adds entries to it) and
-  point projects at it with `skillwharf init --registry <url>`.
+- **A company with several teams.** Keep shared skills in repositories of your own, on
+  GitHub, GitLab, Bitbucket or any server you run. Private ones work too, as long as each
+  person's `git` can already clone them (for example after `gh auth setup-git`, or with an
+  ssh key). Each team's projects pin the skills they use, so one team can move to a new
+  version with `skillwharf update` while another stays where it is. To make skills easy to
+  find, keep a registry of your own (see [Your own registry](#your-own-registry)) next to
+  the public one, and share it by committing `skillwharf.json`.
 
 ## Install
 
@@ -85,19 +86,23 @@ skillwharf sync                                             # after a fresh git 
 
 | Command | Does |
 | --- | --- |
-| `skillwharf init [-a claude,agents,codex,cursor]` | Write `skillwharf.json`; the default agents are `claude,agents` |
-| `skillwharf add <source> [--name n] [--agents a,b] [--all] [--force] [--max-skill-size mb] [--max-skill-files n]` | Install from `github:owner/repo[/path][@ref]`, a GitHub URL or a local path |
+| `skillwharf init [-a claude,agents,codex,cursor] [--registry [name=]location]...` | Write `skillwharf.json`; the default agents are `claude,agents`; `--registry` may be repeated |
+| `skillwharf add <source or name> [--name n] [--agents a,b] [--all] [--from registry] [--force] [--max-skill-size mb] [--max-skill-files n]` | Install from any [source](#sources), or by name from the registries (`--from` picks the registry when two list the name) |
 | `skillwharf remove <name>` | Unlink from agents and delete from the store |
 | `skillwharf sync [--force] [--allow-unpinned] [--allow-outside-paths]` | Make the store and agent folders match the manifest — run after `git clone` |
-| `skillwharf update [names...] [--allow-outside-paths]` | Re-fetch from source, refresh the lockfile, report what changed |
+| `skillwharf update [names...] [--source <new>] [--allow-outside-paths]` | Re-fetch from source, refresh the lockfile, report what changed; `--source` points one skill at a repository that moved |
 | `skillwharf list` | Skills, versions, agents, uses in the last 90 days |
 | `skillwharf usage [--days 30] [--all-projects]` | Which skills actually fire, from Claude Code session logs |
-| `skillwharf doctor [--stale-days 60]` | Broken links, local drift, skills nobody used |
-| `skillwharf search <query> [--registry url]` | Search a registry `index.json` |
-| `skillwharf publish <path> --registry <dir> --source <src>` | Add a skill to a registry checkout |
+| `skillwharf doctor [--stale-days 60] [--allow-outside-paths]` | Broken links, local drift, skills nobody used |
+| `skillwharf search <query> [--registry location]` | Search every registry the manifest lists; each row names its registry |
+| `skillwharf registry add <name> <location>` | Load the registry once (a typo fails here) and add it to the manifest |
+| `skillwharf registry remove <name>` | Remove a registry from the manifest |
+| `skillwharf registry list` | Each registry with its location, how many skills it lists, and whether it loaded |
+| `skillwharf registry help` | The walk-through for running your own registry (offline) |
+| `skillwharf publish <path> --registry <dir> --source <src>` | Add a skill to a registry checkout; `--source` may be on any git host |
 | `skillwharf where <name>` | Print every path a skill is installed at |
 
-Add `-g` to any command to manage `~/.skillwharf` and the agents' global folders instead of a project.
+Add `-g` to any command to manage `~/.skillwharf` and the agents' global folders instead of a project. `--git-timeout <seconds>` (default 120) kills a git call that runs longer, and names the repository; `--git-deadline <seconds>` (default four times the timeout) limits all the git calls of one `add`, `sync` or `update` together. `--allow-askpass` lets your askpass programs (`GIT_ASKPASS`, `core.askPass`, `SSH_ASKPASS`) prompt for credentials during that command; by default none can (see Sources). `--quiet` silences the one-time hint described under [Your own registry](#your-own-registry). `--json` prints machine-readable output for `list`, `usage`, `search` and `registry list`.
 
 ## Files you commit
 
@@ -130,7 +135,7 @@ Add `-g` to any command to manage `~/.skillwharf` and the agents' global folders
 }
 ```
 
-A `path:` source in a project manifest is relative to the project root and must stay inside the project; `sync` and `update` refuse one outside it unless you pass `--allow-outside-paths`. When you `add` a folder that is inside the project, skillwharf records it relative (`path:./skills/x`), so a teammate's checkout at another location resolves the same folder; a folder outside the project is recorded as an absolute path, and `sync` and `update` refuse it on any machine, yours included, unless you pass `--allow-outside-paths`. A `path:` source may not be, contain or lie inside the skill store or the skill's own agent folders (so `path:./.claude/skills/foo` is refused: move that folder to, say, `skills/foo` first). The global manifest (`-g`, in `~/.skillwharf`) is yours, and its `path:` sources are not confined to a project.
+A `path:` source in a project manifest is relative to the project root and must stay inside the project; `sync` and `update` refuse one outside it unless you pass `--allow-outside-paths`. When you `add` a folder that is inside the project, skillwharf records it relative (`path:./skills/x`), so a teammate's checkout at another location resolves the same folder; a folder outside the project is recorded as an absolute path, and `sync` and `update` refuse it on any machine, yours included, unless you pass `--allow-outside-paths` (`remove` and `doctor` take it too; without it `doctor` reports such a source and does not open it). A path written as a share (`//host/share`, share text) is never accepted; drive-letter text (`C:\x`, which is how an outside folder is recorded on Windows) is refused in a project's manifest unless you pass the option, and accepted in the global manifest. A `path:` source may not be, contain or lie inside the skill store or the skill's own agent folders (so `path:./.claude/skills/foo` is refused: move that folder to, say, `skills/foo` first). The global manifest (`-g`, in `~/.skillwharf`) is yours, and its `path:` sources are not confined to a project.
 
 `add` refuses to replace a skill that is already managed from a different source (for example a pack whose `SKILL.md` says `name: pdf`); pass `--force` to replace it. `update` fetches and checks every skill before it replaces any store folder, like `sync`.
 
@@ -165,7 +170,7 @@ On Windows without Developer Mode, symlinks fall back to copies. skillwharf reco
 
 ## Registries
 
-A registry is any git repo (or URL) serving an `index.json`:
+A registry is an `index.json` that `skillwharf search` reads and `skillwharf add <name>` looks names up in:
 
 ```json
 { "version": 1, "skills": [
@@ -173,17 +178,61 @@ A registry is any git repo (or URL) serving an `index.json`:
 ]}
 ```
 
-Point a project at one with `skillwharf init --registry <url>` or `"registry"` in the manifest. The default registry (used when no `--registry` is given and the manifest sets none) is [mujieha/skillwharf-registry](https://github.com/mujieha/skillwharf-registry); if it cannot be reached, `search` says so plainly rather than failing silently. Publish with `skillwharf publish ./my-skill --registry ../registry-checkout --source github:me/skills/my-skill`, then commit and push the checkout.
+A manifest lists the registries it uses, in order:
+
+```json
+"registries": [
+  { "name": "default", "location": "default" },
+  { "name": "acme", "location": "git+https://git.acme.com/team/registry.git" }
+]
+```
+
+A `location` is `default` (the public registry, [mujieha/skillwharf-registry](https://github.com/mujieha/skillwharf-registry)), an https URL of an `index.json`, a git source whose repository root holds `index.json` (add `//folder` for a subfolder), or a local path to an `index.json` or a folder with one (relative paths are read from the folder of the manifest that lists them). A manifest that lists nothing uses the public registry; an explicit empty list (`"registries": []`) means none. The 0.1.x `"registry": "<url>"` field still works and is read as a registry named `registry`. The global manifest (`-g`) may list registries too: its list comes first and the project's follows. A project entry with the same name and the same location as a global one is the same registry; with another location your global registry keeps the name and the project's is shown as `project:<name>` (select it with `--from project:<name>`), and skillwharf says so on stderr, so a cloned repository's manifest cannot take over a name you chose. A registry in a git repository is only an index: its submodules are never opened, and one search has a single `--git-timeout` limit for all the registries it loads.
+
+Every index goes through the same checks: entry names are validated, descriptions are cut to 300 characters, only the known fields are kept, and an entry whose source is a local path, is not a git source, or fails the source rules is dropped. A registry that fails to load (a typo, a server that is down) is reported by name on stderr and the others still answer; `search` fails only when every registry failed.
+
+`search` shows each result with the registry it came from; the same skill name in two registries is two rows, ordered by score and then by the order of the list. `add <name>` (a plain skill name, no scheme and no slash) looks the name up in the registries and installs the source the entry gives; the manifest records that source, not the name. When two registries list the name, `add` refuses and shows both; choose with `--from <registry>`. If no registry lists it, the error says so and reminds you that a local folder is written `./<name>`. If a folder with that name exists in the working directory, `add <name>` refuses as ambiguous (0.1.x read it as the folder): write `./<name>` for the folder or `--from <registry>` for the registry.
+
+## Your own registry
+
+Skills do not have to be public, and the registry that finds them does not either. To run one for a team:
+
+1. **Make a git repository** on GitHub, GitLab, Bitbucket or your own server, with an `index.json` at its root (the shape is above).
+2. **Add skills to it.** In a checkout of that repository, run `skillwharf publish ./release-notes --registry . --source git+https://git.acme.com/team/skills.git//release-notes`, then commit and push. `--source` is where the skill is installed from, on any git host.
+3. **Use it:** `skillwharf registry add acme git+https://git.acme.com/team/registry.git`. skillwharf loads the index once, so a mistyped location fails right away, and then writes it to `skillwharf.json`.
+4. **Share it.** Commit `skillwharf.json`; a teammate's `search` and `add <name>` use the same registry, fetched with their own git credentials.
+5. **Keep or drop the public registry.** When the manifest listed nothing, `registry add` writes `default` first and yours after it, so the public registry stays; `skillwharf registry remove default` drops it.
+
+`skillwharf registry list` shows which registries loaded and how many skills each lists. To use one for every project on your machine, add it to the global manifest (`skillwharf -g init`, then `skillwharf -g registry add ...`).
+
+The first time you run `skillwharf init`, and the first time a `search` uses the public registry alone, skillwharf prints a short hint on stderr that skills come from any git host and that registries are yours to own. It appears once per machine (the marker is `~/.skillwharf/hints.json`; there is no network involved), never with `--json`, and not at all with `--quiet`. `skillwharf registry help` prints the same walk-through offline, and `skillwharf doctor` mentions it in one information line (never a warning) while a project uses the public registry alone. The package has no install-time script.
 
 ## Sources
 
-| Form | Example |
+A skill is installed from a git repository on any host, over https or ssh:
+
+| Spelling | Example |
 | --- | --- |
-| GitHub shorthand | `github:owner/repo/sub/dir@main` |
-| GitHub URL | `https://github.com/owner/repo/tree/main/sub/dir` |
+| GitHub | `github:anthropics/skills/skills/pdf@v1` (the repository is the first two parts; `//` before the folder is optional) |
+| GitLab | `gitlab:acme/platform/skills//release-notes@main` (groups nest, so `//` is required before a folder) |
+| Bitbucket | `bitbucket:acme/skills//pdf` (the repository is the first two parts; `//` is optional) |
+| Any server | `git+https://git.acme.com/team/skills.git//pdf` or `git+ssh://git@git.acme.com/team/skills.git//pdf` (`.git` ends the repository, `//` starts the folder; a port may follow the host) |
+| Web URLs | GitHub `https://github.com/o/r/tree/main/dir`, GitLab `https://gitlab.com/g/r/-/tree/main/dir`, Bitbucket `https://bitbucket.org/o/r/src/main/dir`, converted to the shorthand |
 | Local path | `./skills/foo`, `../shared/foo`, `path:/abs/foo` |
 
-GitHub sources are fetched with `git clone --depth 1`, so private repos work if `git` can already reach them. Each folder name in a sub-path may use only letters, digits, `.`, `_` and `-`, and a symlink anywhere on the sub-path is refused. With `add --all`, a folder whose name cannot be written as a valid sub-path (for example `my skill` or `x@y`) is skipped and reported, and never recorded. A skill folder with more than 2,000 files and folders or more than 50 MB is refused; `--max-skill-files` and `--max-skill-size` (megabytes) raise the cap on `add`, `sync` and `update`.
+`@ref` goes last and is a branch, a tag or a commit. The lockfile records the canonical spelling (the shorthand when there is one) with the full 40-character commit; `github:` sources and 0.1.x lockfiles are unchanged.
+
+**Credentials come from git, never from skillwharf.** Use your git credential helper for https and your ssh agent or ssh config for ssh. A URL that contains a user name or password is refused (only the user `git` may be written in an ssh URL), and so is any scheme other than https and ssh (`git://`, `file:`, `ext::`, and a plain `http://` URL; an `http://` web URL of GitHub, GitLab or Bitbucket is converted to https). A commit pin is the full 40-character sha. Any other all-hex ref (7 to 39 or 41 to 64 characters) is refused at parse time, because git reads it as a name that a repository's owner can create; a tag or branch that really is called that is written in full, `@refs/tags/<name>` or `@refs/heads/<name>` (a full ref is fetched exactly and is never taken for a commit). A 0.1.x manifest that uses such a ref makes `sync` and `update` name the skill and say what to write. skillwharf does not call any host's API, only `git`, with a fixed argument list and the URL after `--`. It runs with `GIT_ALLOW_PROTOCOL` limited to `https:ssh` (never widened if you set it yourself), with git's own prompts off and standard input closed, with your global hooks, LFS filters and HTTP redirects switched off for the fetch, and without the variables that select a repository (`GIT_DIR` and friends, so running inside a git hook is safe). **No askpass program can prompt**: `GIT_ASKPASS`, `core.askPass` and `SSH_ASKPASS` are switched off, so a host named by a repository, submodule or registry cannot raise a credential prompt in your editor's terminal. When a fetch fails for authentication, the error says so and names the fix: configure a git credential helper (`git config --global credential.helper ...`), or re-run with `--allow-askpass` to let your editor ask for that one command. git runs in its own session without your terminal: ssh cannot ask about a host key or passphrase, so trust a new ssh host once with ssh yourself (or use an ssh agent). Files are checked out as committed: a repository's `filter=` drivers, `$Id$` expansion and text and line-ending conversion are switched off (git's own `working-tree-encoding` conversion is not). A git call is killed after 120 seconds, together with the processes it started (`--git-timeout <seconds>`), and all the calls of one command share a limit of four times that (`--git-deadline <seconds>`); both accept at most 2,000,000 seconds. Ctrl-C at a terminal ends git and everything it started, removes the temporary clone and exits 130; a cancel signal that reaches only skillwharf's pid (an editor's or CI's button) ends it at once and git with it, leaving the temporary clone in your temp folder. On Windows git runs in a hidden console of its own, but Windows is not covered by CI (see Known limits). A stored `path:` source or a registry location that names a network share or a drive (`//host/share`, `\\host\share`, `C:/x`) is refused on every platform, and a project's links and agent folders are followed by hand inside the project only, so nothing a cloned repository names is opened before it is known to stay inside. Your git configuration, credential helpers, ssh configuration and URL rewrites are otherwise honoured and are yours to manage.
+
+Each folder name in a sub-path and in a repository path may use only letters, digits, `.`, `_` and `-`, none may end in `.`, and `.git` may only end the repository. A symlink anywhere on the sub-path is refused. A skill folder with more than 2,000 files and folders or more than 50 MB is refused; `--max-skill-files` and `--max-skill-size` (megabytes) raise the cap on `add`, `sync` and `update`.
+
+**Links inside a fetched repository.** A symlink that points to a file or folder inside the same repository is copied as that file or folder; a link that leaves the repository, points into `.git`, or is broken is dropped and reported by `add`. A folder link that leads back into a folder being copied is a cycle and is refused. The size cap counts the content after links are resolved. A `SKILL.md` that is a link to a file inside the repository counts as a skill (repositories that mirror one canonical `SKILL.md` into `.claude/` and `.agents/` rely on this); one that points outside does not. Local `path:` sources keep the stricter rule: every symlink is dropped.
+
+**Submodules, one level.** If the sub-path is a submodule, contains one or runs through one, skillwharf reads `.gitmodules` from the fetched commit, validates the submodule's URL with the rules above (a relative URL resolves against the parent's), fetches it at exactly the commit the parent records, and places its files where the submodule was. The lockfile records the parent. A submodule that has its own submodules is refused, naming the inner repository, and so is a source that touches more than 16 submodules.
+
+**Finding skills.** `add --all` on a git source searches up to six folders deep, dot-folders such as `.agents/skills` and `.claude/skills` included, and skips `.git` and `node_modules`; it gives up after ten times `--max-skill-files` entries (20,000 by default) and says how to narrow the search. A skill that the repository mirrors in several places is installed once, from the plainest path. A local folder keeps the narrower search (two levels, no dot-folders). With `add --all`, a folder whose name cannot be written as a valid sub-path (for example `my skill` or `x@y`) is skipped and reported, and never recorded.
+
+**Pins and moved repositories.** `sync` installs the commit the lockfile pins. If the host refuses to serve a commit by its hash, skillwharf clones the branch or tag the manifest names (the default branch if it names none) and accepts the result only if HEAD is exactly the pinned commit; otherwise it refuses (a manifest that names a commit itself has no fallback). A lockfile written by 0.1.x for a skill that contains links inside its repository still syncs: if the content with links resolved does not match the pinned hash, skillwharf tries the 0.1.x rule (links left out) and installs that if it matches. If a repository moved, skillwharf does not follow redirects: when it cannot be reached it says "repository not found or no access at <url>" and names the fix, `skillwharf update <name> --source <new>`, which points one skill at its new home and re-pins it.
 
 ## Development
 
@@ -200,9 +249,19 @@ MIT
 
 - Usage tracking reads Claude Code's local logs only; Codex and Cursor do not expose comparable ones.
 - Windows without Developer Mode falls back to copying instead of symlinking; `doctor` flags the copies.
-- The default registry is a starter list; it is schema-checked, not reviewed.
-- A registry URL is fetched without credentials, so a company registry must be reachable over https without a login, or used from a local checkout (`--registry <path>`).
-- The size cap applies to the skill folder that is installed, not to the `git clone` that fetches it.
+- The default registry is a starter list; it is schema-checked, not reviewed. So is any registry you add: it is trusted to its schema, not reviewed.
+- An https registry URL is fetched without credentials. A registry that needs a login belongs in a git location (git fetches it with your credentials) or in a local checkout.
+- skillwharf runs `git` and honours your git configuration: credential helpers, ssh configuration (git runs without your terminal, so a first connection to an unknown ssh host fails instead of asking: trust it once with ssh) and URL rewrites are yours to manage. In an ssh URL only the user `git` may be written; any other user comes from your ssh configuration.
+- A repository that moved is not followed through redirects; use `skillwharf update <name> --source <new>`.
+- Submodules are followed one level only; a submodule that has submodules of its own is refused.
+- A git call that runs longer than 120 seconds (`--git-timeout`) is killed together with the processes it started, all the git calls of one `add`, `sync` or `update` share a limit of four times that (`--git-deadline`), and a search across several registries shares one `--git-timeout`. Ctrl-C typed at a terminal while a git call is running ends git and everything it started, removes the temporary clone and exits 130; skillwharf holds the signal only when stdin is a terminal, and only while a git call is running. With stdin redirected, or between git calls (staging, copying, hashing), Ctrl-C takes its default action: skillwharf ends at once and the `skillwharf-*` folder in your temp folder is left behind. A SIGTERM (or any signal other than Ctrl-C) sent to skillwharf alone also ends git, through the supervisor's parent watch, and leaves the temporary clone behind.
+- Windows is implemented but not covered by CI (there is no Windows runner). git runs in a hidden console of its own, the process tree is ended with `%SystemRoot%\System32\taskkill.exe /T /F`, the supervisor probes whether its parent is alive, and symlinks fall back to copies as described above; none of that is tested on Windows. On Windows an unknown ssh host hangs until the timeout instead of failing at once (git has no console to ask on; trust the host with ssh once first; untested), and the supervisor's parent watch could miss its parent's end if the process id is reused within about 300 ms. A registry or `path:` source on a network share is refused everywhere; a drive-letter one only in a project's manifest, unless you pass `--allow-outside-paths` (see Sources).
+- A SIGTERM or an editor's cancel signal that reaches only skillwharf's pid ends it at once, and git with it, but leaves the temporary clone in your temp folder; Ctrl-C at a terminal cleans up only while a git call is running (and not when stdin is redirected).
+- A per-URL `http.<url>.followRedirects` in your own git configuration takes precedence over the general `http.followRedirects=false` skillwharf sets, so a redirect you allowed for one server is followed.
+- A lockfile written by 0.1.x may have pinned a hash of converted bytes: where an LFS smudge filter ran, the skill's `.gitattributes` asked for `eol=crlf`, `text`, `ident` or a `filter=`, or `core.autocrlf=true` was set. skillwharf now checks files out exactly as committed, so `sync` reports an integrity mismatch for such a skill and says to run `skillwharf update <name>`, which re-pins the committed bytes.
+- `add <name>` refuses while any configured registry failed to load (the skill might be listed there too); fix or remove that registry, or choose one with `--from <registry>`.
+- Filter drivers (`filter=...`), `$Id$` expansion and text and line-ending conversion are switched off at checkout, so files come out as committed. Encoding conversion (`working-tree-encoding`, done by git itself, not by a program) is not switched off.
+- The size cap applies to the skill folder that is installed, not to the `git clone` (or a submodule fetch) that fetches it.
 - There is no central approval or audit step; changes to skills are reviewed through the pull requests that change `skillwharf.json` and the lockfile. If you commit the store folder (`.skillwharf/skills`), a change to it is not in those files: `sync` does not re-check a store folder that is already there, and only `skillwharf doctor` compares it with the lockfile.
 - skillwharf looks for `skillwharf.json` upward from the working directory, stops at your home directory (it never finds a manifest there) and does not climb into a folder you do not own. If none is found, the working directory is the project root, so run skillwharf inside the project: with the working directory at `~`, `~` is the root and its store coincides with the global store. A project that lives directly in your home directory is not found from below it.
 - skillwharf does not review a skill's content — read a `SKILL.md` before installing it, as you would a shell script.

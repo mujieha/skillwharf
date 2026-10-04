@@ -2,8 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { assertNoSymlinks, exists, readJson, resolveLink, writeJson } from "./fs.js";
-import type { AgentId, Context, LockEntry, Lockfile, Manifest } from "./types.js";
-import { assertSkillName, hasTerminalUnsafe } from "./validate.js";
+import type { AgentId, Context, LockEntry, Lockfile, Manifest, RegistrySpec } from "./types.js";
+import { assertSkillName, hasTerminalUnsafe, sanitizeForTerminal } from "./validate.js";
 
 const KNOWN_AGENTS = new Set(["claude", "codex", "agents", "cursor"]);
 /** Directory names an agentPaths override may never use (compared lowercase, after Unicode folding). */
@@ -106,6 +106,7 @@ export function validateManifest(m: Manifest, file: string): Manifest {
     if (!spec || typeof spec.source !== "string" || !spec.source.trim()) throw bad(`skill "${name}" needs a "source"`);
     for (const a of spec.agents ?? []) if (!KNOWN_AGENTS.has(a)) throw bad(`skill "${name}": unknown agent "${String(a)}"`);
   }
+  validateRegistries(m, bad);
   for (const [agent, o] of Object.entries(m.agentPaths ?? {})) {
     if (!KNOWN_AGENTS.has(agent)) throw bad(`agentPaths: unknown agent "${agent}"`);
     for (const p of [o?.projectPath, o?.globalPath]) {
@@ -132,6 +133,58 @@ export function validateManifest(m: Manifest, file: string): Manifest {
     }
   }
   return m;
+}
+
+const REGISTRY_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
+const MAX_LOCATION_CHARS = 1000;
+
+/** The shape of `registry` and `registries`; what a location means is decided when it is loaded. */
+function validateRegistries(m: Manifest, bad: (msg: string) => Error): void {
+  if (m.registry !== undefined && typeof m.registry !== "string") throw bad(`"registry" must be a string`);
+  if (m.registries === undefined) return;
+  if (!Array.isArray(m.registries)) throw bad(`"registries" must be an array`);
+  const seen = new Set<string>();
+  m.registries.forEach((r, i) => {
+    if (!r || typeof r !== "object" || Array.isArray(r)) throw bad(`registries[${i}] must be an object with a "name" and a "location"`);
+    if (typeof r.name !== "string" || !REGISTRY_NAME_RE.test(r.name)) {
+      throw bad(`registries[${i}]: invalid registry name ${JSON.stringify(sanitizeForTerminal(String(r.name)))}: use lowercase letters, digits and dashes (max 64 chars)`);
+    }
+    if (typeof r.location !== "string" || r.location === "" || r.location.length > MAX_LOCATION_CHARS) {
+      throw bad(`registries[${i}]: "location" must be a non-empty string of at most ${MAX_LOCATION_CHARS} characters`);
+    }
+    if (hasTerminalUnsafe(r.location)) {
+      throw bad(`registries[${i}]: "location" may not contain control or bidirectional-override characters`);
+    }
+    // `default` is what the hint, `doctor` and `registry remove default` call the public
+    // registry; a manifest from a cloned repository must not make it mean another one.
+    if (r.name === "default" && r.location !== "default") {
+      throw bad(`registries[${i}]: the name "default" is the public registry; it cannot point at another location (choose another name)`);
+    }
+    if (seen.has(r.name)) throw bad(`registry "${r.name}" is listed more than once`);
+    seen.add(r.name);
+  });
+  if (typeof m.registry === "string" && seen.has(LEGACY_REGISTRY_NAME)) {
+    throw bad(`registry "${LEGACY_REGISTRY_NAME}" is listed more than once (the old "registry" field is named "${LEGACY_REGISTRY_NAME}")`);
+  }
+}
+
+const LEGACY_REGISTRY_NAME = "registry";
+
+/** True when the manifest lists registries at all (in either field); otherwise the public registry is implied. */
+export function listsRegistries(m: Manifest | undefined): boolean {
+  return m !== undefined && (m.registries !== undefined || typeof m.registry === "string");
+}
+
+/**
+ * The registries a manifest names, in order: the `registries` list, then the old
+ * `registry` field as a registry called "registry". A manifest that lists none
+ * means the public registry; an explicit empty list means none at all.
+ */
+export function registriesOf(m: Manifest): RegistrySpec[] {
+  if (!listsRegistries(m)) return [{ name: "default", location: "default" }];
+  const list = [...(m.registries ?? [])];
+  if (typeof m.registry === "string") list.push({ name: LEGACY_REGISTRY_NAME, location: m.registry });
+  return list;
 }
 
 /**
@@ -181,7 +234,8 @@ export function loadLock(ctx: Context): Lockfile {
         raw && typeof raw === "object"
           ? Object.entries(raw).filter(([a, v]) => KNOWN_AGENTS.has(a) && v === "copy")
           : [];
-      if (kept.length > 0) entry.links = Object.fromEntries(kept) as LockEntry["links"];
+      // An empty record is kept: it says a 0.2.0 skillwharf wrote the entry and every agent got a link.
+      if (raw && typeof raw === "object" && !Array.isArray(raw)) entry.links = Object.fromEntries(kept) as LockEntry["links"];
       else delete entry.links;
     }
   }

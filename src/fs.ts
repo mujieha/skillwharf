@@ -127,21 +127,246 @@ export function assertWithinLimits(dir: string, limits: SizeLimits = {}): void {
       if (e.isDirectory()) stack.push(p);
       else if (!e.isFile()) continue;
       entries += 1;
-      if (entries > maxFiles) {
-        throw new Error(
-          `${path.basename(dir)}: more than ${maxFiles} files and folders; refusing to install it. Raise the cap with --max-skill-files <n> if you trust it.`,
-        );
-      }
+      if (entries > maxFiles) throw tooManyEntries(dir, maxFiles);
       if (e.isFile()) {
         bytes += fs.lstatSync(p).size;
-        if (bytes > maxBytes) {
-          throw new Error(
-            `${path.basename(dir)}: more than ${formatBytes(maxBytes)} of files; refusing to install it. Raise the cap with --max-skill-size <mb> if you trust it.`,
-          );
-        }
+        if (bytes > maxBytes) throw tooManyBytes(dir, maxBytes);
       }
     }
   }
+}
+
+function tooManyEntries(dir: string, maxFiles: number): Error {
+  return new Error(
+    `${path.basename(dir)}: more than ${maxFiles} files and folders; refusing to install it. Raise the cap with --max-skill-files <n> if you trust it.`,
+  );
+}
+
+function tooManyBytes(dir: string, maxBytes: number): Error {
+  return new Error(
+    `${path.basename(dir)}: more than ${formatBytes(maxBytes)} of files; refusing to install it. Raise the cap with --max-skill-size <mb> if you trust it.`,
+  );
+}
+
+/**
+ * True for link text that is an absolute path, a UNC path (`//host/share`,
+ * `\\host\share`) or carries a drive letter. Such text names a place of the
+ * link author's choosing, possibly another machine; asking the file system
+ * about it can make this machine open a network share.
+ */
+export function isAbsoluteLinkText(text: string): boolean {
+  return path.isAbsolute(text) || /^[\\/]/.test(text) || /^[A-Za-z]:/.test(text);
+}
+
+/** Longest chain of links `resolveInside` follows. */
+const MAX_LINK_HOPS = 32;
+
+/**
+ * Where `p` (a path below `root`) really is, with every symlink on the way
+ * followed by hand: each hop's link text is read and refused outright if it is
+ * absolute or UNC; otherwise it is resolved as text against the folder the link
+ * is in, and the walk goes on from there. A path that would leave `root` (a
+ * `..` past it), a loop, a chain over 32 hops or a missing entry gives
+ * undefined. The file system is only ever asked about paths inside `root`
+ * (`lstat`, `readlink`), and `realpath` is called once, on the result, when the
+ * whole chain is known to stay inside.
+ */
+export function resolveInside(root: string, p: string): string | undefined {
+  const r = resolveInsideDetailed(root, p);
+  return "path" in r ? r.path : undefined;
+}
+
+/**
+ * Like `resolveInside`, but says why it failed: `outside` when the path or a link
+ * on the way leaves `root` (absolute or UNC text, a `..` past it, a path that is
+ * not below it) or cannot be followed safely (a chain over 32 hops, a loop, an entry
+ * that cannot be examined), `broken` only when it stays inside and something is simply
+ * missing (the entry, or one above it, does not exist). The file system is asked about
+ * the same paths as in `resolveInside`: only ones inside `root`.
+ */
+export function resolveInsideDetailed(root: string, p: string): { path: string } | { fail: "outside" | "broken" } {
+  const realBase = fs.realpathSync.native(root);
+  // `p` is written either with the real path of `root` or with `root` as it was given.
+  const abs = path.resolve(p);
+  let rel = path.relative(realBase, abs);
+  if (escapes(rel)) rel = path.relative(path.resolve(root), abs);
+  if (escapes(rel)) return { fail: "outside" };
+  const queue = rel.split(path.sep).filter(Boolean);
+  const done: string[] = [];
+  let hops = 0;
+  // `broken` is only ever "there is nothing at this place": the entry (or one above it) is simply
+  // missing, so there is nothing for the file system to follow. Everything else that stops the walk
+  // (too many hops, a loop, a link that cannot be read, an entry that cannot be examined) is
+  // `outside`: such a path is refused, never handed on to a call that would follow it.
+  const missing = (e: unknown) => ["ENOENT", "ENOTDIR"].includes((e as NodeJS.ErrnoException).code ?? "");
+  while (queue.length > 0) {
+    const part = queue.shift() as string;
+    if (part === ".") continue;
+    if (part === "..") {
+      if (done.length === 0) return { fail: "outside" };
+      done.pop();
+      continue;
+    }
+    const next = path.join(realBase, ...done, part);
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(next);
+    } catch (e) {
+      return { fail: missing(e) ? "broken" : "outside" };
+    }
+    if (st.isSymbolicLink()) {
+      if (++hops > MAX_LINK_HOPS) return { fail: "outside" };
+      let text: string;
+      try {
+        text = fs.readlinkSync(next);
+      } catch (e) {
+        return { fail: missing(e) ? "broken" : "outside" };
+      }
+      if (isAbsoluteLinkText(text)) return { fail: "outside" };
+      // Backslash separates components only where it is a separator (Windows); elsewhere it is part of a name.
+      queue.unshift(...text.split(process.platform === "win32" ? /[\\/]+/ : /\/+/).filter(Boolean));
+      continue;
+    }
+    done.push(part);
+  }
+  try {
+    return { path: fs.realpathSync.native(path.join(realBase, ...done)) };
+  } catch (e) {
+    return { fail: missing(e) ? "broken" : "outside" };
+  }
+}
+
+/** True for path text that names a network share or a drive (`//host/share`, `\\host\share`, `C:\x`). */
+export function isNetworkPathText(text: string): boolean {
+  return isShareText(text) || isDriveText(text);
+}
+
+/** `//host/share` or `\\host\share`: text that makes Windows connect to another machine. */
+export function isShareText(text: string): boolean {
+  return /^[\\/]{2}/.test(text);
+}
+
+/** `C:\x`, `c:/x`, `D:rel`: text that names a drive. */
+export function isDriveText(text: string): boolean {
+  return /^[A-Za-z]:/.test(text);
+}
+
+/**
+ * Whether path text that skillwharf is about to resolve is refused outright. Share text is
+ * refused everywhere, so no manifest, global or project, can make this machine connect to
+ * another one. Drive text is refused only for a project's manifest (which a cloned repository
+ * wrote) without `--allow-outside-paths`: on Windows every absolute path starts with a drive
+ * letter, and the user's own global manifest and an explicit opt-in must keep working.
+ */
+export function pathTextRefusal(text: string, where: { global: boolean; allowOutsidePaths?: boolean }): "share" | "drive" | undefined {
+  if (isShareText(text)) return "share";
+  if (isDriveText(text) && !where.global && !where.allowOutsidePaths) return "drive";
+  return undefined;
+}
+
+/** True for a path component that is `.git` in any letter case (and the look-alike forms a file system folds to it). */
+export function isGitName(name: string): boolean {
+  return name.normalize("NFKC").toLowerCase() === ".git";
+}
+
+/**
+ * True when `p` is, or lies below, a `.git` folder. Components are compared
+ * without regard to case: on a case-insensitive file system `.GIT` is the same
+ * folder as `.git`, and a real path can come back in either spelling.
+ */
+export function inGitDir(p: string): boolean {
+  return p.split(/[\\/]/).some(isGitName);
+}
+
+/**
+ * Copy a skill folder out of a fetched repository, following the links that
+ * stay inside it. A link whose real target lies inside `root` (the fetched
+ * repository) and outside every `.git` folder is copied as the file or folder
+ * it points to; any other link (outside, into `.git`, broken, or to a special
+ * file) is dropped and its path returned. A folder link that leads back into a
+ * folder being copied is a cycle and is refused. Every entry and byte of the
+ * resolved content counts against the size cap while it is copied, so links
+ * cannot multiply a folder past it, and nothing is left behind on failure.
+ * `src` itself is resolved the same way (it may be a link found by discovery).
+ */
+export function copyResolvingLinks(src: string, dest: string, opts: { root: string; limits?: SizeLimits }): { dropped: string[] } {
+  const maxFiles = opts.limits?.maxFiles ?? DEFAULT_MAX_FILES;
+  const maxBytes = opts.limits?.maxBytes ?? DEFAULT_MAX_BYTES;
+  const realRoot = fs.realpathSync.native(opts.root);
+  const realSrc = resolveInside(opts.root, src);
+  if (realSrc === undefined || !isInside(realRoot, realSrc) || inGitDir(path.relative(realRoot, realSrc))) {
+    throw new Error(`${path.basename(src)} resolves outside the fetched repository; refusing it.`);
+  }
+  if (pathsOverlap(realSrc, dest)) {
+    throw new Error(`Refusing to copy ${src} onto ${dest}: the two folders overlap.`);
+  }
+  fs.rmSync(dest, { recursive: true, force: true });
+  const dropped: string[] = [];
+  let entries = 0;
+  let bytes = 0;
+  const count = (size: number | undefined) => {
+    entries += 1;
+    if (entries > maxFiles) throw tooManyEntries(src, maxFiles);
+    if (size !== undefined) {
+      bytes += size;
+      if (bytes > maxBytes) throw tooManyBytes(src, maxBytes);
+    }
+  };
+
+  const copyFile = (from: string, to: string, st: fs.Stats) => {
+    count(st.size);
+    fs.copyFileSync(from, to);
+    fs.chmodSync(to, st.mode & 0o777);
+  };
+
+  // `chain` holds the real path of every folder on the way down to here: a link
+  // back to one of them would be followed forever.
+  const walk = (from: string, to: string, rel: string, chain: string[]) => {
+    fs.mkdirSync(to, { recursive: true });
+    for (const e of fs.readdirSync(from, { withFileTypes: true })) {
+      if (isGitName(e.name)) continue;
+      const childFrom = path.join(from, e.name);
+      const childTo = path.join(to, e.name);
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isSymbolicLink()) {
+        // Resolved by hand: a link to `//host/share` or `/etc` is dropped without the
+        // file system being asked about it (see resolveInside).
+        const target = resolveInside(opts.root, childFrom);
+        let st: fs.Stats;
+        try {
+          if (target === undefined) throw new Error("outside, absolute, looping or broken");
+          st = fs.statSync(target);
+        } catch {
+          dropped.push(childRel); // leaves the clone, or is broken
+          continue;
+        }
+        if (!isInside(realRoot, target) || inGitDir(path.relative(realRoot, target))) {
+          dropped.push(childRel);
+        } else if (st.isDirectory()) {
+          if (chain.includes(target)) throw new Error(`symlink cycle at ${childRel}: it points back into a folder that is being copied; refusing it.`);
+          count(undefined);
+          walk(target, childTo, childRel, [...chain, target]);
+        } else if (st.isFile()) {
+          copyFile(target, childTo, st);
+        } else {
+          dropped.push(childRel);
+        }
+      } else if (e.isDirectory()) {
+        count(undefined);
+        walk(childFrom, childTo, childRel, [...chain, fs.realpathSync.native(childFrom)]);
+      } else if (e.isFile()) {
+        copyFile(childFrom, childTo, fs.lstatSync(childFrom));
+      }
+    }
+  };
+
+  try {
+    walk(realSrc, dest, "", [realSrc]);
+  } catch (e) {
+    fs.rmSync(dest, { recursive: true, force: true });
+    throw e;
+  }
+  return { dropped: dropped.sort() };
 }
 
 /**

@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "agents": [
+    "claude",
+    "agents"
+  ],
+  "agentPaths": {
+    "claude": {
+      "projectPath": ".claude/custom"
+    }
+  },
+  "registry": "https://example.invalid/index.json",
+  "skills": {
+    "pdf": {
+      "source": "github:anthropics/skills/skills/pdf"
+    },
+    "pinned": {
+      "source": "github:acme/skills/tools/pinned@v2",
+      "agents": [
+        "claude"
+      ]
+    },
+    "web": {
+      "source": "https://github.com/acme/skills/tree/main/tools/web"
+    },
+    "local": {
+      "source": "path:./skills/local"
+    }
+  }
+}

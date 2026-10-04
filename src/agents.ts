@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { exists, isDir, isPlainCopyOf, isSymlink, linkOrCopy, removePath, resolveLink } from "./fs.js";
-import { assertSafeTarget } from "./manifest.js";
+import { exists, isDir, isPlainCopyOf, isSymlink, linkOrCopy, removePath, resolveInsideDetailed, resolveLink } from "./fs.js";
+import { assertSafeTarget, writeRoot } from "./manifest.js";
 import type { AgentId, Context, Manifest } from "./types.js";
 
 export interface AgentAdapter {
@@ -190,9 +190,14 @@ export function unlinkSkill(
   // (even if the store is gone), a symlink resolving to our real store dir, or
   // a copied dir whose store twin exists.
   if (isSymlink(target)) {
+    // The chain is followed by hand, as text, and only inside the project: a link whose
+    // text (at any hop) is absolute or names a network share, or that leaves the project,
+    // is never resolved (that would open a place its author chose). Only the exact link
+    // we would have written is ours then.
+    const resolved = resolveInsideDetailed(writeRoot(ctx), target);
     const ours =
       readLinkText(target) === expectedLinkText(target, storeDir) ||
-      (!isSymlink(storeDir) && isDir(storeDir) && resolveLink(target) === realStoreDir(storeDir));
+      ("path" in resolved && !isSymlink(storeDir) && isDir(storeDir) && resolved.path === realStoreDir(storeDir));
     if (!ours) return false;
   } else {
     // A real directory: only remove it if the lockfile says skillwharf made a
@@ -223,9 +228,12 @@ export function linkStatus(
   // put it; nothing linked to it counts as installed.
   const storeIsLink = isSymlink(storeDir);
   if (isSymlink(target)) {
-    const real = resolveLink(target);
-    if (!real) return "broken";
-    return !storeIsLink && real === realStoreDir(storeDir) ? "ok" : "foreign";
+    // Followed by hand, inside the project only. A chain that leaves it (absolute or UNC text
+    // at any hop, a `..` past the root) is not ours and is never opened; one that stays inside
+    // but does not resolve is just broken.
+    const resolved = resolveInsideDetailed(writeRoot(ctx), target);
+    if ("fail" in resolved) return resolved.fail === "outside" ? "foreign" : "broken";
+    return !storeIsLink && resolved.path === realStoreDir(storeDir) ? "ok" : "foreign";
   }
   // A real directory is only "ours" (a copy fallback) if the lockfile records a
   // copy here and it is exactly a copy of the store folder.

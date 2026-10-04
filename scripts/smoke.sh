@@ -18,12 +18,43 @@ printf -- '---\nname: demo\ndescription: smoke test skill\nversion: 0.1\n---\n# 
 proj="$tmp/proj"
 mkdir -p "$proj/.cursor"
 
-echo "== --help"
-$bin --help > /dev/null
+echo "== --help names where skills come from"
+help_out="$($bin --help)"
+grep -q "Where skills come from:" <<< "$help_out"
+grep -q "gitlab:group/repo//dir" <<< "$help_out"
 
-echo "== init"
-(cd "$proj" && $bin init -a claude,codex,agents,cursor > /dev/null)
+echo "== registry help is offline and lists every spelling"
+reg_help="$(cd "$tmp" && $bin registry help)"
+for spelling in "github:" "gitlab:" "bitbucket:" "git+https://" "git+ssh://" "skillwharf registry add" "index.json"; do
+  grep -q -- "$spelling" <<< "$reg_help"
+done
+
+echo "== init shows the one-time hint on stderr, once"
+init_err="$(cd "$proj" && $bin init -a claude,codex,agents,cursor 2>&1 > /dev/null)"
+grep -q "Skills come from any git host" <<< "$init_err"
 test -f "$proj/skillwharf.json"
+test -f "$SKILLWHARF_HOME/.skillwharf/hints.json"
+proj2="$tmp/proj2"
+mkdir -p "$proj2"
+init_again="$(cd "$proj2" && $bin init -a claude 2>&1 > /dev/null)"
+if grep -q "Skills come from any git host" <<< "$init_again"; then
+  echo "the hint was shown twice" >&2
+  exit 1
+fi
+
+echo "== registries you own: add, list, search, publish"
+reg="$tmp/registry-checkout"
+mkdir -p "$reg"
+(cd "$proj" && $bin publish "$src" --registry "$reg" --source "gitlab:acme/platform/skills//demo" > /dev/null)
+grep -q '"source": "gitlab:acme/platform/skills//demo"' "$reg/index.json"
+(cd "$proj" && $bin registry add mine "$reg" > /dev/null)
+reg_list="$(cd "$proj" && $bin --json registry list)"
+grep -q '"name": "mine"' <<< "$reg_list"
+grep -q '"status": "loaded"' <<< "$reg_list"
+(cd "$proj" && $bin registry remove default > /dev/null)
+search_out="$(cd "$proj" && $bin --json search demo)"
+grep -q '"registry": "mine"' <<< "$search_out"
+(cd "$proj" && $bin registry remove mine > /dev/null)
 
 echo "== add"
 (cd "$proj" && $bin add "$src" > /dev/null)
@@ -57,11 +88,15 @@ fi
 test -f "$proj/.claude/skills/demo/SKILL.md"
 test -f "$proj/.agents/skills/demo/SKILL.md"
 
-echo "== doctor is clean apart from usage"
-# With --stale-days 0 every skill is "not used"; that is the only line allowed.
-doctor_out="$(cd "$proj" && $bin doctor --stale-days 0)"
+echo "== doctor is clean apart from usage (and the registries information line)"
+# With --stale-days 0 every skill is "not used"; that and the one information
+# line about registries are the only lines allowed.
+# Without --allow-outside-paths doctor reports the outside source and does not open it.
+doctor_plain="$(cd "$proj" && $bin doctor --stale-days 0 || true)"
+grep -q "outside the project" <<< "$doctor_plain"
+doctor_out="$(cd "$proj" && $bin doctor --stale-days 0 --allow-outside-paths)"
 grep -q "not used" <<< "$doctor_out"
-other="$(grep -v "not used" <<< "$doctor_out" || true)"
+other="$(grep -v -e "not used" -e "registries: only the public registry" <<< "$doctor_out" || true)"
 if [ -n "$other" ]; then
   echo "doctor printed more than the usage warning:" >&2
   echo "$other" >&2

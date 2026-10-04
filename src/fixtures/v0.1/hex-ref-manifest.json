@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "agents": [
+    "claude"
+  ],
+  "skills": {
+    "tagged": {
+      "source": "github:acme/skills/tools/tagged@deadbeef"
+    }
+  }
+}

@@ -14,8 +14,17 @@ export interface Manifest {
   version: 1;
   agents: AgentId[];
   agentPaths?: Partial<Record<AgentId, AgentOverride>>;
+  /** 0.1.x: one registry. Still read, as a registry named "registry". */
   registry?: string;
+  /** Registries searched by `search` and `add <name>`, in order. Absent (with no `registry`) means the public one. */
+  registries?: RegistrySpec[];
   skills: Record<string, SkillSpec>;
+}
+
+/** A registry a project or the global manifest lists: `location` is `default`, an https index URL, a git source, or a local path. */
+export interface RegistrySpec {
+  name: string;
+  location: string;
 }
 
 export interface LockEntry {
@@ -56,6 +65,26 @@ export interface RegistryEntry {
 export interface RegistryIndex {
   version: 1;
   skills: RegistryEntry[];
+  /** Names of entries left out because their source ends in a hex ref that is not a full commit sha. */
+  skippedHexRefs?: string[];
+}
+
+/** One registry after an attempt to load it: its index, or why it could not be loaded. */
+export interface LoadedRegistry {
+  name: string;
+  location: string;
+  /** Where the entry came from: the global manifest, the project manifest, or a `--registry` flag. */
+  scope: "global" | "project" | "cli";
+  index?: RegistryIndex;
+  error?: string;
+  /** Something to tell the user about this registry (it was renamed because a global one has the name). */
+  note?: string;
+}
+
+/** A search result: the entry, the registry it came from and its score. */
+export interface SearchHit extends RegistryEntry {
+  registry: string;
+  score: number;
 }
 
 export interface Context {
