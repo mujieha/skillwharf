@@ -114,7 +114,9 @@ describe("updateSkills + doctor", () => {
     expect(updateSkills(ctx, ["alpha"], outside)[0].changed).toBe(false);
     fs.appendFileSync(path.join(src, "alpha/SKILL.md"), "more\n");
     expect(updateSkills(ctx, [], outside)[0].changed).toBe(true);
-    expect(doctor(ctx)).toEqual([]);
+    // the source folder is outside the project: doctor reports it unless it is told to look (Round D D6)
+    expect(doctor(ctx).map((i) => i.message)).toEqual([expect.stringMatching(/outside the project/)]);
+    expect(doctor(ctx, outside)).toEqual([]);
 
     fs.appendFileSync(storePath(ctx, "alpha") + "/SKILL.md", "local edit\n");
     const issues = doctor(ctx);

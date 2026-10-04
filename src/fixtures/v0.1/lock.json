@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "skills": {
+    "local": {
+      "source": "path:./skills/local",
+      "resolved": "path:./skills/local",
+      "integrity": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "version": "0.1",
+      "installedAt": "2026-09-30T10:00:00.000Z",
+      "links": {
+        "claude": "copy"
+      }
+    },
+    "pdf": {
+      "source": "github:anthropics/skills/skills/pdf",
+      "resolved": "github:anthropics/skills/skills/pdf@0123456789abcdef0123456789abcdef01234567",
+      "integrity": "sha256-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+      "version": "1.0.0",
+      "installedAt": "2026-09-30T10:00:00.000Z"
+    },
+    "pinned": {
+      "source": "github:acme/skills/tools/pinned@v2",
+      "resolved": "github:acme/skills/tools/pinned@fedcba9876543210fedcba9876543210fedcba98",
+      "integrity": "sha256-CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=",
+      "installedAt": "2026-09-30T10:00:00.000Z"
+    }
+  }
+}

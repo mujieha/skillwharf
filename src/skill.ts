@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import YAML from "yaml";
+import { inGitDir, isInside, resolveInside } from "./fs.js";
 import type { SkillMeta } from "./types.js";
 
 const FM_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
@@ -60,6 +61,28 @@ export function readSkill(dir: string): SkillMeta {
 
 export function isSkillDir(dir: string): boolean {
   return skillFile(dir) !== undefined;
+}
+
+/**
+ * Like `isSkillDir`, but for a folder inside a fetched repository (`root`): a
+ * SKILL.md that is a symlink counts when it resolves to a regular file inside
+ * that repository (outside any `.git`). Repositories that mirror one canonical
+ * SKILL.md into several agent folders rely on this. One that resolves outside
+ * the repository is not a skill, so its target is never read.
+ */
+export function isSkillDirIn(dir: string, root: string): boolean {
+  if (skillFile(dir) !== undefined) return true;
+  try {
+    const file = path.join(dir, "SKILL.md");
+    if (!fs.lstatSync(file).isSymbolicLink()) return false;
+    // Resolved by hand, so the target of a link that leaves the repository (or names a
+    // network share) is never opened.
+    const realRoot = fs.realpathSync.native(root);
+    const real = resolveInside(root, file);
+    return real !== undefined && isInside(realRoot, real) && !inGitDir(path.relative(realRoot, real)) && fs.statSync(real).isFile();
+  } catch {
+    return false;
+  }
 }
 
 /** Valid skill folder / registry names: lowercase, digits, dashes. */

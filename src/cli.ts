@@ -4,9 +4,8 @@ import fs from "node:fs";
 import path from "node:path";
 import pc from "picocolors";
 import { ADAPTERS, ALL_AGENTS, DEFAULT_AGENTS, groupLabel, isAgentId, targetGroups } from "./agents.js";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_FILES, isDir, type SizeLimits } from "./fs.js";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_FILES, type SizeLimits } from "./fs.js";
 import {
-  DEFAULT_REGISTRY,
   MANIFEST,
   emptyManifest,
   loadLock,
@@ -16,27 +15,77 @@ import {
   requireManifest,
   saveManifest,
   storePath,
+  validateManifest,
 } from "./manifest.js";
-import { addSkill, agentsFor, doctor, removeSkill, syncSkills, updateSkills } from "./ops.js";
-import { loadRegistry, publishToRegistry, searchRegistry } from "./registry.js";
+import { addFromRegistry, addSkill, agentsFor, doctor, inspectStore, removeSkill, syncSkills, updateSkills } from "./ops.js";
+import {
+  addRegistry,
+  configuredRegistries,
+  isRegistryName,
+  loadRegistries,
+  publishToRegistry,
+  removeRegistry,
+  searchRegistries,
+} from "./registry.js";
 import { readSkill } from "./skill.js";
 import { parseSource } from "./source.js";
-import type { AgentId, Context } from "./types.js";
+import type { AgentId, Context, Manifest } from "./types.js";
 import { daysAgo, scanClaudeUsage } from "./usage.js";
 import { sanitizeForTerminal, toSafeJson } from "./validate.js";
+import { allowAskpass, interruptedBy } from "./git.js";
+import { REGISTRY_HELP, SOURCES_BLOCK, afterSearch, showHintOnce, usesDefaultOnly } from "./hints.js";
 
-const VERSION = "0.1.2";
+const VERSION = "0.2.0";
 
 const program = new Command()
   .name("skillwharf")
   .description("skillwharf — install, version, sync and track agent skills across Claude Code, Codex, Cursor and more")
   .version(VERSION)
   .option("-g, --global", "operate on ~/.skillwharf instead of the current project")
-  .option("--json", "machine-readable output where supported");
+  .option("--json", "machine-readable output where supported")
+  .option("--quiet", "do not print the one-time hint about sources and registries")
+  .option("--git-timeout <seconds>", "kill a git call that runs longer than this (default 120)")
+  .option("--git-deadline <seconds>", "most time all the git calls of one add, sync or update may take together (default: four times --git-timeout)")
+  .option("--allow-askpass", "let your askpass programs (GIT_ASKPASS, core.askPass, SSH_ASKPASS) prompt for credentials during this command; off by default")
+  .hook("preAction", (_program, action) => {
+    if ((action.optsWithGlobals() as { allowAskpass?: boolean }).allowAskpass) allowAskpass(true);
+  })
+  .addHelpText("after", `\nWhere skills come from:\n${indent(SOURCES_BLOCK)}\n`);
+
+/** Two spaces in front of every line, for help text. */
+function indent(text: string): string {
+  return text.split("\n").map((l) => `  ${l}`).join("\n");
+}
 
 function ctxFrom(cmd: Command): Context {
   const opts = cmd.optsWithGlobals() as { global?: boolean };
   return makeContext({ global: opts.global });
+}
+
+/** `--git-deadline <seconds>` as milliseconds, or undefined for the default (four times the timeout). */
+function gitDeadlineMs(cmd: Command): number | undefined {
+  const raw = (cmd.optsWithGlobals() as { gitDeadline?: string }).gitDeadline;
+  if (raw === undefined) return undefined;
+  return seconds("--git-deadline", raw);
+}
+
+/** Longest limit a timer can hold (Node's setTimeout overflows past about 2^31 ms). */
+const MAX_LIMIT_SECONDS = 2_000_000;
+
+/** A positive number of seconds, at most MAX_LIMIT_SECONDS, as milliseconds. */
+function seconds(flag: string, raw: string): number {
+  const s = Number(raw);
+  if (!Number.isFinite(s) || s <= 0 || s > MAX_LIMIT_SECONDS) {
+    fail(`${flag} takes a positive number of seconds (at most ${MAX_LIMIT_SECONDS}), got "${raw}"`);
+  }
+  return Math.round(s * 1000);
+}
+
+/** `--git-timeout <seconds>` as milliseconds, or undefined for the default. */
+function gitTimeoutMs(cmd: Command): number | undefined {
+  const raw = (cmd.optsWithGlobals() as { gitTimeout?: string }).gitTimeout;
+  if (raw === undefined) return undefined;
+  return seconds("--git-timeout", raw);
 }
 
 function parseAgents(s: string | undefined): AgentId[] | undefined {
@@ -63,6 +112,8 @@ function parseLimits(o: { maxSkillSize?: string; maxSkillFiles?: string }): Size
 }
 
 function fail(msg: string): never {
+  // Ctrl-C ended a git call: the temporary files are already cleaned up; leave as the shell expects.
+  if (interruptedBy()) process.exit(130);
   console.error(pc.red("error:"), clean(msg));
   process.exit(1);
 }
@@ -88,23 +139,56 @@ function stripAnsi(s: string): string {
   return s.replace(/\u001b\[[0-9;]*m/g, "");
 }
 
+/**
+ * `--registry` values for `init`. One bare location is written as the 0.1.x
+ * `registry` field (so the manifest is the one 0.1.x wrote); anything named, or
+ * more than one, goes into `registries`. `name=` counts only when what comes
+ * before the first `=` is a registry name, so a URL with `?a=b` stays a location.
+ */
+function registriesFromFlags(specs: string[]): Pick<Manifest, "registry" | "registries"> {
+  if (specs.length === 0) return {};
+  const parsed = specs.map((s) => {
+    const eq = s.indexOf("=");
+    if (eq > 0 && /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(s.slice(0, eq)) && s.length > eq + 1) {
+      return { name: s.slice(0, eq) as string | undefined, location: s.slice(eq + 1) };
+    }
+    return { name: undefined as string | undefined, location: s };
+  });
+  if (parsed.length === 1 && parsed[0].name === undefined) return { registry: parsed[0].location };
+  if (parsed.filter((p) => p.name === undefined).length > 1) {
+    fail("with more than one --registry, give each a name: --registry name=location");
+  }
+  return { registries: parsed.map((p) => ({ name: p.name ?? "registry", location: p.location })) };
+}
+
 // ---------------------------------------------------------------- init
 program
   .command("init")
   .description(`create ${MANIFEST} (default agents: ${DEFAULT_AGENTS.join(",")} — covers Claude Code, Codex and Cursor)`)
   .option("-a, --agents <list>", "comma-separated agents: " + ALL_AGENTS.join(","))
-  .option("--registry <url>", "default registry index URL")
-  .action((opts: { agents?: string; registry?: string }, cmd: Command) => {
+  .option(
+    "--registry <spec>",
+    "a registry for this project: <location>, or <name>=<location>; repeat for several. A location is an https index URL, a git source or a local path",
+    (value: string, previous: string[]) => [...previous, value],
+    [] as string[],
+  )
+  .action((opts: { agents?: string; registry: string[] }, cmd: Command) => {
     const ctx = ctxFrom(cmd);
     if (loadManifest(ctx)) fail(`${rel(ctx, manifestPath(ctx))} already exists`);
     const agents = parseAgents(opts.agents) ?? [...DEFAULT_AGENTS];
     const m = emptyManifest(agents);
-    if (opts.registry) m.registry = opts.registry;
+    Object.assign(m, registriesFromFlags(opts.registry));
+    try {
+      validateManifest(m, MANIFEST);
+    } catch (e) {
+      fail((e as Error).message);
+    }
     fs.mkdirSync(ctx.root, { recursive: true });
     saveManifest(ctx, m);
     console.log(pc.green("✔"), `created ${rel(ctx, manifestPath(ctx))}`);
     console.log("  agents:", agents.map((a) => `${a} (${ADAPTERS[a].label})`).join(", "));
     console.log(pc.dim(`  next: skillwharf add github:owner/repo/path-to-skill`));
+    showHintOnce(ctx.home, { quiet: (cmd.optsWithGlobals() as { quiet?: boolean }).quiet });
   });
 
 // ---------------------------------------------------------------- add
@@ -112,6 +196,7 @@ interface AddCliOptions {
   name?: string;
   agents?: string;
   all?: boolean;
+  from?: string;
   force?: boolean;
   maxSkillSize?: string;
   maxSkillFiles?: string;
@@ -119,24 +204,35 @@ interface AddCliOptions {
 
 program
   .command("add <source>")
-  .description("install a skill from github:owner/repo[/path][@ref], a GitHub URL, or a local path")
+  .description(
+    "install a skill by registry name, or from github:owner/repo[//dir][@ref], gitlab:group/repo//dir, bitbucket:owner/repo//dir, git+https://host/repo.git//dir, git+ssh://git@host/repo.git//dir, a web URL, or a local path",
+  )
   .option("-n, --name <name>", "override the skill name")
   .option("-a, --agents <list>", "only link into these agents")
   .option("--all", "install every skill found in the source")
+  .option("--from <registry>", "with a skill name: take it from this registry (needed when two registries list the name)")
   .option("--force", "replace agent files that skillwharf did not create")
   .option("--max-skill-size <mb>", `refuse a skill folder over this many megabytes (default ${DEFAULT_MAX_BYTES / 1024 / 1024})`)
   .option("--max-skill-files <n>", `refuse a skill folder with more than this many files and folders (default ${DEFAULT_MAX_FILES})`)
-  .action((source: string, opts: AddCliOptions, cmd: Command) => {
+  .action(async (source: string, opts: AddCliOptions, cmd: Command) => {
     const ctx = ctxFrom(cmd);
+    const timeout = gitTimeoutMs(cmd);
     try {
-      const added = addSkill(ctx, source, {
+      const byName = isRegistryName(source);
+      if (opts.from !== undefined && !byName) fail("--from is for a skill name (skillwharf add <name> --from <registry>), not a source");
+      const addOpts = {
         name: opts.name,
         agents: parseAgents(opts.agents),
         all: opts.all,
         force: opts.force,
         limits: parseLimits(opts),
-        onSkipped: (s) => console.log(pc.yellow("!"), `skipped ${clean(s.dir)}: ${clean(s.reason)}`),
-      });
+        gitTimeoutMs: timeout,
+        gitDeadlineMs: gitDeadlineMs(cmd),
+        onSkipped: (s: { dir: string; reason: string }) => console.log(pc.yellow("!"), `skipped ${clean(s.dir)}: ${clean(s.reason)}`),
+      };
+      const added = byName
+        ? await addFromRegistry(ctx, source, { ...addOpts, from: opts.from, onWarning: (w) => console.error(pc.yellow("!"), clean(w)) })
+        : addSkill(ctx, source, addOpts);
       for (const a of added) {
         console.log(pc.green("✔"), pc.bold(a.name), a.meta.version ? pc.dim(`v${clean(a.meta.version)}`) : "", pc.dim(clean(a.lock.resolved)));
         for (const l of a.links) {
@@ -157,10 +253,11 @@ program
   .command("remove <name>")
   .alias("rm")
   .description("unlink a skill from all agents and delete it from the store")
-  .action((name: string, _opts: unknown, cmd: Command) => {
+  .option("--allow-outside-paths", "accept a path: source that resolves outside the project")
+  .action((name: string, opts: { allowOutsidePaths?: boolean }, cmd: Command) => {
     const ctx = ctxFrom(cmd);
     try {
-      const r = removeSkill(ctx, name);
+      const r = removeSkill(ctx, name, { allowOutsidePaths: opts.allowOutsidePaths });
       if (!r.existed) console.log(pc.yellow("!"), `${name} was not in the manifest; cleaned up anyway`);
       const unlinked = r.removed.map((g) => groupLabel(g.agents)).join(", ");
       console.log(pc.green("✔"), `removed ${name}`, unlinked ? pc.dim(`(unlinked: ${unlinked})`) : "");
@@ -183,12 +280,15 @@ program
   .option("--max-skill-files <n>", `refuse a skill folder with more than this many files and folders (default ${DEFAULT_MAX_FILES})`)
   .action((opts: { force?: boolean; allowUnpinned?: boolean; allowOutsidePaths?: boolean; maxSkillSize?: string; maxSkillFiles?: string }, cmd: Command) => {
     const ctx = ctxFrom(cmd);
+    const timeout = gitTimeoutMs(cmd);
     try {
       const r = syncSkills(ctx, {
         force: opts.force,
         allowUnpinned: opts.allowUnpinned,
         allowOutsidePaths: opts.allowOutsidePaths,
         limits: parseLimits(opts),
+        gitTimeoutMs: timeout,
+        gitDeadlineMs: gitDeadlineMs(cmd),
       });
       for (const n of r.fetched) console.log(pc.green("✔"), "fetched", pc.bold(n));
       for (const l of r.linked) console.log(pc.green("✔"), "linked ", pc.bold(l.name), pc.dim(`→ ${groupLabel(l.link.agents)} (${l.link.mode})`));
@@ -201,14 +301,22 @@ program
 // ---------------------------------------------------------------- update
 program
   .command("update [names...]")
-  .description("re-fetch skills from their sources and refresh the lockfile")
+  .description("re-fetch skills from their sources and refresh the lockfile (--source: the repository moved, point one skill at its new home)")
+  .option("--source <source>", "replace the source of the one named skill (a repository that moved) and re-pin it")
   .option("--allow-outside-paths", "accept path: sources that resolve outside the project")
   .option("--max-skill-size <mb>", `refuse a skill folder over this many megabytes (default ${DEFAULT_MAX_BYTES / 1024 / 1024})`)
   .option("--max-skill-files <n>", `refuse a skill folder with more than this many files and folders (default ${DEFAULT_MAX_FILES})`)
-  .action((names: string[], opts: { allowOutsidePaths?: boolean; maxSkillSize?: string; maxSkillFiles?: string }, cmd: Command) => {
+  .action((names: string[], opts: { source?: string; allowOutsidePaths?: boolean; maxSkillSize?: string; maxSkillFiles?: string }, cmd: Command) => {
     const ctx = ctxFrom(cmd);
+    const timeout = gitTimeoutMs(cmd);
     try {
-      const res = updateSkills(ctx, names, { allowOutsidePaths: opts.allowOutsidePaths, limits: parseLimits(opts) });
+      const res = updateSkills(ctx, names, {
+        source: opts.source,
+        allowOutsidePaths: opts.allowOutsidePaths,
+        limits: parseLimits(opts),
+        gitTimeoutMs: timeout,
+        gitDeadlineMs: gitDeadlineMs(cmd),
+      });
       for (const r of res) {
         console.log(r.changed ? pc.green("↑") : pc.dim("="), pc.bold(r.name), r.changed ? "updated" : pc.dim("unchanged"));
       }
@@ -234,17 +342,13 @@ program
 
     const rows = Object.keys(m.skills).map((name) => {
       const entry = lock.skills[name];
-      const store = storePath(ctx, name);
+      // The store is examined with lstat first: one reached through a link is not read.
+      const store = inspectStore(ctx, name);
       let version = entry?.version;
       let description = "";
-      if (isDir(store)) {
-        try {
-          const meta = readSkill(store);
-          version = version ?? meta.version;
-          description = meta.description;
-        } catch {
-          /* ignore */
-        }
+      if (store.meta) {
+        version = version ?? store.meta.version;
+        description = store.meta.description;
       }
       const u = usage.get(name);
       return {
@@ -256,7 +360,7 @@ program
         uses: u?.count ?? 0,
         lastUsed: u?.lastUsed?.toISOString(),
         description,
-        installed: isDir(store),
+        installed: store.state === "installed",
       };
     });
 
@@ -344,11 +448,12 @@ program
   .command("doctor")
   .description("check for broken links, drift and stale skills")
   .option("--stale-days <n>", "flag managed skills unused for this many days", "60")
-  .action(async (opts: { staleDays: string }, cmd: Command) => {
+  .option("--allow-outside-paths", "look at path: sources that resolve outside the project (they are reported, not opened, without it)")
+  .action(async (opts: { staleDays: string; allowOutsidePaths?: boolean }, cmd: Command) => {
     const ctx = ctxFrom(cmd);
     let issues;
     try {
-      issues = doctor(ctx);
+      issues = doctor(ctx, { allowOutsidePaths: opts.allowOutsidePaths });
     } catch (e) {
       fail((e as Error).message);
     }
@@ -364,11 +469,14 @@ program
     }
     if (issues.length === 0) {
       console.log(pc.green("✔"), "no problems found");
-      return;
     }
     for (const i of issues) {
       const tag = i.level === "error" ? pc.red("✖") : pc.yellow("!");
       console.log(tag, i.skill ? pc.bold(i.skill) : "", i.agents ? pc.dim(`[${groupLabel(i.agents)}]`) : "", clean(i.message), i.fix ? pc.dim(`→ ${clean(i.fix)}`) : "");
+    }
+    // Information, not a problem: it never counts as an issue or changes the exit code.
+    if (usesDefaultOnly(configuredRegistries(ctx))) {
+      console.log(pc.dim("i registries: only the public registry is configured; to use your own, run `skillwharf registry help`"));
     }
     if (issues.some((i) => i.level === "error")) process.exitCode = 1;
   });
@@ -376,21 +484,123 @@ program
 // ---------------------------------------------------------------- search
 program
   .command("search <query...>")
-  .description("search a registry index (default: manifest.registry or the public index)")
-  .option("--registry <url|path>", "registry index URL, index.json or a directory containing one")
+  .description("search the registries the manifest lists (default: the public index); results name their registry")
+  .option("--registry <url|path>", "search only this registry: an index URL, a git source, an index.json or a directory containing one")
   .action(async (query: string[], opts: { registry?: string }, cmd: Command) => {
     const ctx = ctxFrom(cmd);
     const gopts = cmd.optsWithGlobals() as { json?: boolean };
-    const reg = opts.registry ?? loadManifest(ctx)?.registry ?? DEFAULT_REGISTRY;
+    const timeout = gitTimeoutMs(cmd);
     try {
-      const idx = await loadRegistry(reg);
-      const hits = searchRegistry(idx, query.join(" "));
-      if (gopts.json) return console.log(toSafeJson(hits));
-      if (hits.length === 0) return console.log(pc.dim(`no matches in ${clean(reg)}`));
+      const registries = await loadRegistries(ctx, {
+        only: opts.registry ? [{ name: "registry", location: opts.registry }] : undefined,
+        timeoutMs: timeout,
+      });
+      for (const r of registries) {
+        if (r.note !== undefined) console.error(pc.yellow("!"), clean(r.note));
+        if (r.error !== undefined) console.error(pc.yellow("!"), `registry ${clean(r.name)}: ${clean(r.error)}`);
+      }
+      if (registries.length > 0 && registries.every((r) => r.error !== undefined)) fail("no registry could be loaded");
+      const hits = searchRegistries(registries, query.join(" "));
+      const several = registries.length > 1;
+      if (gopts.json) {
+        console.log(toSafeJson(hits));
+      } else if (hits.length === 0) {
+        console.log(pc.dim(`no matches in ${registries.filter((r) => r.index).map((r) => clean(r.name)).join(", ") || "any registry"}`));
+      } else {
+        console.log(
+          table(
+            hits.slice(0, 20).map((h) => [
+              pc.bold(clean(h.name)),
+              ...(several ? [clean(h.registry)] : []),
+              shorten(clean(h.description), 60),
+              pc.dim(clean(h.source)),
+            ]),
+            ["skill", ...(several ? ["registry"] : []), "description", "install with: skillwharf add <source>"],
+          ),
+        );
+      }
+      // The first search that used the public registry alone: say once that registries are yours to own.
+      afterSearch(opts.registry ? [] : registries, { quiet: (cmd.optsWithGlobals() as { quiet?: boolean }).quiet, json: gopts.json }, ctx.home);
+    } catch (e) {
+      fail((e as Error).message);
+    }
+  });
+
+// ---------------------------------------------------------------- registry
+const registryCmd = program
+  .command("registry")
+  .description("manage the registries this project searches (add, remove, list); `registry help` explains how to run your own")
+  .addHelpCommand(false)
+  .addHelpText("after", `\nWhere skills come from:\n${indent(SOURCES_BLOCK)}\n`);
+
+registryCmd
+  .command("help")
+  .description("the walk-through: where skills come from and how to run a registry of your own")
+  .action(() => {
+    console.log(REGISTRY_HELP.trimEnd());
+  });
+
+registryCmd
+  .command("add <name> <location>")
+  .description("add a registry: an https index URL, a git source whose repository root holds index.json, or a local path")
+  .action(async (name: string, location: string, _opts: unknown, cmd: Command) => {
+    const ctx = ctxFrom(cmd);
+    try {
+      const r = await addRegistry(ctx, name, location, { timeoutMs: gitTimeoutMs(cmd) });
+      console.log(pc.green("✔"), `added registry ${pc.bold(clean(name))}`, pc.dim(`(${r.entries} skills)`));
+    } catch (e) {
+      fail((e as Error).message);
+    }
+  });
+
+registryCmd
+  .command("remove <name>")
+  .alias("rm")
+  .description("remove a registry from the manifest")
+  .action((name: string, _opts: unknown, cmd: Command) => {
+    const ctx = ctxFrom(cmd);
+    try {
+      removeRegistry(ctx, name);
+      console.log(pc.green("✔"), `removed registry ${pc.bold(clean(name))}`);
+    } catch (e) {
+      fail((e as Error).message);
+    }
+  });
+
+registryCmd
+  .command("list")
+  .alias("ls")
+  .description("show each registry with where it is, how many skills it lists, and whether it loaded")
+  .action(async (_opts: unknown, cmd: Command) => {
+    const ctx = ctxFrom(cmd);
+    const gopts = cmd.optsWithGlobals() as { json?: boolean };
+    try {
+      const registries = await loadRegistries(ctx, { timeoutMs: gitTimeoutMs(cmd) });
+      for (const r of registries) if (r.note !== undefined) console.error(pc.yellow("!"), clean(r.note));
+      if (gopts.json) {
+        return console.log(
+          toSafeJson(
+            registries.map((r) => ({
+              name: r.name,
+              location: r.location,
+              scope: r.scope,
+              entries: r.index ? r.index.skills.length : null,
+              status: r.index ? "loaded" : "failed",
+              ...(r.error !== undefined ? { error: r.error } : {}),
+            })),
+          ),
+        );
+      }
+      if (registries.length === 0) return console.log(pc.dim("no registries listed; add one with: skillwharf registry add <name> <location>"));
       console.log(
         table(
-          hits.slice(0, 20).map((h) => [pc.bold(clean(h.name)), shorten(clean(h.description), 60), pc.dim(clean(h.source))]),
-          ["skill", "description", "install with: skillwharf add <source>"],
+          registries.map((r) => [
+            pc.bold(clean(r.name)),
+            clean(r.location),
+            r.index ? String(r.index.skills.length) : pc.dim("-"),
+            r.index ? pc.green("loaded") : pc.red(clean(r.error ?? "failed")),
+          ]),
+          ["name", "location", "skills", "status"],
         ),
       );
     } catch (e) {
@@ -403,13 +613,15 @@ program
   .command("publish <skillPath>")
   .description("add or update a skill entry in a local registry checkout (then commit and push it)")
   .requiredOption("--registry <dir>", "local checkout of the registry repo")
-  .requiredOption("--source <source>", "public install source, e.g. github:owner/repo/path")
+  .requiredOption("--source <source>", "where the skill is installed from, on any git host: github:owner/repo/path, gitlab:group/repo//path, git+https://host/repo.git//path")
   .option("--tags <list>", "comma-separated tags")
   .action((skillPath: string, opts: { registry: string; source: string; tags?: string }) => {
     try {
       const dir = path.resolve(skillPath);
       const meta = readSkill(dir);
-      parseSource(opts.source); // validate
+      if (parseSource(opts.source).kind !== "git") {
+        throw new Error("a registry entry must be a git source (github:, gitlab:, bitbucket:, git+https:// or git+ssh://), not a local path");
+      }
       const r = publishToRegistry(path.resolve(opts.registry), {
         name: meta.name,
         description: meta.description,

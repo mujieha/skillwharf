@@ -901,7 +901,8 @@ describe("R6-D2: a copy is ours only when the lock records that skillwharf made 
     withoutSymlinks(() => addSkill(ctx, path.join(proj, "src", "s")));
     addSkill(ctx, path.join(proj, "src", "s"));
     expect(fs.lstatSync(target()).isSymbolicLink()).toBe(true);
-    expect(loadLock(ctx).skills.s.links).toBeUndefined();
+    // 0.2.0 writes the record always (empty when no agent holds a copy): see Round D D7
+    expect(loadLock(ctx).skills.s.links).toEqual({});
   });
 
   it("a lock that says copy does not make a folder with extra files ours", () => {
