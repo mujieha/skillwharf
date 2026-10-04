@@ -563,6 +563,20 @@ export interface AddFromRegistryOptions extends AddOptions {
 }
 
 /**
+ * Is there a folder, or a link of any kind, at `p`? Asked with lstat only: a link a
+ * cloned repository commits under that name is never followed (it could point at a
+ * share), and counts as ambiguous whatever it points at. A plain file does not.
+ */
+function isFolderOrLinkHere(p: string): boolean {
+  try {
+    const st = fs.lstatSync(p);
+    return st.isDirectory() || st.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/**
  * `add <name>`: look the name up in the registries (in order), then install the
  * source the entry gives, exactly as `add <source>` would. The manifest records
  * that source, not the name.
@@ -570,7 +584,7 @@ export interface AddFromRegistryOptions extends AddOptions {
 export async function addFromRegistry(ctx: Context, name: string, opts: AddFromRegistryOptions = {}): Promise<AddedSkill[]> {
   // 0.1.x read a bare `add pdf` as the folder ./pdf. A name that is also a folder
   // here is ambiguous, so say so instead of choosing (`--from` settles it).
-  if (opts.from === undefined && isDir(path.resolve(opts.cwd ?? process.cwd(), name))) {
+  if (opts.from === undefined && isFolderOrLinkHere(path.resolve(opts.cwd ?? process.cwd(), name))) {
     throw new Error(
       `ambiguous: \`${name}\` is a folder here and a registry lookup; use \`./${name}\` for the folder or \`--from <registry> ${name}\``,
     );

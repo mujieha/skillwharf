@@ -870,6 +870,23 @@ describe("S2.4: addFromRegistry installs what the registry says", () => {
       await expect(addFromRegistry(ctx, "alpha", { cwd: proj })).resolves.toHaveLength(1);
     });
 
+    it("Round F: a committed link with that name is ambiguous too, and is never followed", async () => {
+      fs.rmSync(path.join(proj, "alpha"), { recursive: true });
+      // a link a cloned repository could commit, pointing at a share (here: a path that does not exist)
+      fs.symlinkSync("/skillwharf-test-not-there/share", path.join(proj, "alpha"));
+      const stat = vi.spyOn(fs, "statSync");
+      const exists = vi.spyOn(fs, "existsSync");
+      try {
+        await expect(addFromRegistry(ctx, "alpha", { cwd: proj })).rejects.toThrow(AMBIGUOUS);
+        const target = path.join(proj, "alpha");
+        expect(stat.mock.calls.filter((c) => String(c[0]) === target)).toEqual([]);
+        expect(exists.mock.calls.filter((c) => String(c[0]) === target)).toEqual([]);
+      } finally {
+        stat.mockRestore();
+        exists.mockRestore();
+      }
+    });
+
     it("on the command line too", () => {
       const r = spawnSync(process.execPath, [path.join(repoRoot, "node_modules/tsx/dist/cli.mjs"), path.join(repoRoot, "src/cli.ts"), "add", "alpha"], {
         cwd: proj,

@@ -2975,3 +2975,19 @@ describe("Round E E1: a committed link at an agent target is never resolved by t
     expect(fs.lstatSync(path.join(proj, ".claude", "skills", "x")).isSymbolicLink()).toBe(true);
   });
 });
+
+describe("Round F: loose resolution keeps the real letter case of what exists", () => {
+  it("a missing agent target under a folder spelled differently on disk is reported in the disk's spelling", (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "skillwharf-case-"));
+    try {
+      fs.mkdirSync(path.join(root, ".Claude"));
+      if (!fs.existsSync(path.join(root, ".claude"))) return t.skip(); // case-sensitive file system
+      const real = fs.realpathSync.native(root);
+      expect(resolveInsideDetailed(root, path.join(root, ".claude", "skills", "x"), { loose: true })).toEqual({
+        path: path.join(real, ".Claude", "skills", "x"),
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

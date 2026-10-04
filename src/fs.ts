@@ -223,7 +223,10 @@ export function resolveInsideDetailed(
     } catch (e) {
       if (!missing(e)) return { fail: "outside" };
       if (!opts.loose) return { fail: "broken" };
-      const rest = path.join(realBase, ...done, part, ...queue);
+      // What exists is spelled as the file system stores it (letter case on macOS and Windows),
+      // so an overlap check compares like with like; only the missing rest is as written.
+      // Every component in `done` was examined with lstat and is not a link, so this resolves nothing.
+      const rest = path.join(fs.realpathSync.native(path.join(realBase, ...done)), part, ...queue);
       return escapes(path.relative(realBase, rest)) ? { fail: "outside" } : { path: rest };
     }
     if (st.isSymbolicLink()) {
