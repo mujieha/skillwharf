@@ -483,6 +483,9 @@ function fallbackClone(
     try {
       clone(ref, alt);
     } catch (e) {
+      // Ctrl-C ends the command: it is not "the repository could not be reached", and it must not
+      // become the original pin error that `sync --allow-unpinned` answers with another fetch.
+      if (e instanceof GitError && e.kind === "interrupted") throw e;
       if (e instanceof GitError && e.kind === "ref") {
         throw new PinUnavailable(`the host refused commit ${src.ref} and ${ref ? `"${ref}"` : "the default branch"} cannot be cloned instead (${e.message})`);
       }

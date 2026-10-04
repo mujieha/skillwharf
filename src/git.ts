@@ -268,6 +268,8 @@ export function runGit(args: string[], opts: RunGitOptions): string {
   let timeoutMs = opts.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
   let limitedByDeadline = false;
   const shown = sanitizeForTerminal(opts.url);
+  // After Ctrl-C no further git call is started, whatever a caller does with the error it got.
+  if (interrupt) throw new GitError(`git fetch failed for ${shown}: interrupted`, "interrupted", opts.url);
   if (opts.deadline !== undefined) {
     const left = opts.deadline - Date.now();
     if (left <= 0) {
