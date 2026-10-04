@@ -234,7 +234,8 @@ export function loadLock(ctx: Context): Lockfile {
         raw && typeof raw === "object"
           ? Object.entries(raw).filter(([a, v]) => KNOWN_AGENTS.has(a) && v === "copy")
           : [];
-      if (kept.length > 0) entry.links = Object.fromEntries(kept) as LockEntry["links"];
+      // An empty record is kept: it says a 0.2.0 skillwharf wrote the entry and every agent got a link.
+      if (raw && typeof raw === "object" && !Array.isArray(raw)) entry.links = Object.fromEntries(kept) as LockEntry["links"];
       else delete entry.links;
     }
   }

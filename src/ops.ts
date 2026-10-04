@@ -9,7 +9,7 @@ import {
   hashDir,
   isDir,
   isInside,
-  isNetworkPathText,
+  pathTextRefusal,
   resolveInsideDetailed,
   pathsOverlap,
   removePath,
@@ -99,7 +99,7 @@ export function parseStoredSource(
     // Containment first, as text and through links followed by hand: only then is the
     // path resolved (see storedPathMayBeResolved).
     const confined = !ctx.global && !opts.allowOutsidePaths;
-    const resolvable = storedPathMayBeResolved(ctx, raw, p.path);
+    const resolvable = storedPathMayBeResolved(ctx, raw, p.path, opts.allowOutsidePaths);
     if (confined && !resolvable) {
       throw new Error(
         `Source "${raw}" is outside the project (${ctx.root}). Re-run with --allow-outside-paths if you trust it.`,
@@ -162,8 +162,9 @@ function recordLinks(lock: Lockfile, name: string, results: LinkResult[]): boole
       else if (r.mode === "symlink") delete links[a];
     }
   }
-  if (Object.keys(links).length > 0) entry.links = links;
-  else delete entry.links;
+  // Always present from 0.2.0 on (empty when every agent got a link): an entry without the
+  // record is the one a 0.1.x skillwharf wrote, which is what the integrity-mismatch hint keys on.
+  entry.links = links;
   return JSON.stringify(entry.links ?? null) !== before;
 }
 
@@ -523,7 +524,7 @@ export function addSkill(ctx: Context, sourceRaw: string, options: AddOptions = 
         integrity: hashDir(store),
         version: meta.version,
         installedAt: new Date().toISOString(),
-        ...(lock.skills[name]?.links ? { links: lock.skills[name].links } : {}),
+        links: lock.skills[name]?.links ?? {},
       };
       lock.skills[name] = entry;
       // Record each skill as soon as its store folder is in place, before the
@@ -591,7 +592,7 @@ export interface RemoveResult {
   existed: boolean;
 }
 
-export function removeSkill(ctx: Context, name: string): RemoveResult {
+export function removeSkill(ctx: Context, name: string, options: { allowOutsidePaths?: boolean } = {}): RemoveResult {
   const m = requireManifest(ctx);
   const lock = loadLock(ctx);
   const existed = name in m.skills;
@@ -602,7 +603,7 @@ export function removeSkill(ctx: Context, name: string): RemoveResult {
   // touching anything, as add, sync, update and doctor do.
   const entry = lock.skills[name];
   for (const raw of [m.skills[name]?.source, entry?.source, entry?.resolved]) {
-    if (typeof raw === "string") assertStoredSourceClear(ctx, m, name, raw);
+    if (typeof raw === "string") assertStoredSourceClear(ctx, m, name, raw, options);
   }
   const removed: TargetGroup[] = [];
   for (const g of targetGroups(ctx, m, agentsFor(m, name), name)) {
@@ -640,15 +641,17 @@ export function syncSkills(ctx: Context, options: SyncOptions = {}): SyncReport 
   const lock = loadLock(ctx);
   const report: SyncReport = { fetched: [], linked: [], unchanged: [] };
 
+  // A committed store can be a link (`.skillwharf`, or one skill's folder) to a share or any
+  // absolute path. Every store path is checked with lstat only, before anything asks the file
+  // system about it (`isDir` follows links) or about a source that is compared with it.
+  for (const name of Object.keys(m.skills)) assertSafeTarget(ctx, storePath(ctx, name));
+
   // Check every committed store folder before linking any of them. Freshly
   // fetched ones cannot contain symlinks: installToStore leaves them out.
   for (const [name, spec] of Object.entries(m.skills)) {
     const store = storePath(ctx, name);
-    if (isDir(store)) {
-      assertSafeTarget(ctx, store);
-      assertStoreHasNoSymlinks(name, store);
-    }
-    assertStoredSourceClear(ctx, m, name, spec.source);
+    if (isDir(store)) assertStoreHasNoSymlinks(name, store);
+    assertStoredSourceClear(ctx, m, name, spec.source, opts);
   }
 
   // A lock entry with no integrity hash pins a commit but cannot verify what
@@ -751,7 +754,7 @@ export function syncSkills(ctx: Context, options: SyncOptions = {}): SyncReport 
               `Nothing was installed and the lockfile was not changed.` +
               // skillwharf 0.1.x wrote no `links` record; files are now checked out as committed
               // (no LFS, eol, ident or autocrlf conversion), which can change what a 0.1.x lock hashed.
-              (entry && !entry.links
+              (entry && entry.links === undefined
                 ? ` If this lock was written by skillwharf 0.1.x, run \`skillwharf update ${name}\` to re-pin the committed bytes.`
                 : ""),
           );
@@ -775,7 +778,7 @@ export function syncSkills(ctx: Context, options: SyncOptions = {}): SyncReport 
         integrity: s.integrity,
         version: s.version,
         installedAt: new Date().toISOString(),
-        ...(lock.skills[name]?.links ? { links: lock.skills[name].links } : {}),
+        links: lock.skills[name]?.links ?? {},
       };
       report.fetched.push(name);
     }
@@ -801,29 +804,33 @@ export function syncSkills(ctx: Context, options: SyncOptions = {}): SyncReport 
 }
 
 /** The overlap check alone, for a source read back from the manifest (a local path only). */
-function assertStoredSourceClear(ctx: Context, m: Manifest, name: string, raw: string): void {
+function assertStoredSourceClear(ctx: Context, m: Manifest, name: string, raw: string, opts: { allowOutsidePaths?: boolean } = {}): void {
   let p: ParsedSource;
   try {
     p = parseSource(raw, ctx.root);
   } catch {
     return; // a source that does not parse is refused where it is used
   }
-  if (p.kind === "path" && storedPathMayBeResolved(ctx, raw, p.path)) assertSourceClear(ctx, m, name, raw, p.path);
+  if (p.kind === "path" && storedPathMayBeResolved(ctx, raw, p.path, opts.allowOutsidePaths)) assertSourceClear(ctx, m, name, raw, p.path);
 }
 
 /**
- * Whether the file system may be asked about a stored `path:` source at all. Network
- * share and drive text is refused outright (on every platform, global manifest
- * included). In a project, a path that is not below the project, or whose links lead
- * out of it, is not resolved: `sync` refuses it as outside the project (unless
- * `--allow-outside-paths`), and nothing here may connect to a place a cloned
+ * Whether the file system may be asked about a stored `path:` source at all. Share
+ * text (`//host/share`) is refused outright, on every platform and in every manifest;
+ * drive text (`C:\x`) is refused in a project unless `--allow-outside-paths` is given
+ * (see `pathTextRefusal`). In a project, a path that is not below the project, or whose
+ * links lead out of it, is not resolved: `sync` refuses it as outside the project
+ * (unless `--allow-outside-paths`), and nothing here may connect to a place a cloned
  * repository's manifest chose.
  */
-function storedPathMayBeResolved(ctx: Context, raw: string, abs: string): boolean {
+function storedPathMayBeResolved(ctx: Context, raw: string, abs: string, allowOutsidePaths = false): boolean {
   const text = raw.trim().replace(/^path:/, "");
-  if (isNetworkPathText(text)) {
+  const refusal = pathTextRefusal(text, { global: ctx.global, allowOutsidePaths });
+  if (refusal) {
     throw new Error(
-      `Source "${raw}" names a network share or a drive; skillwharf does not read local sources from those. Use a path below the project, or a git source.`,
+      `Source "${raw}" names a network share or a drive; skillwharf does not read local sources from those` +
+        (refusal === "drive" ? " in a project unless --allow-outside-paths is given" : "") +
+        `. Use a path below the project, or a git source.`,
     );
   }
   if (ctx.global) return true;
@@ -934,7 +941,7 @@ export function updateSkills(ctx: Context, only?: string[], options: UpdateOptio
         integrity: s.integrity,
         version: s.version,
         installedAt: new Date().toISOString(),
-        ...(lock.skills[name]?.links ? { links: lock.skills[name].links } : {}),
+        links: lock.skills[name]?.links ?? {},
       };
       saveLock(ctx, lock);
       for (const g of groups) linkGroup(ctx, m, lock, g, name, store, true);
@@ -959,7 +966,27 @@ export interface DoctorIssue {
   fix?: string;
 }
 
-export function doctor(ctx: Context): DoctorIssue[] {
+/**
+ * What `list` may say about a skill's store folder. The path is examined with lstat only
+ * first: a store reached through a link (a committed `.skillwharf`, say, pointing at a share)
+ * is `foreign` and nothing is read through it.
+ */
+export function inspectStore(ctx: Context, name: string): { state: "installed" | "missing" | "foreign"; meta?: SkillMeta } {
+  const store = storePath(ctx, name);
+  try {
+    assertSafeTarget(ctx, store);
+  } catch {
+    return { state: "foreign" };
+  }
+  if (!isDir(store)) return { state: "missing" };
+  try {
+    return { state: "installed", meta: readSkill(store) };
+  } catch {
+    return { state: "installed" };
+  }
+}
+
+export function doctor(ctx: Context, options: { allowOutsidePaths?: boolean } = {}): DoctorIssue[] {
   const m = requireManifest(ctx);
   const lock = loadLock(ctx);
   const issues: DoctorIssue[] = [];
@@ -973,7 +1000,7 @@ export function doctor(ctx: Context): DoctorIssue[] {
       continue;
     }
     try {
-      assertStoredSourceClear(ctx, m, name, m.skills[name].source);
+      assertStoredSourceClear(ctx, m, name, m.skills[name].source, options);
     } catch (e) {
       issues.push({ level: "error", skill: name, message: (e as Error).message });
       continue;
@@ -992,7 +1019,8 @@ export function doctor(ctx: Context): DoctorIssue[] {
     const entry = lock.skills[name];
     if (entry) {
       try {
-        lockedSource(ctx, m, name, m.skills[name], entry, { allowOutsidePaths: true });
+        // An outside path is reported, not resolved, unless the user opted in (as for sync and update).
+        lockedSource(ctx, m, name, m.skills[name], entry, { allowOutsidePaths: options.allowOutsidePaths });
       } catch (e) {
         issues.push({ level: "error", skill: name, message: (e as Error).message, fix: "skillwharf update " + name });
       }

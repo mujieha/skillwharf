@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import pc from "picocolors";
 import { ADAPTERS, ALL_AGENTS, DEFAULT_AGENTS, groupLabel, isAgentId, targetGroups } from "./agents.js";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_FILES, isDir, type SizeLimits } from "./fs.js";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_FILES, type SizeLimits } from "./fs.js";
 import {
   MANIFEST,
   emptyManifest,
@@ -17,7 +17,7 @@ import {
   storePath,
   validateManifest,
 } from "./manifest.js";
-import { addFromRegistry, addSkill, agentsFor, doctor, removeSkill, syncSkills, updateSkills } from "./ops.js";
+import { addFromRegistry, addSkill, agentsFor, doctor, inspectStore, removeSkill, syncSkills, updateSkills } from "./ops.js";
 import {
   addRegistry,
   configuredRegistries,
@@ -253,10 +253,11 @@ program
   .command("remove <name>")
   .alias("rm")
   .description("unlink a skill from all agents and delete it from the store")
-  .action((name: string, _opts: unknown, cmd: Command) => {
+  .option("--allow-outside-paths", "accept a path: source that resolves outside the project")
+  .action((name: string, opts: { allowOutsidePaths?: boolean }, cmd: Command) => {
     const ctx = ctxFrom(cmd);
     try {
-      const r = removeSkill(ctx, name);
+      const r = removeSkill(ctx, name, { allowOutsidePaths: opts.allowOutsidePaths });
       if (!r.existed) console.log(pc.yellow("!"), `${name} was not in the manifest; cleaned up anyway`);
       const unlinked = r.removed.map((g) => groupLabel(g.agents)).join(", ");
       console.log(pc.green("✔"), `removed ${name}`, unlinked ? pc.dim(`(unlinked: ${unlinked})`) : "");
@@ -341,17 +342,13 @@ program
 
     const rows = Object.keys(m.skills).map((name) => {
       const entry = lock.skills[name];
-      const store = storePath(ctx, name);
+      // The store is examined with lstat first: one reached through a link is not read.
+      const store = inspectStore(ctx, name);
       let version = entry?.version;
       let description = "";
-      if (isDir(store)) {
-        try {
-          const meta = readSkill(store);
-          version = version ?? meta.version;
-          description = meta.description;
-        } catch {
-          /* ignore */
-        }
+      if (store.meta) {
+        version = version ?? store.meta.version;
+        description = store.meta.description;
       }
       const u = usage.get(name);
       return {
@@ -363,7 +360,7 @@ program
         uses: u?.count ?? 0,
         lastUsed: u?.lastUsed?.toISOString(),
         description,
-        installed: isDir(store),
+        installed: store.state === "installed",
       };
     });
 
@@ -451,11 +448,12 @@ program
   .command("doctor")
   .description("check for broken links, drift and stale skills")
   .option("--stale-days <n>", "flag managed skills unused for this many days", "60")
-  .action(async (opts: { staleDays: string }, cmd: Command) => {
+  .option("--allow-outside-paths", "look at path: sources that resolve outside the project (they are reported, not opened, without it)")
+  .action(async (opts: { staleDays: string; allowOutsidePaths?: boolean }, cmd: Command) => {
     const ctx = ctxFrom(cmd);
     let issues;
     try {
-      issues = doctor(ctx);
+      issues = doctor(ctx, { allowOutsidePaths: opts.allowOutsidePaths });
     } catch (e) {
       fail((e as Error).message);
     }

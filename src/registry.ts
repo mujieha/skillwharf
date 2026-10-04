@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { assertNoSymlinks, isInside, isNetworkPathText, readJson, resolveInsideDetailed, writeJson } from "./fs.js";
+import { assertNoSymlinks, isDriveText, isInside, isShareText, readJson, resolveInsideDetailed, writeJson } from "./fs.js";
 import {
   DEFAULT_REGISTRY,
   listsRegistries,
@@ -23,6 +23,18 @@ export interface LoadRegistryOptions {
   timeoutMs?: number;
   /** An overall limit (epoch milliseconds) for all the git calls of one search (git locations only). */
   deadline?: number;
+  /**
+   * Accept a drive-letter path (`C:\registry`): on Windows every absolute path has one. Off by
+   * default; `loadRegistries` turns it on for the user's own (global or command-line) locations,
+   * never for a project manifest, which a cloned repository wrote. A share is never accepted.
+   */
+  allowDrive?: boolean;
+}
+
+/** Text that must never reach the file system as a registry location, or undefined. */
+function networkLocationProblem(location: string, allowDrive: boolean): string | undefined {
+  if (!(isShareText(location) || (!allowDrive && isDriveText(location)))) return undefined;
+  return `Registry location "${sanitizeForTerminal(location)}" names a network share or a drive; skillwharf does not read registries from those. Use a git location, an https URL, or a folder path.`;
 }
 
 /** What a registry location is: the words `default`, an https index URL, a git source, or a local path. */
@@ -76,11 +88,8 @@ export async function loadRegistry(location: string, opts: LoadRegistryOptions =
   }
   // A share or drive is never asked about (on Windows that would open a connection to a
   // host a manifest chose); use a git location, an https URL or a folder path instead.
-  if (isNetworkPathText(location)) {
-    throw new Error(
-      `Registry location "${sanitizeForTerminal(location)}" names a network share or a drive; skillwharf does not read registries from those. Use a git location, an https URL, or a folder path.`,
-    );
-  }
+  const problem = networkLocationProblem(location, opts.allowDrive === true);
+  if (problem) throw new Error(problem);
   const p = fs.existsSync(location) && fs.statSync(location).isDirectory() ? path.join(location, "index.json") : location;
   return readIndexFile(p);
 }
@@ -197,16 +206,28 @@ export async function loadRegistries(
       const head = { name: p.spec.name, location: p.spec.location, scope: p.scope, ...(p.note ? { note: p.note } : {}) };
       if (p.error) return { ...head, error: sanitizeForTerminal(p.error) };
       try {
+        const isPath = p.spec.location !== "default" && classifyLocation(p.spec.location) === "path";
+        // The text as written is judged before it is turned into a path (on Windows a drive or a
+        // share survives that, elsewhere it would turn into a folder name and hide what it was).
+        // Drive text is accepted from the user's own locations only, never from a project manifest.
+        const written = isPath ? networkLocationProblem(p.spec.location, p.scope !== "project") : undefined;
+        if (written) throw new Error(written);
         const where = resolveLocation(p.spec.location, p.root, ctx.home);
-        // A relative location in a manifest is read from the folder of that manifest: a link on the
-        // way (a cloned repository can commit one) must stay inside it, checked before any stat.
-        if (p.scope !== "cli" && where !== "default" && classifyLocation(where) === "path" && !isNetworkPathText(where) && isInside(p.root, where)) {
-          const r = resolveInsideDetailed(p.root, where);
-          if ("fail" in r && r.fail === "outside") {
-            throw new Error(`Registry location "${sanitizeForTerminal(p.spec.location)}" leaves the folder of the manifest that lists it (a link points out of it); refusing it.`);
+        // A relative location in a project manifest is read from the folder of that manifest, and
+        // never from outside it (`../../x` is a place the repository's author chose on this machine).
+        // A link on the way (a cloned repository can commit one) must stay inside it too. Both are
+        // checked before any stat, and by hand: only paths inside the folder are asked about.
+        if (p.scope !== "cli" && isPath) {
+          const relative = !path.isAbsolute(p.spec.location) && p.spec.location !== "~" && !p.spec.location.startsWith("~/");
+          const leaves = () =>
+            new Error(`Registry location "${sanitizeForTerminal(p.spec.location)}" leaves the folder of the manifest that lists it (a path or a link points out of it); refusing it.`);
+          if (p.scope === "project" && relative && !isInside(p.root, where)) throw leaves();
+          if (isInside(p.root, where)) {
+            const r = resolveInsideDetailed(p.root, where);
+            if ("fail" in r && r.fail === "outside") throw leaves();
           }
         }
-        const index = await loadRegistry(where, { timeoutMs: opts.timeoutMs, deadline });
+        const index = await loadRegistry(where, { timeoutMs: opts.timeoutMs, deadline, allowDrive: p.scope !== "project" });
         const skipped = index.skippedHexRefs ?? [];
         const hexNote =
           skipped.length > 0

@@ -179,9 +179,10 @@ export function resolveInside(root: string, p: string): string | undefined {
 /**
  * Like `resolveInside`, but says why it failed: `outside` when the path or a link
  * on the way leaves `root` (absolute or UNC text, a `..` past it, a path that is
- * not below it), `broken` when it stays inside but does not resolve (a missing
- * entry, a loop, too many hops). The file system is asked about the same paths
- * as in `resolveInside`: only ones inside `root`.
+ * not below it) or cannot be followed safely (a chain over 32 hops, a loop, an entry
+ * that cannot be examined), `broken` only when it stays inside and something is simply
+ * missing (the entry, or one above it, does not exist). The file system is asked about
+ * the same paths as in `resolveInside`: only ones inside `root`.
  */
 export function resolveInsideDetailed(root: string, p: string): { path: string } | { fail: "outside" | "broken" } {
   const realBase = fs.realpathSync.native(root);
@@ -193,6 +194,11 @@ export function resolveInsideDetailed(root: string, p: string): { path: string }
   const queue = rel.split(path.sep).filter(Boolean);
   const done: string[] = [];
   let hops = 0;
+  // `broken` is only ever "there is nothing at this place": the entry (or one above it) is simply
+  // missing, so there is nothing for the file system to follow. Everything else that stops the walk
+  // (too many hops, a loop, a link that cannot be read, an entry that cannot be examined) is
+  // `outside`: such a path is refused, never handed on to a call that would follow it.
+  const missing = (e: unknown) => ["ENOENT", "ENOTDIR"].includes((e as NodeJS.ErrnoException).code ?? "");
   while (queue.length > 0) {
     const part = queue.shift() as string;
     if (part === ".") continue;
@@ -205,16 +211,16 @@ export function resolveInsideDetailed(root: string, p: string): { path: string }
     let st: fs.Stats;
     try {
       st = fs.lstatSync(next);
-    } catch {
-      return { fail: "broken" };
+    } catch (e) {
+      return { fail: missing(e) ? "broken" : "outside" };
     }
     if (st.isSymbolicLink()) {
-      if (++hops > MAX_LINK_HOPS) return { fail: "broken" };
+      if (++hops > MAX_LINK_HOPS) return { fail: "outside" };
       let text: string;
       try {
         text = fs.readlinkSync(next);
-      } catch {
-        return { fail: "broken" };
+      } catch (e) {
+        return { fail: missing(e) ? "broken" : "outside" };
       }
       if (isAbsoluteLinkText(text)) return { fail: "outside" };
       // Backslash separates components only where it is a separator (Windows); elsewhere it is part of a name.
@@ -225,14 +231,37 @@ export function resolveInsideDetailed(root: string, p: string): { path: string }
   }
   try {
     return { path: fs.realpathSync.native(path.join(realBase, ...done)) };
-  } catch {
-    return { fail: "broken" };
+  } catch (e) {
+    return { fail: missing(e) ? "broken" : "outside" };
   }
 }
 
-/** True for path text that names a network share or a drive (`//host/share`, `\\host\share`, `C:\x`): refused for stored `path:` sources on every platform. */
+/** True for path text that names a network share or a drive (`//host/share`, `\\host\share`, `C:\x`). */
 export function isNetworkPathText(text: string): boolean {
-  return /^[\\/]{2}/.test(text) || /^[A-Za-z]:/.test(text);
+  return isShareText(text) || isDriveText(text);
+}
+
+/** `//host/share` or `\\host\share`: text that makes Windows connect to another machine. */
+export function isShareText(text: string): boolean {
+  return /^[\\/]{2}/.test(text);
+}
+
+/** `C:\x`, `c:/x`, `D:rel`: text that names a drive. */
+export function isDriveText(text: string): boolean {
+  return /^[A-Za-z]:/.test(text);
+}
+
+/**
+ * Whether path text that skillwharf is about to resolve is refused outright. Share text is
+ * refused everywhere, so no manifest, global or project, can make this machine connect to
+ * another one. Drive text is refused only for a project's manifest (which a cloned repository
+ * wrote) without `--allow-outside-paths`: on Windows every absolute path starts with a drive
+ * letter, and the user's own global manifest and an explicit opt-in must keep working.
+ */
+export function pathTextRefusal(text: string, where: { global: boolean; allowOutsidePaths?: boolean }): "share" | "drive" | undefined {
+  if (isShareText(text)) return "share";
+  if (isDriveText(text) && !where.global && !where.allowOutsidePaths) return "drive";
+  return undefined;
 }
 
 /** True for a path component that is `.git` in any letter case (and the look-alike forms a file system folds to it). */
