@@ -327,6 +327,22 @@ describe("S3.6/S3.7: the README and SECURITY.md name what the code does", () => 
     expect(readme).not.toContain("A registry or `path:` source on a network share or a drive letter is refused; use a relative path or a git location.");
   });
 
+  it("Round E E3: the docs name the registry-location rule, the Windows ssh caveat and when the 0.1.x sentence can appear", () => {
+    for (const doc of [readme, security]) {
+      expect(doc).toContain("relative path below the project");
+      expect(doc).toContain("hangs until the timeout on Windows");
+    }
+    expect(readme).toContain("a project's manifest may list a local registry only as a relative path below the project");
+    expect(readme).toContain("while a git call is running");
+    expect(readme).toContain("is refused in a project's manifest unless you pass `--allow-outside-paths`");
+    expect(readme).not.toContain("is refused on every platform, and a project's links");
+    expect(security).toContain("an entry it never linked");
+    expect(security).toContain("an absolute one (`/net/host/x`, `~/x`)");
+    // the cannot-ask sentence is qualified for Windows everywhere it is made
+    expect(security).not.toContain("so a first connection to an unknown ssh host fails instead of asking; trust");
+    expect(readme).not.toContain("so a first connection to an unknown ssh host fails instead of asking: trust");
+  });
+
   it("SECURITY.md no longer claims that symlinks in a fetched repository are never followed", () => {
     expect(security).not.toContain("Never follows a symlink in a fetched repository");
   });
