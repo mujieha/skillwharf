@@ -91,7 +91,10 @@ test -f "$proj/.agents/skills/demo/SKILL.md"
 echo "== doctor is clean apart from usage (and the registries information line)"
 # With --stale-days 0 every skill is "not used"; that and the one information
 # line about registries are the only lines allowed.
-doctor_out="$(cd "$proj" && $bin doctor --stale-days 0)"
+# Without --allow-outside-paths doctor reports the outside source and does not open it.
+doctor_plain="$(cd "$proj" && $bin doctor --stale-days 0 || true)"
+grep -q "outside the project" <<< "$doctor_plain"
+doctor_out="$(cd "$proj" && $bin doctor --stale-days 0 --allow-outside-paths)"
 grep -q "not used" <<< "$doctor_out"
 other="$(grep -v -e "not used" -e "registries: only the public registry" <<< "$doctor_out" || true)"
 if [ -n "$other" ]; then

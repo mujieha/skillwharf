@@ -298,6 +298,35 @@ describe("S3.6/S3.7: the README and SECURITY.md name what the code does", () => 
     }
   });
 
+  it("Round D D8: the cancel and Windows limits are stated as the code behaves", () => {
+    for (const s of [
+      "only when stdin is a terminal",
+      "only while a git call is running",
+      "`skillwharf-*` folder in your temp folder",
+      "between git calls",
+      "unknown ssh host hangs until the timeout",
+      "reused within about 300 ms",
+    ]) {
+      expect(security).toContain(s);
+    }
+    for (const s of ["only when stdin is a terminal", "between git calls", "`skillwharf-*`", "unknown ssh host hangs until the timeout"]) {
+      expect(readme).toContain(s);
+    }
+    // no sentence claims that Ctrl-C always cleans up
+    expect(security).not.toContain("skillwharf holds the signal, ends git, removes its temporary clone and exits 130. Elsewhere");
+    expect(readme).not.toContain("Ctrl-C at a terminal cleans up.");
+  });
+
+  it("Round D D8: the drive-letter rule is the same in README and SECURITY.md", () => {
+    for (const doc of [readme, security]) {
+      expect(doc).toContain("share text");
+      expect(doc).toContain("drive-letter");
+      expect(doc).toContain("--allow-outside-paths");
+    }
+    expect(security).toContain("global manifest");
+    expect(readme).not.toContain("A registry or `path:` source on a network share or a drive letter is refused; use a relative path or a git location.");
+  });
+
   it("SECURITY.md no longer claims that symlinks in a fetched repository are never followed", () => {
     expect(security).not.toContain("Never follows a symlink in a fetched repository");
   });
